@@ -1,0 +1,28 @@
+# TeamGamesRL — Multi-Agent LLM RL on OpenSpiel
+# Install with: pip install -r requirements.txt
+
+# ===== Core =====
+open-spiel>=1.5
+numpy>=1.24
+absl-py>=2.0
+
+# ===== Deep Learning =====
+torch>=2.2.0
+accelerate>=0.30.0
+
+# ===== Hugging Face / Gemma 2B =====
+transformers>=4.51.0
+peft>=0.11.0          # LoRA adapters
+trl>=0.9.0            # PPO / REINFORCE trainers for LLMs
+bitsandbytes>=0.43.0  # Quantization (4-bit / 8-bit)
+datasets>=2.19.0
+sentencepiece>=0.2.0  # Tokenizer dependency for Gemma
+
+# ===== LLM backend (optional – API-based agent) =====
+google-genai>=1.0
+
+# ===== Experiment tracking =====
+wandb>=0.17.0
+
+# ===== Utilities =====
+tqdm>=4.65.0
