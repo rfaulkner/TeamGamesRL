@@ -33,9 +33,13 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# scripts
+run_rl_act.sh
+
 # Logs
 /tmp/llm_rl_logs
 *.log
+slurm/
 
 # Misc
 .DS_Store

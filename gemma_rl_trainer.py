@@ -215,7 +215,8 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
     _lazy_import_hf()
 
     self._max_seq_len = max_seq_len
-
+    self._hf_token = os.environ.get('HF_TOKEN', None)
+    
     if device is None:
       self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     else:
