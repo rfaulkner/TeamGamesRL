@@ -44,6 +44,7 @@ Usage:
 """
 
 import dataclasses
+import json
 import os
 import time
 from typing import Optional
@@ -126,6 +127,10 @@ flags.DEFINE_bool(
 flags.DEFINE_string(
     'wandb_project', 'TeamGamesRL',
     'Wandb project name.')
+flags.DEFINE_integer(
+    'log_episodes_every', 10,
+    'Log full episode transcripts (game state + LLM responses) every this '
+    'many episodes. Set to 0 to disable.')
 
 
 # ============================================================================
@@ -216,7 +221,7 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
 
     self._max_seq_len = max_seq_len
     self._hf_token = os.environ.get('HF_TOKEN', None)
-    
+
     if device is None:
       self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     else:
@@ -241,10 +246,12 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
         device_map='auto' if self.device == 'cuda' else None,
         torch_dtype=torch.bfloat16,
         attn_implementation='eager',  # Gemma 2 needs eager attention
+        token=self._hf_token,
     )
 
     # ── Tokenizer ──
-    self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_name, token=self._hf_token)
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -423,11 +430,17 @@ class RLTrajectoryStep:
     action_text: The text of the selected action.
     action_id: Integer action ID in the OpenSpiel game.
     log_prob: Log-probability of the action under the policy (float, no grad).
+    state_text: The rendered game state (before prompt construction).
+    llm_response: The raw text response from the LLM.
+    game_action_text: The game's canonical action string.
   """
   prompt: str
   action_text: str
   action_id: int
   log_prob: float
+  state_text: str = ''
+  llm_response: str = ''
+  game_action_text: str = ''
 
 
 @dataclasses.dataclass
@@ -594,6 +607,9 @@ class GemmaRLTrainer:
           action_text=response.strip(),
           action_id=action_id,
           log_prob=log_prob,
+          state_text=state_text,
+          llm_response=response,
+          game_action_text=action_text,
       ))
 
       time_step = self.env.step([action_id])
@@ -692,6 +708,51 @@ class GemmaRLTrainer:
     logging.info('Checkpoint saved: %s', ckpt_dir)
     return ckpt_dir
 
+  def _log_episode(
+      self,
+      episode: int,
+      trajectories: list[PlayerTrajectory],
+      loss: float,
+      is_evaluation: bool = False,
+  ) -> None:
+    """Logs a full episode transcript to JSONL for visualization.
+
+    Each line in the JSONL file is one episode with per-step details:
+    game state, LLM prompt/response, parsed action, reward, etc.
+
+    Args:
+      episode: The episode number.
+      trajectories: Per-player trajectories from the episode.
+      loss: The REINFORCE loss for this episode.
+      is_evaluation: Whether this was an evaluation episode.
+    """
+    log_path = os.path.join(self.output_dir, 'episode_log.jsonl')
+    record = {
+        'episode': episode,
+        'game': self.game_name,
+        'is_evaluation': is_evaluation,
+        'loss': loss,
+        'players': [],
+    }
+    for traj in trajectories:
+      player_data = {
+          'player_id': traj.player_id,
+          'reward': traj.reward,
+          'steps': [],
+      }
+      for step in traj.steps:
+        player_data['steps'].append({
+            'state_text': step.state_text,
+            'llm_response': step.llm_response,
+            'game_action': step.game_action_text,
+            'action_id': step.action_id,
+            'log_prob': step.log_prob,
+        })
+      record['players'].append(player_data)
+
+    with open(log_path, 'a') as f:
+      f.write(json.dumps(record) + '\n')
+
   def train(self) -> None:
     """Runs the main REINFORCE training loop.
 
@@ -729,6 +790,11 @@ class GemmaRLTrainer:
       # ── Episode ──
       trajectories = self.run_episode(is_evaluation=False)
       loss = self.compute_and_apply_reinforce_loss(trajectories)
+
+      # ── Episode logging ──
+      log_episodes_every = FLAGS.log_episodes_every
+      if log_episodes_every > 0 and ep % log_episodes_every == 0:
+        self._log_episode(ep, trajectories, loss)
 
       # ── Metrics ──
       ep_rewards = [t.reward for t in trajectories]
@@ -862,3 +928,4 @@ def main(argv: list[str]) -> None:
 
 if __name__ == '__main__':
   app.run(main)
+
