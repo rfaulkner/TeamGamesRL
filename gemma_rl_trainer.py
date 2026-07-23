@@ -90,7 +90,7 @@ flags.DEFINE_float(
     'temperature', 0.8,
     'Sampling temperature for LLM action selection.')
 flags.DEFINE_float(
-    'lr', 1e-4,
+    'lr', 1e-5,
     'Learning rate for the LoRA adapter.')
 flags.DEFINE_integer(
     'lora_rank', 16,
@@ -141,8 +141,16 @@ flags.DEFINE_float(
     'Prevents mode collapse and language degradation.')
 flags.DEFINE_float(
     'reward_baseline_decay', 0.95,
-    'Exponential moving average decay for the reward baseline. '
-    'Higher values = smoother baseline.')
+    'DEPRECATED — replaced by sliding window baseline. '
+    'Kept for backward compatibility.')
+flags.DEFINE_integer(
+    'gradient_accumulation_steps', 8,
+    'Number of episodes to accumulate gradients over before '
+    'updating the model. Reduces REINFORCE variance by ~sqrt(N).')
+flags.DEFINE_integer(
+    'baseline_window_size', 50,
+    'Number of recent episodes to use for the reward baseline '
+    '(sliding window mean). Replaces the EMA baseline.')
 
 # GRPO-specific flags.
 flags.DEFINE_integer(
@@ -578,6 +586,7 @@ class GemmaRLTrainer:
     self._episode_rewards: list[float] = []
     self._episode_losses: list[float] = []
     self._player_wins = np.zeros(self.game_config.num_players, dtype=np.int64)
+    self._team_wins = 0
     self._total_episodes = 0
 
     os.makedirs(output_dir, exist_ok=True)
@@ -591,9 +600,11 @@ class GemmaRLTrainer:
         if v.requires_grad
     }
 
-    # ── Reward baseline (exponential moving average) ──
-    self._reward_baseline = 0.0
-    self._baseline_initialized = False
+    # ── Reward baseline (sliding window) ──
+    self._recent_rewards: list[float] = []
+
+    # ── Gradient accumulation ──
+    self._grad_accum_count = 0
 
     logging.info(
         'GemmaRLTrainer ready: game=%s, lr=%g, lora_params=%d',
@@ -668,50 +679,54 @@ class GemmaRLTrainer:
   def compute_and_apply_reinforce_loss(
       self, trajectories: list[PlayerTrajectory],
   ) -> float:
-    """Computes REINFORCE loss with baseline and KL penalty.
+    """Computes REINFORCE loss with sliding-window baseline and KL penalty.
 
     Improvements over vanilla REINFORCE:
-      1. Reward baseline: advantage = R - EMA(R), reduces variance.
-      2. KL penalty: loss += kl_coeff * KL(pi || pi_ref), prevents
+      1. Sliding window baseline: advantage = R - mean(recent R), reduces
+         variance without the lag of an EMA.
+      2. KL penalty: loss += kl_coeff * ||w - w_ref||^2, prevents
          mode collapse and language degradation.
-      3. Log-prob clamping: prevents gradient death when log_prob → 0.
+      3. Gradient accumulation: accumulates gradients over multiple
+         episodes before updating, reducing variance by ~sqrt(N).
 
     Args:
       trajectories: Per-player trajectories from one episode.
 
     Returns:
-      The scalar loss value (float).
+      The scalar loss value (float, unscaled).
     """
-    self.optimizer.zero_grad()
+    # Zero grad only at the start of each accumulation window.
+    if self._grad_accum_count == 0:
+      self.optimizer.zero_grad()
+
     total_loss = torch.tensor(0.0, device=self.backend.device)
     kl_coeff = FLAGS.kl_coeff
+    accum_steps = FLAGS.gradient_accumulation_steps
 
-    # ── Update reward baseline (EMA) ──
+    # ── Update reward baseline (sliding window) ──
     ep_reward = float(np.mean([t.reward for t in trajectories]))
-    decay = FLAGS.reward_baseline_decay
-    if not self._baseline_initialized:
-      self._reward_baseline = ep_reward
-      self._baseline_initialized = True
-    else:
-      self._reward_baseline = (
-          decay * self._reward_baseline + (1 - decay) * ep_reward)
+    self._recent_rewards.append(ep_reward)
+    window = FLAGS.baseline_window_size
+    if len(self._recent_rewards) > window:
+      self._recent_rewards = self._recent_rewards[-window:]
+    baseline = float(np.mean(self._recent_rewards))
 
     for traj in trajectories:
       if not traj.steps:
         continue
 
       # Advantage = reward - baseline (can be negative → pushes
-      # down probability of bad actions)
-      advantage = traj.reward - self._reward_baseline
+      # down probability of bad actions).
+      advantage = traj.reward - baseline
 
       for step in traj.steps:
         # Recompute log-prob *with gradients*.
         log_prob = self.backend.compute_action_log_prob(
             step.prompt, step.action_text)
 
-        # Clamp log-prob to prevent gradient death when
-        # log_prob → 0 (probability → 1).
-        log_prob = log_prob.clamp(max=-1e-4)
+        # Prevent -inf only; do NOT clamp max — clamping near-zero
+        # log-probs kills gradients for confident predictions.
+        log_prob = log_prob.clamp(min=-20.0)
 
         total_loss = total_loss + (-log_prob * advantage)
 
@@ -724,11 +739,22 @@ class GemmaRLTrainer:
           kl_loss = kl_loss + ((param - ref_param) ** 2).sum()
       total_loss = total_loss + kl_coeff * kl_loss
 
-    if total_loss.requires_grad:
-      total_loss.backward()
+    # Scale loss for gradient accumulation (so accumulated grads
+    # average out rather than sum).
+    scaled_loss = total_loss / accum_steps if accum_steps > 1 else total_loss
+
+    if scaled_loss.requires_grad:
+      scaled_loss.backward()
+
+    self._grad_accum_count += 1
+
+    # Step optimizer every accum_steps episodes.
+    if self._grad_accum_count >= accum_steps:
       torch.nn.utils.clip_grad_norm_(
           self.backend.model.parameters(), self.max_grad_norm)
       self.optimizer.step()
+      self.optimizer.zero_grad()
+      self._grad_accum_count = 0
 
     return float(total_loss.item())
 
@@ -880,6 +906,7 @@ class GemmaRLTrainer:
       self._episode_losses.append(loss)
       self._total_episodes += 1
 
+      # Track per-player wins (for competitive games).
       max_r = max(ep_rewards)
       winners = [
           p for p in range(self.game_config.num_players)
@@ -887,6 +914,10 @@ class GemmaRLTrainer:
       ]
       if len(winners) == 1:
         self._player_wins[winners[0]] += 1
+
+      # Track team wins for cooperative games (all players share reward).
+      if mean_reward >= 8.0:
+        self._team_wins += 1
 
       # ── Logging ──
       if ep % log_every == 0:
@@ -923,6 +954,14 @@ class GemmaRLTrainer:
       if ep % checkpoint_every == 0:
         self.save_checkpoint(ep)
 
+    # ── Flush remaining accumulated gradients ──
+    if self._grad_accum_count > 0:
+      torch.nn.utils.clip_grad_norm_(
+          self.backend.model.parameters(), self.max_grad_norm)
+      self.optimizer.step()
+      self.optimizer.zero_grad()
+      self._grad_accum_count = 0
+
     # ── Final summary ──
     total_time = time.time() - start_time
     logging.info('Training complete: %d episodes in %.1f seconds.',
@@ -936,6 +975,9 @@ class GemmaRLTrainer:
                    p,
                    100.0 * self._player_wins[p] / self._total_episodes,
                    self._player_wins[p], self._total_episodes)
+    logging.info('  Team win rate (reward >= 8): %.1f%% (%d/%d)',
+                 100.0 * self._team_wins / self._total_episodes,
+                 self._team_wins, self._total_episodes)
 
     # Save final checkpoint.
     self.save_checkpoint(self.num_episodes)
@@ -1182,9 +1224,9 @@ class GemmaRLTrainer:
       grpo_trainer = trl.GRPOTrainer(
           model=self.backend.model,
           reward_funcs=game_reward_fn,
-          config=grpo_config,
+          args=grpo_config,
           train_dataset=dataset,
-          processing_class=self.backend.tokenizer,
+          tokenizer=self.backend.tokenizer,
       )
 
       self.backend.model.train()
