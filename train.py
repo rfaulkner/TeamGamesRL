@@ -573,7 +573,7 @@ def _create_renderer(game_config: GameConfig, player_id: int) -> object:
   """
   game_name = game_config.game_name
   if game_name == 'tiny_hanabi':
-    return state_renderers.HanabiRenderer()
+    return state_renderers.TinyHanabiRenderer()
   elif game_name == 'hanabi':
     return state_renderers.HanabiRenderer()
   elif game_name == 'negotiation':

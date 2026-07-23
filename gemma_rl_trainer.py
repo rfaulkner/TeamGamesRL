@@ -925,7 +925,9 @@ class GemmaRLTrainer:
 
 def _create_renderer(game_config: GameConfig) -> state_renderers.BaseStateRenderer:
   """Creates a state renderer for the given game."""
-  if game_config.game_name in ('tiny_hanabi', 'hanabi'):
+  if game_config.game_name == 'tiny_hanabi':
+    return state_renderers.TinyHanabiRenderer()
+  elif game_config.game_name == 'hanabi':
     return state_renderers.HanabiRenderer()
   elif game_config.game_name == 'negotiation':
     return state_renderers.NegotiationRenderer()

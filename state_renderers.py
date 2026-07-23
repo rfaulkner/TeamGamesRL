@@ -537,6 +537,192 @@ class NegotiationRenderer(BaseStateRenderer):
     return _fuzzy_match_action(text, legal_actions)
 
 
+class TinyHanabiRenderer(BaseStateRenderer):
+  """Renders Tiny Hanabi game states as natural language for LLM agents.
+
+  Tiny Hanabi is a cooperative two-turn matrix game from the Bayesian Action
+  Decoder (BAD) paper (Foerster et al., 2018). It is NOT the full Hanabi card
+  game — there are no hands, fireworks, life tokens, or information tokens.
+
+  Game mechanics:
+    1. Each of 2 players is secretly dealt one of 2 cards (card 0 or card 1).
+    2. Player 0 chooses one of 3 actions (0, 1, or 2).
+    3. Player 1 observes Player 0's action but not their card, then also
+       chooses one of 3 actions.
+    4. Both players receive the same reward from a payoff matrix indexed by
+       (card0, card1, action0, action1).
+
+  The observation string format is:
+    "p{id}:d{card}"           — just the dealt card (before any actions)
+    "p{id}:d{card} p0:a{act}" — after Player 0 has acted
+
+  Benchmark results (optimal = 10, no-cooperation equilibrium = 8):
+    BAD:         9.5
+    SAD:         9.5
+    PG/PBT:      9.0
+    Independent Q: 8.8
+  """
+
+  def _parse_observation(
+      self, obs_str: str, player_id: int
+  ) -> dict[str, object]:
+    """Parses the tiny_hanabi observation string.
+
+    The observation string has the format:
+      "p0:d1"          — player 0, dealt card 1, no actions yet
+      "p0:d1 p0:a2"    — player 0, dealt card 1, player 0 took action 2
+
+    Args:
+      obs_str: Raw observation string from state.observation_string().
+      player_id: The player ID.
+
+    Returns:
+      A dict with keys: 'my_card' (int or None), 'actions_taken' (list of
+        (player_id, action_id) tuples).
+    """
+    result = {
+        'my_card': None,
+        'actions_taken': [],
+    }
+
+    tokens = obs_str.strip().split()
+    for token in tokens:
+      # Match "pN:dC" (card deal) or "pN:aA" (action taken).
+      match = re.match(r'p(\d+):([da])(\d+)', token)
+      if match:
+        pid = int(match.group(1))
+        kind = match.group(2)
+        value = int(match.group(3))
+        if kind == 'd' and pid == player_id:
+          result['my_card'] = value
+        elif kind == 'a':
+          result['actions_taken'].append((pid, value))
+
+    return result
+
+  def render_state(
+      self,
+      state: pyspiel.State,
+      player_id: int,
+      game: pyspiel.Game,
+  ) -> str:
+    """Renders the Tiny Hanabi game state as a natural language prompt.
+
+    Args:
+      state: The current OpenSpiel game state.
+      player_id: The ID of the player to render for.
+      game: The OpenSpiel game object.
+
+    Returns:
+      A natural language prompt describing the Tiny Hanabi game state.
+    """
+    obs_str = state.observation_string(player_id)
+    parsed = self._parse_observation(obs_str, player_id)
+    num_players = game.num_players()
+    num_actions = game.num_distinct_actions()
+
+    lines = []
+    lines.append(
+        f'You are Player {player_id} in a {num_players}-player '
+        f'cooperative Tiny Hanabi game.')
+    lines.append(
+        'Goal: Both players receive the same reward. Coordinate to '
+        'maximize the shared payoff (max possible: 10).')
+    lines.append('')
+
+    # Show dealt card.
+    if parsed['my_card'] is not None:
+      lines.append(
+          f'You were dealt card {parsed["my_card"]}. '
+          f'(You cannot see the other player\'s card.)')
+    else:
+      lines.append('Your card has not been dealt yet.')
+
+    # Show any actions already taken.
+    if parsed['actions_taken']:
+      lines.append('')
+      lines.append('Actions taken so far:')
+      for pid, action in parsed['actions_taken']:
+        if pid == player_id:
+          lines.append(f'  You (Player {pid}) chose Action {action}.')
+        else:
+          lines.append(f'  Player {pid} chose Action {action}.')
+
+    # Prompt for action if it's this player's turn.
+    current = state.current_player()
+    if current == player_id:
+      lines.append('')
+      lines.append(
+          f'It is your turn. Choose one of {num_actions} actions '
+          f'(0 to {num_actions - 1}).')
+
+    return '\n'.join(lines)
+
+  def render_legal_actions(
+      self,
+      state: pyspiel.State,
+      player_id: int,
+      game: pyspiel.Game,
+  ) -> list[tuple[int, str]]:
+    """Renders Tiny Hanabi legal actions as human-readable descriptions.
+
+    In Tiny Hanabi, actions are abstract (no semantic meaning like "play"
+    or "discard"). They are simply Action 0, Action 1, Action 2.
+
+    Args:
+      state: The current OpenSpiel game state.
+      player_id: The ID of the player.
+      game: The OpenSpiel game object.
+
+    Returns:
+      A list of (action_id, description) tuples.
+    """
+    legal_action_ids = state.legal_actions(player_id)
+    return [
+        (action_id, f'Action {action_id}')
+        for action_id in legal_action_ids
+    ]
+
+  def parse_action(
+      self,
+      text: str,
+      legal_actions: list[tuple[int, str]],
+  ) -> Optional[int]:
+    """Parses LLM text output to find the best matching Tiny Hanabi action.
+
+    Looks for a bare integer or "action N" pattern first, then falls back
+    to fuzzy matching.
+
+    Args:
+      text: The raw text output from the LLM.
+      legal_actions: List of (action_id, description) pairs.
+
+    Returns:
+      The best matching action_id, or None if no match found.
+    """
+    normalized = text.strip().lower()
+
+    # Try to extract a bare integer.
+    try:
+      raw_id = int(normalized)
+      for action_id, _ in legal_actions:
+        if action_id == raw_id:
+          return raw_id
+    except ValueError:
+      pass
+
+    # Try "action N" pattern.
+    action_match = re.search(r'\baction\s*(\d+)', normalized)
+    if action_match:
+      parsed_id = int(action_match.group(1))
+      for action_id, _ in legal_actions:
+        if action_id == parsed_id:
+          return parsed_id
+
+    # Fall back to fuzzy matching.
+    return _fuzzy_match_action(text, legal_actions)
+
+
 class HanabiRenderer(BaseStateRenderer):
   """Renders Hanabi game states as natural language for LLM agents.
 
@@ -1071,6 +1257,7 @@ def get_renderer(game_name: str) -> BaseStateRenderer:
   renderers = {
       'negotiation': NegotiationRenderer,
       'hanabi': HanabiRenderer,
+      'tiny_hanabi': TinyHanabiRenderer,
   }
 
   renderer_class = renderers.get(game_name, GenericRenderer)
