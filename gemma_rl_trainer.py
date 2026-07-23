@@ -131,6 +131,14 @@ flags.DEFINE_integer(
     'log_episodes_every', 10,
     'Log full episode transcripts (game state + LLM responses) every this '
     'many episodes. Set to 0 to disable.')
+flags.DEFINE_float(
+    'kl_coeff', 0.05,
+    'KL penalty coefficient against the reference (pre-trained) model. '
+    'Prevents mode collapse and language degradation.')
+flags.DEFINE_float(
+    'reward_baseline_decay', 0.95,
+    'Exponential moving average decay for the reward baseline. '
+    'Higher values = smoother baseline.')
 
 
 # ============================================================================
@@ -551,6 +559,20 @@ class GemmaRLTrainer:
     self._total_episodes = 0
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # ── Reference model for KL penalty (frozen copy) ──
+    # Keeps a detached copy of the initial LoRA weights to compute
+    # KL divergence, preventing mode collapse.
+    self._ref_state_dict = {
+        k: v.detach().clone()
+        for k, v in gemma_backend.model.named_parameters()
+        if v.requires_grad
+    }
+
+    # ── Reward baseline (exponential moving average) ──
+    self._reward_baseline = 0.0
+    self._baseline_initialized = False
+
     logging.info(
         'GemmaRLTrainer ready: game=%s, lr=%g, lora_params=%d',
         game_name, lr, sum(p.numel() for p in trainable_params))
@@ -624,14 +646,13 @@ class GemmaRLTrainer:
   def compute_and_apply_reinforce_loss(
       self, trajectories: list[PlayerTrajectory],
   ) -> float:
-    """Computes REINFORCE loss and updates LoRA weights.
+    """Computes REINFORCE loss with baseline and KL penalty.
 
-    For each step in each player's trajectory:
-      loss += -log_pi(action | state) * reward
-
-    The log-probabilities are recomputed with gradients via
-    compute_action_log_prob so that back-propagation flows through
-    the LoRA adapter.
+    Improvements over vanilla REINFORCE:
+      1. Reward baseline: advantage = R - EMA(R), reduces variance.
+      2. KL penalty: loss += kl_coeff * KL(pi || pi_ref), prevents
+         mode collapse and language degradation.
+      3. Log-prob clamping: prevents gradient death when log_prob → 0.
 
     Args:
       trajectories: Per-player trajectories from one episode.
@@ -641,16 +662,45 @@ class GemmaRLTrainer:
     """
     self.optimizer.zero_grad()
     total_loss = torch.tensor(0.0, device=self.backend.device)
+    kl_coeff = FLAGS.kl_coeff
+
+    # ── Update reward baseline (EMA) ──
+    ep_reward = float(np.mean([t.reward for t in trajectories]))
+    decay = FLAGS.reward_baseline_decay
+    if not self._baseline_initialized:
+      self._reward_baseline = ep_reward
+      self._baseline_initialized = True
+    else:
+      self._reward_baseline = (
+          decay * self._reward_baseline + (1 - decay) * ep_reward)
 
     for traj in trajectories:
-      if not traj.steps or traj.reward == 0.0:
+      if not traj.steps:
         continue
+
+      # Advantage = reward - baseline (can be negative → pushes
+      # down probability of bad actions)
+      advantage = traj.reward - self._reward_baseline
 
       for step in traj.steps:
         # Recompute log-prob *with gradients*.
         log_prob = self.backend.compute_action_log_prob(
             step.prompt, step.action_text)
-        total_loss = total_loss + (-log_prob * traj.reward)
+
+        # Clamp log-prob to prevent gradient death when
+        # log_prob → 0 (probability → 1).
+        log_prob = log_prob.clamp(max=-1e-4)
+
+        total_loss = total_loss + (-log_prob * advantage)
+
+    # ── KL penalty against reference policy ──
+    if kl_coeff > 0:
+      kl_loss = torch.tensor(0.0, device=self.backend.device)
+      for name, param in self.backend.model.named_parameters():
+        if param.requires_grad and name in self._ref_state_dict:
+          ref_param = self._ref_state_dict[name]
+          kl_loss = kl_loss + ((param - ref_param) ** 2).sum()
+      total_loss = total_loss + kl_coeff * kl_loss
 
     if total_loss.requires_grad:
       total_loss.backward()

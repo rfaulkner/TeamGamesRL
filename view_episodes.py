@@ -21,32 +21,29 @@ Usage:
   python view_episodes.py --log_path=episode_log.jsonl --summary_only
 """
 
+import argparse
 import json
 import sys
 
-from absl import app
-from absl import flags
-
-FLAGS = flags.FLAGS
-
-flags.DEFINE_string(
-    'log_path', None,
-    'Path to the episode_log.jsonl file.')
-flags.DEFINE_string(
-    'episodes', '',
-    'Comma-separated list of episode numbers to display. '
-    'If empty, shows all episodes.')
-flags.DEFINE_integer(
-    'last', 0,
-    'Show only the last N episodes.')
-flags.DEFINE_bool(
-    'show_prompts', False,
-    'Show the full LLM prompts (can be very verbose).')
-flags.DEFINE_bool(
-    'summary_only', False,
-    'Show only the summary table, no step-by-step details.')
-
-flags.mark_flag_as_required('log_path')
+def parse_args():
+  parser = argparse.ArgumentParser(
+      description='View TeamGamesRL episode logs.')
+  parser.add_argument(
+      '--log_path', required=True,
+      help='Path to the episode_log.jsonl file.')
+  parser.add_argument(
+      '--episodes', default='',
+      help='Comma-separated list of episode numbers to display.')
+  parser.add_argument(
+      '--last', type=int, default=0,
+      help='Show only the last N episodes.')
+  parser.add_argument(
+      '--show_prompts', action='store_true',
+      help='Show the full LLM prompts (can be very verbose).')
+  parser.add_argument(
+      '--summary_only', action='store_true',
+      help='Show only the summary table, no step-by-step details.')
+  return parser.parse_args()
 
 # ── ANSI colors ──────────────────────────────────────────────────────────────
 
@@ -218,24 +215,24 @@ def print_episode_detail(ep, show_prompts=False):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
-def main(argv):
-  del argv
+def main():
+  args = parse_args()
 
-  episodes = load_episodes(FLAGS.log_path)
+  episodes = load_episodes(args.log_path)
   if not episodes:
     print('No episodes found in log file.', file=sys.stderr)
     sys.exit(1)
 
   # Filter by episode numbers if specified.
-  if FLAGS.episodes:
+  if args.episodes:
     target_eps = set(
-        int(x.strip()) for x in FLAGS.episodes.split(',') if x.strip()
+        int(x.strip()) for x in args.episodes.split(',') if x.strip()
     )
     episodes = [e for e in episodes if e['episode'] in target_eps]
 
   # Show only last N.
-  if FLAGS.last > 0:
-    episodes = episodes[-FLAGS.last:]
+  if args.last > 0:
+    episodes = episodes[-args.last:]
 
   if not episodes:
     print('No episodes match the filter criteria.', file=sys.stderr)
@@ -245,11 +242,11 @@ def main(argv):
   print_summary_table(episodes)
 
   # Show detailed view unless summary_only.
-  if not FLAGS.summary_only:
+  if not args.summary_only:
     for ep in episodes:
-      print_episode_detail(ep, show_prompts=FLAGS.show_prompts)
+      print_episode_detail(ep, show_prompts=args.show_prompts)
 
 
 if __name__ == '__main__':
-  app.run(main)
+  main()
 
