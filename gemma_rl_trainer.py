@@ -71,6 +71,10 @@ trl = None
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum(
+    'rl_algorithm', 'reinforce', ['reinforce', 'grpo'],
+    'RL algorithm to use. "reinforce" uses the hand-rolled REINFORCE '
+    'with baseline + KL penalty. "grpo" uses TRL\'s GRPOTrainer.')
+flags.DEFINE_enum(
     'game', 'tiny_hanabi', ['negotiation', 'hanabi', 'tiny_hanabi'],
     'Name of the OpenSpiel game to train on.')
 flags.DEFINE_integer(
@@ -139,6 +143,24 @@ flags.DEFINE_float(
     'reward_baseline_decay', 0.95,
     'Exponential moving average decay for the reward baseline. '
     'Higher values = smoother baseline.')
+
+# GRPO-specific flags.
+flags.DEFINE_integer(
+    'grpo_num_generations', 4,
+    'Number of completions to sample per prompt in GRPO (group size K).')
+flags.DEFINE_integer(
+    'grpo_collect_episodes', 50,
+    'Number of episodes to play for collecting game state prompts '
+    'before each GRPO training pass.')
+flags.DEFINE_integer(
+    'grpo_train_epochs', 1,
+    'Number of training epochs per GRPO pass.')
+flags.DEFINE_integer(
+    'grpo_passes', 10,
+    'Number of collect-then-train passes for GRPO.')
+flags.DEFINE_integer(
+    'grpo_max_completion_length', 64,
+    'Maximum completion length for GRPO generation.')
 
 
 # ============================================================================
@@ -743,16 +765,21 @@ class GemmaRLTrainer:
       metrics[f'eval/win_rate_p{p}'] = float(wins[p] / num_episodes)
     return metrics
 
-  def save_checkpoint(self, episode: int) -> str:
+  def save_checkpoint(self, episode: int = 0, suffix=None) -> str:
     """Saves a LoRA adapter checkpoint.
 
     Args:
       episode: Current episode number (used in the checkpoint path).
+      suffix: Optional suffix override (e.g., 'final').
 
     Returns:
       Path to the saved checkpoint directory.
     """
-    ckpt_dir = os.path.join(self.output_dir, f'checkpoint-ep{episode}')
+    if suffix:
+      ckpt_dir = os.path.join(self.output_dir, f'checkpoint_{suffix}')
+    else:
+      ckpt_dir = os.path.join(
+          self.output_dir, f'checkpoint_ep{episode}')
     self.backend.model.save_pretrained(ckpt_dir)
     self.backend.tokenizer.save_pretrained(ckpt_dir)
     logging.info('Checkpoint saved: %s', ckpt_dir)
@@ -917,6 +944,272 @@ class GemmaRLTrainer:
       import wandb  # pylint: disable=g-import-not-at-top
       wandb.finish()
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # GRPO Training (via TRL)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  def collect_game_prompts(
+      self, num_episodes: int,
+  ) -> list[dict]:
+    """Plays episodes to collect game state prompts with metadata.
+
+    For each turn in each episode, records the prompt, player ID, legal
+    actions, and the action history needed to reconstruct the state.
+    These prompts become the dataset for GRPO training.
+
+    Args:
+      num_episodes: Number of episodes to play for prompt collection.
+
+    Returns:
+      List of dicts, each with keys: 'prompt', 'player_id',
+      'legal_actions', 'action_history'.
+    """
+    prompts = []
+    for _ in range(num_episodes):
+      time_step = self.env.reset()
+      action_history = []  # Track actions to replay this state.
+
+      while not time_step.last():
+        current_player = time_step.current_player()
+        state = self.env._state  # pylint: disable=protected-access
+
+        state_text = self.renderers[current_player].render_state(
+            state, current_player, self.env.game)
+        legal_actions_with_desc = self.renderers[
+            current_player].render_legal_actions(
+                state, current_player, self.env.game)
+        legal_actions = [a for a, _ in legal_actions_with_desc]
+        action_descriptions = [d for _, d in legal_actions_with_desc]
+
+        prompt = self.agents[current_player]._build_prompt(
+            state_text, legal_actions, action_descriptions)
+
+        prompts.append({
+            'prompt': prompt,
+            'player_id': current_player,
+            'legal_actions': legal_actions,
+            'legal_actions_desc': legal_actions_with_desc,
+            'action_history': list(action_history),
+        })
+
+        # Play this turn with current policy to advance the game.
+        response, _ = self.backend.generate_with_logprobs(
+            prompt, temperature=FLAGS.temperature, max_tokens=64)
+        action_id = self.renderers[current_player].parse_action(
+            response, legal_actions_with_desc)
+        if action_id is None:
+          action_id = int(np.random.choice(legal_actions))
+
+        action_history.append(action_id)
+        time_step = self.env.step([action_id])
+
+    logging.info('Collected %d turn-level prompts from %d episodes.',
+                 len(prompts), num_episodes)
+    return prompts
+
+  def _simulate_from_state(
+      self,
+      action_history: list[int],
+      chosen_action: int,
+      target_player: int,
+  ) -> float:
+    """Replays a game from the initial state, applying chosen_action at
+    the target decision point, then plays out remaining turns with the
+    current policy.
+
+    Args:
+      action_history: Actions taken before the target decision point.
+      chosen_action: The action to evaluate at the target point.
+      target_player: The player whose turn we're evaluating.
+
+    Returns:
+      The reward for target_player at the end of the game.
+    """
+    time_step = self.env.reset()
+
+    # Replay actions up to the target decision point.
+    for action_id in action_history:
+      time_step = self.env.step([action_id])
+      if time_step.last():
+        rewards = time_step.rewards or [0.0] * self.game_config.num_players
+        return rewards[target_player]
+
+    # Apply the chosen action at the target point.
+    time_step = self.env.step([chosen_action])
+
+    # Play out remaining turns with current policy.
+    while not time_step.last():
+      current_player = time_step.current_player()
+      state = self.env._state  # pylint: disable=protected-access
+
+      state_text = self.renderers[current_player].render_state(
+          state, current_player, self.env.game)
+      legal_actions_with_desc = self.renderers[
+          current_player].render_legal_actions(
+              state, current_player, self.env.game)
+      legal_actions = [a for a, _ in legal_actions_with_desc]
+      action_descriptions = [d for _, d in legal_actions_with_desc]
+
+      prompt = self.agents[current_player]._build_prompt(
+          state_text, legal_actions, action_descriptions)
+      response, _ = self.backend.generate_with_logprobs(
+          prompt, temperature=FLAGS.temperature, max_tokens=64)
+      action_id = self.renderers[current_player].parse_action(
+          response, legal_actions_with_desc)
+      if action_id is None:
+        action_id = int(np.random.choice(legal_actions))
+
+      time_step = self.env.step([action_id])
+
+    rewards = time_step.rewards or [0.0] * self.game_config.num_players
+    return rewards[target_player]
+
+  def train_grpo(self) -> None:
+    """Runs GRPO training using TRL's GRPOTrainer.
+
+    The training loop:
+      1. Collect game state prompts by playing episodes.
+      2. Build a HuggingFace Dataset from the prompts.
+      3. Define a reward function that evaluates completions by
+         simulating the game from the saved state.
+      4. Run GRPOTrainer for one epoch.
+      5. Repeat for grpo_passes rounds.
+    """
+    _lazy_import_hf()
+    global trl
+    if trl is None:
+      try:
+        import trl as _trl
+        trl = _trl
+      except ImportError:
+        raise ImportError(
+            'TRL is required for GRPO training. '
+            'Install with: pip install trl')
+
+    from datasets import Dataset  # pylint: disable=g-import-not-at-top
+
+    logging.info('=== Starting GRPO training ===')
+    logging.info('Passes: %d, episodes/pass: %d, group size: %d',
+                 FLAGS.grpo_passes, FLAGS.grpo_collect_episodes,
+                 FLAGS.grpo_num_generations)
+
+    start_time = time.time()
+
+    # Store metadata for the reward function (indexed by prompt).
+    self._prompt_metadata = {}
+
+    def game_reward_fn(completions, **kwargs):
+      """Reward function for GRPO: evaluates actions via game simulation."""
+      prompts = kwargs.get('prompts', kwargs.get('prompt', []))
+      rewards = []
+      for i, completion in enumerate(completions):
+        # Extract text from completion.
+        if hasattr(completion, 'text'):
+          comp_text = completion.text
+        elif isinstance(completion, list):
+          # Tokenized completion — decode it.
+          comp_text = self.backend.tokenizer.decode(
+              completion, skip_special_tokens=True)
+        else:
+          comp_text = str(completion)
+
+        # Look up metadata for this prompt.
+        prompt_text = prompts[i] if i < len(prompts) else ''
+        meta = self._prompt_metadata.get(prompt_text, {})
+        legal_actions_desc = meta.get('legal_actions_desc', [])
+        action_history = meta.get('action_history', [])
+        player_id = meta.get('player_id', 0)
+        legal_actions = meta.get('legal_actions', [])
+
+        # Parse the action from the completion.
+        action_id = self.renderers[player_id].parse_action(
+            comp_text, legal_actions_desc)
+        if action_id is None:
+          if legal_actions:
+            action_id = int(np.random.choice(legal_actions))
+          else:
+            rewards.append(torch.tensor(0.0))
+            continue
+
+        # Simulate the game from the saved state.
+        reward = self._simulate_from_state(
+            action_history, action_id, player_id)
+        rewards.append(torch.tensor(float(reward)))
+
+      return rewards
+
+    for pass_num in range(1, FLAGS.grpo_passes + 1):
+      logging.info('--- GRPO pass %d/%d ---', pass_num, FLAGS.grpo_passes)
+
+      # Phase 1: Collect game state prompts.
+      self.backend.model.eval()
+      prompt_dicts = self.collect_game_prompts(
+          FLAGS.grpo_collect_episodes)
+
+      # Store metadata for the reward function.
+      self._prompt_metadata = {}
+      prompt_texts = []
+      for pd in prompt_dicts:
+        self._prompt_metadata[pd['prompt']] = pd
+        prompt_texts.append(pd['prompt'])
+
+      # Deduplicate prompts (same state can appear multiple times).
+      unique_prompts = list(dict.fromkeys(prompt_texts))
+      logging.info('Unique prompts: %d (from %d total)',
+                   len(unique_prompts), len(prompt_texts))
+
+      # Phase 2: Build HuggingFace dataset.
+      dataset = Dataset.from_dict({'prompt': unique_prompts})
+
+      # Phase 3: Configure and run GRPOTrainer.
+      grpo_config = trl.GRPOConfig(
+          output_dir=os.path.join(
+              self.output_dir, f'grpo_pass_{pass_num}'),
+          num_generations=FLAGS.grpo_num_generations,
+          max_completion_length=FLAGS.grpo_max_completion_length,
+          learning_rate=FLAGS.lr,
+          beta=FLAGS.kl_coeff,
+          per_device_train_batch_size=min(
+              len(unique_prompts), 4),
+          num_train_epochs=FLAGS.grpo_train_epochs,
+          logging_steps=1,
+          save_strategy='no',
+          report_to='none',
+          max_grad_norm=FLAGS.max_grad_norm,
+          temperature=FLAGS.temperature,
+      )
+
+      grpo_trainer = trl.GRPOTrainer(
+          model=self.backend.model,
+          reward_funcs=game_reward_fn,
+          config=grpo_config,
+          train_dataset=dataset,
+          processing_class=self.backend.tokenizer,
+      )
+
+      self.backend.model.train()
+      grpo_trainer.train()
+
+      # Phase 4: Evaluate after this pass.
+      logging.info('--- Evaluation after GRPO pass %d ---', pass_num)
+      self.backend.model.eval()
+      eval_metrics = self.evaluate(
+          num_episodes=FLAGS.num_eval_episodes)
+      for k, v in sorted(eval_metrics.items()):
+        logging.info('  %s: %.4f', k, v)
+
+      # Checkpoint.
+      self.save_checkpoint(pass_num * FLAGS.grpo_collect_episodes)
+
+      elapsed = time.time() - start_time
+      logging.info('Pass %d complete. %.1f sec elapsed.', pass_num,
+                   elapsed)
+
+    total_time = time.time() - start_time
+    logging.info('GRPO training complete: %d passes in %.1f seconds.',
+                 FLAGS.grpo_passes, total_time)
+    self.save_checkpoint(0, suffix='final')
+
 
 # ============================================================================
 # Helpers
@@ -975,7 +1268,12 @@ def main(argv: list[str]) -> None:
       max_grad_norm=FLAGS.max_grad_norm,
       output_dir=FLAGS.output_dir,
   )
-  trainer.train()
+  if FLAGS.rl_algorithm == 'grpo':
+    logging.info('Using GRPO (TRL) training.')
+    trainer.train_grpo()
+  else:
+    logging.info('Using REINFORCE training.')
+    trainer.train()
 
 
 if __name__ == '__main__':
