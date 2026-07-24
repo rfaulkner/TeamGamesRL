@@ -1226,7 +1226,7 @@ class GemmaRLTrainer:
           reward_funcs=game_reward_fn,
           args=grpo_config,
           train_dataset=dataset,
-          tokenizer=self.backend.tokenizer,
+          processing_class=self.backend.tokenizer,
       )
 
       self.backend.model.train()
