@@ -26,6 +26,8 @@ Usage:
   python gemma_rl_trainer.py --rl_algorithm=grpo --game=tiny_hanabi
 """
 
+import dataclasses
+
 from absl import app
 from absl import flags
 from absl import logging
@@ -227,6 +229,35 @@ def main(argv: list[str]) -> None:
         temperature=FLAGS.temperature,
         num_eval_episodes=FLAGS.num_eval_episodes,
     )
+    # ── Tiny Hanabi-specific tuning ──
+    # These overrides implement recommendations from experiment analysis:
+    #   1. More passes (100 vs 25) for better convergence.
+    #   2. Larger group size (K=16) for more reliable advantage estimation.
+    #   3. Per-player updates to avoid conflicting gradient signals.
+    #   4. Temperature annealing to shift from exploration to exploitation.
+    #   5. Reward variance penalty to favor consistent strategies.
+    # These only apply to tiny_hanabi; other games use the base defaults.
+    if FLAGS.game == 'tiny_hanabi':
+      grpo_config = dataclasses.replace(
+          grpo_config,
+          passes=100,
+          num_generations=16,
+          per_player_updates=True,
+          temperature_anneal_end=0.2,
+          reward_variance_penalty=1.0,
+          reward_num_simulations=10,
+      )
+      logging.info(
+          'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, K=%d, '
+          'per_player_updates=%s, temp_anneal_end=%.1f, '
+          'reward_var_penalty=%.1f, reward_num_sims=%d',
+          grpo_config.passes,
+          grpo_config.num_generations,
+          grpo_config.per_player_updates,
+          grpo_config.temperature_anneal_end,
+          grpo_config.reward_variance_penalty,
+          grpo_config.reward_num_simulations,
+      )
     trainer.train_grpo(grpo_config)
   else:
     from learn.reinforce import ReinforceConfig  # pylint: disable=g-import-not-at-top
