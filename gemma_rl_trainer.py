@@ -52,11 +52,10 @@ from typing import Optional
 from absl import app
 from absl import flags
 from absl import logging
-import numpy as np
-import torch
-
 import llm_agent
+import numpy as np
 import state_renderers
+import torch
 
 # Lazy imports — heavy dependencies loaded only when needed.
 transformers = None  # Will be imported in _lazy_import_hf()
@@ -71,104 +70,112 @@ trl = None
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum(
-    'rl_algorithm', 'reinforce', ['reinforce', 'grpo'],
+    'rl_algorithm',
+    'grpo',
+    ['reinforce', 'grpo'],
     'RL algorithm to use. "reinforce" uses the hand-rolled REINFORCE '
-    'with baseline + KL penalty. "grpo" uses TRL\'s GRPOTrainer.')
+    'with baseline + KL penalty. "grpo" uses TRL\'s GRPOTrainer.',
+)
 flags.DEFINE_enum(
-    'game', 'tiny_hanabi', ['negotiation', 'hanabi', 'tiny_hanabi'],
-    'Name of the OpenSpiel game to train on.')
+    'game',
+    'tiny_hanabi',
+    ['negotiation', 'hanabi', 'tiny_hanabi'],
+    'Name of the OpenSpiel game to train on.',
+)
 flags.DEFINE_integer(
-    'num_episodes', 500,
-    'Total number of training episodes to run.')
+    'num_episodes', 500, 'Total number of training episodes to run.'
+)
 flags.DEFINE_integer(
-    'eval_every', 50,
-    'Run evaluation every this many episodes.')
+    'eval_every', 50, 'Run evaluation every this many episodes.'
+)
 flags.DEFINE_integer(
-    'num_eval_episodes', 10,
-    'Number of episodes per evaluation round.')
+    'num_eval_episodes', 10, 'Number of episodes per evaluation round.'
+)
 flags.DEFINE_float(
-    'temperature', 0.8,
-    'Sampling temperature for LLM action selection.')
-flags.DEFINE_float(
-    'lr', 1e-5,
-    'Learning rate for the LoRA adapter.')
-flags.DEFINE_integer(
-    'lora_rank', 16,
-    'LoRA adapter rank.')
-flags.DEFINE_integer(
-    'lora_alpha', 32,
-    'LoRA scaling alpha.')
-flags.DEFINE_float(
-    'lora_dropout', 0.05,
-    'LoRA dropout probability.')
+    'temperature', 0.8, 'Sampling temperature for LLM action selection.'
+)
+flags.DEFINE_float('lr', 1e-5, 'Learning rate for the LoRA adapter.')
+flags.DEFINE_integer('lora_rank', 16, 'LoRA adapter rank.')
+flags.DEFINE_integer('lora_alpha', 32, 'LoRA scaling alpha.')
+flags.DEFINE_float('lora_dropout', 0.05, 'LoRA dropout probability.')
 flags.DEFINE_string(
-    'model_name', 'google/gemma-2-2b',
-    'HuggingFace model ID for Gemma 2B.')
+    'model_name', 'google/gemma-2-2b', 'HuggingFace model ID for Gemma 2B.'
+)
 flags.DEFINE_bool(
-    'use_4bit', True,
-    'Use 4-bit NF4 quantization for the base model.')
+    'use_4bit', True, 'Use 4-bit NF4 quantization for the base model.'
+)
 flags.DEFINE_string(
-    'output_dir', '/tmp/teamgamesrl',
-    'Directory for checkpoints, logs, and metrics.')
+    'output_dir',
+    '/tmp/teamgamesrl',
+    'Directory for checkpoints, logs, and metrics.',
+)
 flags.DEFINE_integer(
-    'log_every', 10,
-    'Log training metrics every this many episodes.')
+    'log_every', 10, 'Log training metrics every this many episodes.'
+)
 flags.DEFINE_integer(
-    'checkpoint_every', 100,
-    'Save a LoRA checkpoint every this many episodes.')
+    'checkpoint_every', 100, 'Save a LoRA checkpoint every this many episodes.'
+)
+flags.DEFINE_integer('seed', 42, 'Random seed for reproducibility.')
 flags.DEFINE_integer(
-    'seed', 42,
-    'Random seed for reproducibility.')
+    'max_seq_len', 512, 'Maximum sequence length for the model.'
+)
+flags.DEFINE_float('max_grad_norm', 1.0, 'Maximum gradient norm for clipping.')
+flags.DEFINE_bool('use_wandb', False, 'Enable Weights & Biases logging.')
+flags.DEFINE_string('wandb_project', 'TeamGamesRL', 'Wandb project name.')
 flags.DEFINE_integer(
-    'max_seq_len', 512,
-    'Maximum sequence length for the model.')
-flags.DEFINE_float(
-    'max_grad_norm', 1.0,
-    'Maximum gradient norm for clipping.')
-flags.DEFINE_bool(
-    'use_wandb', False,
-    'Enable Weights & Biases logging.')
-flags.DEFINE_string(
-    'wandb_project', 'TeamGamesRL',
-    'Wandb project name.')
-flags.DEFINE_integer(
-    'log_episodes_every', 10,
+    'log_episodes_every',
+    10,
     'Log full episode transcripts (game state + LLM responses) every this '
-    'many episodes. Set to 0 to disable.')
+    'many episodes. Set to 0 to disable.',
+)
 flags.DEFINE_float(
-    'kl_coeff', 0.05,
+    'kl_coeff',
+    0.05,
     'KL penalty coefficient against the reference (pre-trained) model. '
-    'Prevents mode collapse and language degradation.')
+    'Prevents mode collapse and language degradation.',
+)
 flags.DEFINE_float(
-    'reward_baseline_decay', 0.95,
+    'reward_baseline_decay',
+    0.95,
     'DEPRECATED — replaced by sliding window baseline. '
-    'Kept for backward compatibility.')
+    'Kept for backward compatibility.',
+)
 flags.DEFINE_integer(
-    'gradient_accumulation_steps', 8,
+    'gradient_accumulation_steps',
+    8,
     'Number of episodes to accumulate gradients over before '
-    'updating the model. Reduces REINFORCE variance by ~sqrt(N).')
+    'updating the model. Reduces REINFORCE variance by ~sqrt(N).',
+)
 flags.DEFINE_integer(
-    'baseline_window_size', 50,
+    'baseline_window_size',
+    50,
     'Number of recent episodes to use for the reward baseline '
-    '(sliding window mean). Replaces the EMA baseline.')
+    '(sliding window mean). Replaces the EMA baseline.',
+)
 
 # GRPO-specific flags.
 flags.DEFINE_integer(
-    'grpo_num_generations', 4,
-    'Number of completions to sample per prompt in GRPO (group size K).')
+    'grpo_num_generations',
+    4,
+    'Number of completions to sample per prompt in GRPO (group size K).',
+)
 flags.DEFINE_integer(
-    'grpo_collect_episodes', 50,
+    'grpo_collect_episodes',
+    50,
     'Number of episodes to play for collecting game state prompts '
-    'before each GRPO training pass.')
+    'before each GRPO training pass.',
+)
 flags.DEFINE_integer(
-    'grpo_train_epochs', 1,
-    'Number of training epochs per GRPO pass.')
+    'grpo_train_epochs', 1, 'Number of training epochs per GRPO pass.'
+)
 flags.DEFINE_integer(
-    'grpo_passes', 10,
-    'Number of collect-then-train passes for GRPO.')
+    'grpo_passes', 10, 'Number of collect-then-train passes for GRPO.'
+)
 flags.DEFINE_integer(
-    'grpo_max_completion_length', 64,
-    'Maximum completion length for GRPO generation.')
+    'grpo_max_completion_length',
+    64,
+    'Maximum completion length for GRPO generation.',
+)
 
 
 # ============================================================================
@@ -179,6 +186,7 @@ flags.DEFINE_integer(
 @dataclasses.dataclass(frozen=True)
 class GameConfig:
   """Configuration for an OpenSpiel game."""
+
   game_name: str
   game_params: dict[str, object]
   num_players: int
@@ -202,11 +210,13 @@ def _lazy_import_hf():
   if transformers is None:
     import transformers as _transformers
     import peft as _peft
+
     transformers = _transformers
     peft = _peft
   try:
     if trl is None:
       import trl as _trl
+
       trl = _trl
   except ImportError:
     logging.warning('trl not installed — PPOTrainer unavailable.')
@@ -289,7 +299,8 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
 
     # ── Tokenizer ──
     self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_name, token=self._hf_token)
+        model_name, token=self._hf_token
+    )
     if self.tokenizer.pad_token is None:
       self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -345,7 +356,7 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
       )
 
     # Decode only the newly generated tokens.
-    new_tokens = output_ids[0, inputs['input_ids'].shape[1]:]
+    new_tokens = output_ids[0, inputs['input_ids'].shape[1] :]
     return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
   def generate_with_logprobs(
@@ -396,13 +407,13 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
     # Compute log-probs for the response tokens only.
     # logits[t] predicts token[t+1], so we take logits[prompt_len-1:-1]
     # and compare against input_ids[prompt_len:].
-    response_logits = logits[0, prompt_len - 1:-1, :]  # (response_len, vocab)
+    response_logits = logits[0, prompt_len - 1 : -1, :]  # (response_len, vocab)
     response_ids = inputs['input_ids'][0, prompt_len:]  # (response_len,)
 
     log_probs = torch.log_softmax(response_logits, dim=-1)
-    token_log_probs = log_probs.gather(
-        1, response_ids.unsqueeze(1)
-    ).squeeze(1)  # (response_len,)
+    token_log_probs = log_probs.gather(1, response_ids.unsqueeze(1)).squeeze(
+        1
+    )  # (response_len,)
 
     total_log_prob = float(token_log_probs.sum().item())
     return text, total_log_prob
@@ -443,13 +454,11 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
     outputs = self.model(**inputs)
     logits = outputs.logits
 
-    response_logits = logits[0, prompt_len - 1:-1, :]
+    response_logits = logits[0, prompt_len - 1 : -1, :]
     response_ids = inputs['input_ids'][0, prompt_len:]
 
     log_probs = torch.log_softmax(response_logits, dim=-1)
-    token_log_probs = log_probs.gather(
-        1, response_ids.unsqueeze(1)
-    ).squeeze(1)
+    token_log_probs = log_probs.gather(1, response_ids.unsqueeze(1)).squeeze(1)
 
     return token_log_probs.sum()
 
@@ -472,6 +481,7 @@ class RLTrajectoryStep:
     llm_response: The raw text response from the LLM.
     game_action_text: The game's canonical action string.
   """
+
   prompt: str
   action_text: str
   action_id: int
@@ -490,6 +500,7 @@ class PlayerTrajectory:
     steps: List of RLTrajectoryStep objects.
     reward: The final reward for this player.
   """
+
   player_id: int
   steps: list[RLTrajectoryStep] = dataclasses.field(default_factory=list)
   reward: float = 0.0
@@ -542,8 +553,8 @@ class GemmaRLTrainer:
     """
     if game_name not in _GAME_CONFIGS:
       raise ValueError(
-          f'Unknown game: {game_name}. '
-          f'Available: {list(_GAME_CONFIGS.keys())}')
+          f'Unknown game: {game_name}. Available: {list(_GAME_CONFIGS.keys())}'
+      )
 
     self.game_config = _GAME_CONFIGS[game_name]
     self.game_name = game_name
@@ -555,9 +566,11 @@ class GemmaRLTrainer:
 
     # ── OpenSpiel environment ──
     from open_spiel.python import rl_environment
+
     if self.game_config.game_params:
       self.env = rl_environment.Environment(
-          self.game_config.game_name, **self.game_config.game_params)
+          self.game_config.game_name, **self.game_config.game_params
+      )
     else:
       self.env = rl_environment.Environment(self.game_config.game_name)
 
@@ -591,6 +604,22 @@ class GemmaRLTrainer:
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # ── Results directory for persistent metrics ──
+    self.results_dir = os.path.join(output_dir, 'results')
+    os.makedirs(self.results_dir, exist_ok=True)
+
+    # Initialize training metrics CSV.
+    self._train_csv_path = os.path.join(
+        self.results_dir, 'training_metrics.csv'
+    )
+    with open(self._train_csv_path, 'w') as f:
+      f.write('episode,reward,loss,avg_reward,avg_loss,elapsed_sec\n')
+
+    # Initialize eval metrics CSV.
+    self._eval_csv_path = os.path.join(self.results_dir, 'eval_metrics.csv')
+    # Eval CSV header will be written dynamically on first eval (keys depend on game).
+    self._eval_csv_header_written = False
+
     # ── Reference model for KL penalty (frozen copy) ──
     # Keeps a detached copy of the initial LoRA weights to compute
     # KL divergence, preventing mode collapse.
@@ -608,10 +637,14 @@ class GemmaRLTrainer:
 
     logging.info(
         'GemmaRLTrainer ready: game=%s, lr=%g, lora_params=%d',
-        game_name, lr, sum(p.numel() for p in trainable_params))
+        game_name,
+        lr,
+        sum(p.numel() for p in trainable_params),
+    )
 
   def run_episode(
-      self, is_evaluation: bool = False,
+      self,
+      is_evaluation: bool = False,
   ) -> list[PlayerTrajectory]:
     """Plays one full episode, collecting trajectory data per player.
 
@@ -632,40 +665,47 @@ class GemmaRLTrainer:
       # Render state text.
       state = self.env._state  # pylint: disable=protected-access
       state_text = self.renderers[current_player].render_state(
-          state, current_player, self.env.game)
+          state, current_player, self.env.game
+      )
 
       # Get legal actions with descriptions.
-      legal_actions_with_desc = self.renderers[current_player] \
-          .render_legal_actions(state, current_player, self.env.game)
+      legal_actions_with_desc = self.renderers[
+          current_player
+      ].render_legal_actions(state, current_player, self.env.game)
       legal_actions = [a for a, _ in legal_actions_with_desc]
       action_descriptions = [d for _, d in legal_actions_with_desc]
 
       # Build prompt.
       prompt = self.agents[current_player]._build_prompt(
-          state_text, legal_actions, action_descriptions)
+          state_text, legal_actions, action_descriptions
+      )
 
       # Generate action.
       temp = 0.01 if is_evaluation else FLAGS.temperature
       response, log_prob = self.backend.generate_with_logprobs(
-          prompt, temperature=temp, max_tokens=64)
+          prompt, temperature=temp, max_tokens=64
+      )
 
       # Parse action.
       action_id = self.renderers[current_player].parse_action(
-          response, legal_actions_with_desc)
+          response, legal_actions_with_desc
+      )
       if action_id is None:
         action_id = int(np.random.choice(legal_actions))
 
       action_text = state.action_to_string(current_player, action_id)
 
-      trajectories[current_player].steps.append(RLTrajectoryStep(
-          prompt=prompt,
-          action_text=response.strip(),
-          action_id=action_id,
-          log_prob=log_prob,
-          state_text=state_text,
-          llm_response=response,
-          game_action_text=action_text,
-      ))
+      trajectories[current_player].steps.append(
+          RLTrajectoryStep(
+              prompt=prompt,
+              action_text=response.strip(),
+              action_id=action_id,
+              log_prob=log_prob,
+              state_text=state_text,
+              llm_response=response,
+              game_action_text=action_text,
+          )
+      )
 
       time_step = self.env.step([action_id])
 
@@ -677,7 +717,8 @@ class GemmaRLTrainer:
     return trajectories
 
   def compute_and_apply_reinforce_loss(
-      self, trajectories: list[PlayerTrajectory],
+      self,
+      trajectories: list[PlayerTrajectory],
   ) -> float:
     """Computes REINFORCE loss with sliding-window baseline and KL penalty.
 
@@ -722,7 +763,8 @@ class GemmaRLTrainer:
       for step in traj.steps:
         # Recompute log-prob *with gradients*.
         log_prob = self.backend.compute_action_log_prob(
-            step.prompt, step.action_text)
+            step.prompt, step.action_text
+        )
 
         # Prevent -inf only; do NOT clamp max — clamping near-zero
         # log-probs kills gradients for confident predictions.
@@ -751,7 +793,8 @@ class GemmaRLTrainer:
     # Step optimizer every accum_steps episodes.
     if self._grad_accum_count >= accum_steps:
       torch.nn.utils.clip_grad_norm_(
-          self.backend.model.parameters(), self.max_grad_norm)
+          self.backend.model.parameters(), self.max_grad_norm
+      )
       self.optimizer.step()
       self.optimizer.zero_grad()
       self._grad_accum_count = 0
@@ -804,8 +847,7 @@ class GemmaRLTrainer:
     if suffix:
       ckpt_dir = os.path.join(self.output_dir, f'checkpoint_{suffix}')
     else:
-      ckpt_dir = os.path.join(
-          self.output_dir, f'checkpoint_ep{episode}')
+      ckpt_dir = os.path.join(self.output_dir, f'checkpoint_ep{episode}')
     self.backend.model.save_pretrained(ckpt_dir)
     self.backend.tokenizer.save_pretrained(ckpt_dir)
     logging.info('Checkpoint saved: %s', ckpt_dir)
@@ -867,7 +909,9 @@ class GemmaRLTrainer:
     """
     logging.info(
         'Starting Gemma RL training: %d episodes on %s',
-        self.num_episodes, self.game_name)
+        self.num_episodes,
+        self.game_name,
+    )
     start_time = time.time()
     log_every = FLAGS.log_every
     checkpoint_every = FLAGS.checkpoint_every
@@ -875,6 +919,7 @@ class GemmaRLTrainer:
     # Optional W&B init.
     if FLAGS.use_wandb:
       import wandb  # pylint: disable=g-import-not-at-top
+
       wandb.init(
           project=FLAGS.wandb_project,
           config={
@@ -894,6 +939,15 @@ class GemmaRLTrainer:
       trajectories = self.run_episode(is_evaluation=False)
       loss = self.compute_and_apply_reinforce_loss(trajectories)
 
+      # ── Per-episode progress (lightweight) ──
+      ep_elapsed = time.time() - start_time
+      mean_r = float(np.mean([t.reward for t in trajectories]))
+      actions_str = ' | '.join(
+          f'P{t.player_id}:[{",".join(s.game_action_text for s in t.steps)}]'
+          for t in trajectories)
+      print(f'[ep {ep}/{self.num_episodes}] reward={mean_r:.3f} '
+            f'loss={loss:.4f} ({ep_elapsed:.1f}s) {actions_str}', flush=True)
+
       # ── Episode logging ──
       log_episodes_every = FLAGS.log_episodes_every
       if log_episodes_every > 0 and ep % log_episodes_every == 0:
@@ -909,7 +963,8 @@ class GemmaRLTrainer:
       # Track per-player wins (for competitive games).
       max_r = max(ep_rewards)
       winners = [
-          p for p in range(self.game_config.num_players)
+          p
+          for p in range(self.game_config.num_players)
           if ep_rewards[p] == max_r
       ]
       if len(winners) == 1:
@@ -927,10 +982,25 @@ class GemmaRLTrainer:
         logging.info(
             'Ep %d/%d | reward=%.4f (avg=%.4f) | loss=%.4f (avg=%.4f) | '
             '%.1f sec elapsed',
-            ep, self.num_episodes, mean_reward, avg_r, loss, avg_l, elapsed)
+            ep,
+            self.num_episodes,
+            mean_reward,
+            avg_r,
+            loss,
+            avg_l,
+            elapsed,
+        )
+
+        # ── Write training metrics to CSV ──
+        with open(self._train_csv_path, 'a') as f:
+          f.write(
+              f'{ep},{mean_reward:.6f},{loss:.6f},'
+              f'{avg_r:.6f},{avg_l:.6f},{elapsed:.1f}\n'
+          )
 
         if FLAGS.use_wandb:
           import wandb  # pylint: disable=g-import-not-at-top
+
           wandb.log({
               'episode': ep,
               'reward': mean_reward,
@@ -942,12 +1012,24 @@ class GemmaRLTrainer:
       # ── Evaluation ──
       if ep % self.eval_every == 0:
         logging.info('--- Evaluation at episode %d ---', ep)
-        eval_metrics = self.evaluate(
-            num_episodes=FLAGS.num_eval_episodes)
+        eval_metrics = self.evaluate(num_episodes=FLAGS.num_eval_episodes)
         for k, v in sorted(eval_metrics.items()):
           logging.info('  %s: %.4f', k, v)
+
+        # ── Write eval metrics to CSV ──
+        with open(self._eval_csv_path, 'a') as f:
+          if not self._eval_csv_header_written:
+            header = 'episode,' + ','.join(sorted(eval_metrics.keys()))
+            f.write(header + '\n')
+            self._eval_csv_header_written = True
+          vals = ','.join(
+              f'{eval_metrics[k]:.6f}' for k in sorted(eval_metrics.keys())
+          )
+          f.write(f'{ep},{vals}\n')
+
         if FLAGS.use_wandb:
           import wandb  # pylint: disable=g-import-not-at-top
+
           wandb.log(eval_metrics, step=ep)
 
       # ── Checkpoint ──
@@ -957,33 +1039,75 @@ class GemmaRLTrainer:
     # ── Flush remaining accumulated gradients ──
     if self._grad_accum_count > 0:
       torch.nn.utils.clip_grad_norm_(
-          self.backend.model.parameters(), self.max_grad_norm)
+          self.backend.model.parameters(), self.max_grad_norm
+      )
       self.optimizer.step()
       self.optimizer.zero_grad()
       self._grad_accum_count = 0
 
     # ── Final summary ──
     total_time = time.time() - start_time
-    logging.info('Training complete: %d episodes in %.1f seconds.',
-                 self.num_episodes, total_time)
-    logging.info('Final mean reward: %.4f',
-                 float(np.mean(self._episode_rewards)))
-    logging.info('Final mean loss: %.4f',
-                 float(np.mean(self._episode_losses)))
+    logging.info(
+        'Training complete: %d episodes in %.1f seconds.',
+        self.num_episodes,
+        total_time,
+    )
+    logging.info(
+        'Final mean reward: %.4f', float(np.mean(self._episode_rewards))
+    )
+    logging.info('Final mean loss: %.4f', float(np.mean(self._episode_losses)))
     for p in range(self.game_config.num_players):
-      logging.info('  Player %d win rate: %.1f%% (%d/%d)',
-                   p,
-                   100.0 * self._player_wins[p] / self._total_episodes,
-                   self._player_wins[p], self._total_episodes)
-    logging.info('  Team win rate (reward >= 8): %.1f%% (%d/%d)',
-                 100.0 * self._team_wins / self._total_episodes,
-                 self._team_wins, self._total_episodes)
+      logging.info(
+          '  Player %d win rate: %.1f%% (%d/%d)',
+          p,
+          100.0 * self._player_wins[p] / self._total_episodes,
+          self._player_wins[p],
+          self._total_episodes,
+      )
+    logging.info(
+        '  Team win rate (reward >= 8): %.1f%% (%d/%d)',
+        100.0 * self._team_wins / self._total_episodes,
+        self._team_wins,
+        self._total_episodes,
+    )
+
+    # ── Write final summary JSON ──
+    summary = {
+        'game': self.game_name,
+        'model': FLAGS.model_name,
+        'lora_rank': FLAGS.lora_rank,
+        'lr': FLAGS.lr,
+        'num_episodes': self.num_episodes,
+        'total_time_sec': round(total_time, 1),
+        'final_mean_reward': round(float(np.mean(self._episode_rewards)), 4),
+        'final_mean_loss': round(float(np.mean(self._episode_losses)), 4),
+        'last_10_mean_reward': round(
+            float(np.mean(self._episode_rewards[-10:])), 4
+        ),
+        'last_10_mean_loss': round(
+            float(np.mean(self._episode_losses[-10:])), 4
+        ),
+        'player_win_rates': {
+            f'player_{p}': round(
+                100.0 * self._player_wins[p] / self._total_episodes, 2
+            )
+            for p in range(self.game_config.num_players)
+        },
+        'team_win_rate': round(
+            100.0 * self._team_wins / self._total_episodes, 2
+        ),
+    }
+    summary_path = os.path.join(self.results_dir, 'summary.json')
+    with open(summary_path, 'w') as f:
+      json.dump(summary, f, indent=2)
+    logging.info('Results written to %s', self.results_dir)
 
     # Save final checkpoint.
     self.save_checkpoint(self.num_episodes)
 
     if FLAGS.use_wandb:
       import wandb  # pylint: disable=g-import-not-at-top
+
       wandb.finish()
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -991,7 +1115,8 @@ class GemmaRLTrainer:
   # ════════════════════════════════════════════════════════════════════════════
 
   def collect_game_prompts(
-      self, num_episodes: int,
+      self,
+      num_episodes: int,
   ) -> list[dict]:
     """Plays episodes to collect game state prompts with metadata.
 
@@ -1016,15 +1141,17 @@ class GemmaRLTrainer:
         state = self.env._state  # pylint: disable=protected-access
 
         state_text = self.renderers[current_player].render_state(
-            state, current_player, self.env.game)
+            state, current_player, self.env.game
+        )
         legal_actions_with_desc = self.renderers[
-            current_player].render_legal_actions(
-                state, current_player, self.env.game)
+            current_player
+        ].render_legal_actions(state, current_player, self.env.game)
         legal_actions = [a for a, _ in legal_actions_with_desc]
         action_descriptions = [d for _, d in legal_actions_with_desc]
 
         prompt = self.agents[current_player]._build_prompt(
-            state_text, legal_actions, action_descriptions)
+            state_text, legal_actions, action_descriptions
+        )
 
         prompts.append({
             'prompt': prompt,
@@ -1036,17 +1163,22 @@ class GemmaRLTrainer:
 
         # Play this turn with current policy to advance the game.
         response, _ = self.backend.generate_with_logprobs(
-            prompt, temperature=FLAGS.temperature, max_tokens=64)
+            prompt, temperature=FLAGS.temperature, max_tokens=64
+        )
         action_id = self.renderers[current_player].parse_action(
-            response, legal_actions_with_desc)
+            response, legal_actions_with_desc
+        )
         if action_id is None:
           action_id = int(np.random.choice(legal_actions))
 
         action_history.append(action_id)
         time_step = self.env.step([action_id])
 
-    logging.info('Collected %d turn-level prompts from %d episodes.',
-                 len(prompts), num_episodes)
+    logging.info(
+        'Collected %d turn-level prompts from %d episodes.',
+        len(prompts),
+        num_episodes,
+    )
     return prompts
 
   def _simulate_from_state(
@@ -1056,6 +1188,7 @@ class GemmaRLTrainer:
       target_player: int,
   ) -> float:
     """Replays a game from the initial state, applying chosen_action at
+
     the target decision point, then plays out remaining turns with the
     current policy.
 
@@ -1085,19 +1218,23 @@ class GemmaRLTrainer:
       state = self.env._state  # pylint: disable=protected-access
 
       state_text = self.renderers[current_player].render_state(
-          state, current_player, self.env.game)
+          state, current_player, self.env.game
+      )
       legal_actions_with_desc = self.renderers[
-          current_player].render_legal_actions(
-              state, current_player, self.env.game)
+          current_player
+      ].render_legal_actions(state, current_player, self.env.game)
       legal_actions = [a for a, _ in legal_actions_with_desc]
       action_descriptions = [d for _, d in legal_actions_with_desc]
 
       prompt = self.agents[current_player]._build_prompt(
-          state_text, legal_actions, action_descriptions)
+          state_text, legal_actions, action_descriptions
+      )
       response, _ = self.backend.generate_with_logprobs(
-          prompt, temperature=FLAGS.temperature, max_tokens=64)
+          prompt, temperature=FLAGS.temperature, max_tokens=64
+      )
       action_id = self.renderers[current_player].parse_action(
-          response, legal_actions_with_desc)
+          response, legal_actions_with_desc
+      )
       if action_id is None:
         action_id = int(np.random.choice(legal_actions))
 
@@ -1122,18 +1259,22 @@ class GemmaRLTrainer:
     if trl is None:
       try:
         import trl as _trl
+
         trl = _trl
       except ImportError:
         raise ImportError(
-            'TRL is required for GRPO training. '
-            'Install with: pip install trl')
+            'TRL is required for GRPO training. Install with: pip install trl'
+        )
 
     from datasets import Dataset  # pylint: disable=g-import-not-at-top
 
     logging.info('=== Starting GRPO training ===')
-    logging.info('Passes: %d, episodes/pass: %d, group size: %d',
-                 FLAGS.grpo_passes, FLAGS.grpo_collect_episodes,
-                 FLAGS.grpo_num_generations)
+    logging.info(
+        'Passes: %d, episodes/pass: %d, group size: %d',
+        FLAGS.grpo_passes,
+        FLAGS.grpo_collect_episodes,
+        FLAGS.grpo_num_generations,
+    )
 
     start_time = time.time()
 
@@ -1151,7 +1292,8 @@ class GemmaRLTrainer:
         elif isinstance(completion, list):
           # Tokenized completion — decode it.
           comp_text = self.backend.tokenizer.decode(
-              completion, skip_special_tokens=True)
+              completion, skip_special_tokens=True
+          )
         else:
           comp_text = str(completion)
 
@@ -1165,7 +1307,8 @@ class GemmaRLTrainer:
 
         # Parse the action from the completion.
         action_id = self.renderers[player_id].parse_action(
-            comp_text, legal_actions_desc)
+            comp_text, legal_actions_desc
+        )
         if action_id is None:
           if legal_actions:
             action_id = int(np.random.choice(legal_actions))
@@ -1174,8 +1317,7 @@ class GemmaRLTrainer:
             continue
 
         # Simulate the game from the saved state.
-        reward = self._simulate_from_state(
-            action_history, action_id, player_id)
+        reward = self._simulate_from_state(action_history, action_id, player_id)
         rewards.append(torch.tensor(float(reward)))
 
       return rewards
@@ -1185,8 +1327,7 @@ class GemmaRLTrainer:
 
       # Phase 1: Collect game state prompts.
       self.backend.model.eval()
-      prompt_dicts = self.collect_game_prompts(
-          FLAGS.grpo_collect_episodes)
+      prompt_dicts = self.collect_game_prompts(FLAGS.grpo_collect_episodes)
 
       # Store metadata for the reward function.
       self._prompt_metadata = {}
@@ -1197,22 +1338,23 @@ class GemmaRLTrainer:
 
       # Deduplicate prompts (same state can appear multiple times).
       unique_prompts = list(dict.fromkeys(prompt_texts))
-      logging.info('Unique prompts: %d (from %d total)',
-                   len(unique_prompts), len(prompt_texts))
+      logging.info(
+          'Unique prompts: %d (from %d total)',
+          len(unique_prompts),
+          len(prompt_texts),
+      )
 
       # Phase 2: Build HuggingFace dataset.
       dataset = Dataset.from_dict({'prompt': unique_prompts})
 
       # Phase 3: Configure and run GRPOTrainer.
       grpo_config = trl.GRPOConfig(
-          output_dir=os.path.join(
-              self.output_dir, f'grpo_pass_{pass_num}'),
+          output_dir=os.path.join(self.output_dir, f'grpo_pass_{pass_num}'),
           num_generations=FLAGS.grpo_num_generations,
           max_completion_length=FLAGS.grpo_max_completion_length,
           learning_rate=FLAGS.lr,
           beta=FLAGS.kl_coeff,
-          per_device_train_batch_size=min(
-              len(unique_prompts), 4),
+          per_device_train_batch_size=min(len(unique_prompts), 4),
           num_train_epochs=FLAGS.grpo_train_epochs,
           logging_steps=1,
           save_strategy='no',
@@ -1235,8 +1377,7 @@ class GemmaRLTrainer:
       # Phase 4: Evaluate after this pass.
       logging.info('--- Evaluation after GRPO pass %d ---', pass_num)
       self.backend.model.eval()
-      eval_metrics = self.evaluate(
-          num_episodes=FLAGS.num_eval_episodes)
+      eval_metrics = self.evaluate(num_episodes=FLAGS.num_eval_episodes)
       for k, v in sorted(eval_metrics.items()):
         logging.info('  %s: %.4f', k, v)
 
@@ -1244,12 +1385,14 @@ class GemmaRLTrainer:
       self.save_checkpoint(pass_num * FLAGS.grpo_collect_episodes)
 
       elapsed = time.time() - start_time
-      logging.info('Pass %d complete. %.1f sec elapsed.', pass_num,
-                   elapsed)
+      logging.info('Pass %d complete. %.1f sec elapsed.', pass_num, elapsed)
 
     total_time = time.time() - start_time
-    logging.info('GRPO training complete: %d passes in %.1f seconds.',
-                 FLAGS.grpo_passes, total_time)
+    logging.info(
+        'GRPO training complete: %d passes in %.1f seconds.',
+        FLAGS.grpo_passes,
+        total_time,
+    )
     self.save_checkpoint(0, suffix='final')
 
 
@@ -1258,7 +1401,9 @@ class GemmaRLTrainer:
 # ============================================================================
 
 
-def _create_renderer(game_config: GameConfig) -> state_renderers.BaseStateRenderer:
+def _create_renderer(
+    game_config: GameConfig,
+) -> state_renderers.BaseStateRenderer:
   """Creates a state renderer for the given game."""
   if game_config.game_name == 'tiny_hanabi':
     return state_renderers.TinyHanabiRenderer()
@@ -1285,10 +1430,18 @@ def main(argv: list[str]) -> None:
   logging.info('=== TeamGamesRL — Gemma 2B RL Training ===')
   logging.info('Game: %s', FLAGS.game)
   logging.info('Model: %s (4-bit=%s)', FLAGS.model_name, FLAGS.use_4bit)
-  logging.info('LoRA: rank=%d, alpha=%d, dropout=%.2f',
-               FLAGS.lora_rank, FLAGS.lora_alpha, FLAGS.lora_dropout)
-  logging.info('Training: episodes=%d, lr=%g, temp=%.2f',
-               FLAGS.num_episodes, FLAGS.lr, FLAGS.temperature)
+  logging.info(
+      'LoRA: rank=%d, alpha=%d, dropout=%.2f',
+      FLAGS.lora_rank,
+      FLAGS.lora_alpha,
+      FLAGS.lora_dropout,
+  )
+  logging.info(
+      'Training: episodes=%d, lr=%g, temp=%.2f',
+      FLAGS.num_episodes,
+      FLAGS.lr,
+      FLAGS.temperature,
+  )
 
   # ── Load model ──
   backend = GemmaLLMBackend(
