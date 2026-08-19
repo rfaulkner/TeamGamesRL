@@ -35,7 +35,7 @@ set -euo pipefail
 GAME="${1:-tiny_hanabi}"
 MODEL_ID="${2:-google/gemma-2-2b}"
 LORA_RANK="${3:-16}"
-LR="${4:-1e-4}"
+LR="${4:-3e-5}"
 NUM_EPISODES="${5:-500}"
 
 # ── Derived settings ─────────────────────────────────────────────────────────

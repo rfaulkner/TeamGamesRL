@@ -29,10 +29,9 @@ Usage:
 from absl import app
 from absl import flags
 from absl import logging
+from env.game_config import AVAILABLE_GAMES
 import numpy as np
 import torch
-
-from env.game_config import AVAILABLE_GAMES
 
 FLAGS = flags.FLAGS
 
@@ -65,7 +64,7 @@ flags.DEFINE_integer(
 flags.DEFINE_float(
     'temperature', 0.8, 'Sampling temperature for LLM action selection.'
 )
-flags.DEFINE_float('lr', 1e-5, 'Learning rate for the LoRA adapter.')
+flags.DEFINE_float('lr', 3e-5, 'Learning rate for the LoRA adapter.')
 flags.DEFINE_integer('lora_rank', 16, 'LoRA adapter rank.')
 flags.DEFINE_integer('lora_alpha', 32, 'LoRA scaling alpha.')
 flags.DEFINE_float('lora_dropout', 0.05, 'LoRA dropout probability.')
@@ -121,7 +120,7 @@ flags.DEFINE_integer(
 # GRPO-specific flags.
 flags.DEFINE_integer(
     'grpo_num_generations',
-    4,
+    8,
     'Number of completions to sample per prompt in GRPO (group size K).',
 )
 flags.DEFINE_integer(
@@ -134,11 +133,11 @@ flags.DEFINE_integer(
     'grpo_train_epochs', 1, 'Number of training epochs per GRPO pass.'
 )
 flags.DEFINE_integer(
-    'grpo_passes', 10, 'Number of collect-then-train passes for GRPO.'
+    'grpo_passes', 25, 'Number of collect-then-train passes for GRPO.'
 )
 flags.DEFINE_integer(
     'grpo_max_completion_length',
-    64,
+    16,
     'Maximum completion length for GRPO generation.',
 )
 

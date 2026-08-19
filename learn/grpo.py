@@ -41,11 +41,10 @@ import time
 from typing import Callable, Optional
 
 from absl import logging
-import numpy as np
-import torch
-
 from learn.trajectory import PlayerTrajectory
 from learn.trajectory import RLTrajectoryStep
+import numpy as np
+import torch
 
 
 @dataclasses.dataclass
@@ -53,26 +52,27 @@ class GRPOConfig:
   """Configuration for the GRPO training algorithm.
 
   Attributes:
-    num_generations: Number of completions to sample per prompt in GRPO
-        (group size K).
+    num_generations: Number of completions to sample per prompt in GRPO (group
+      size K).
     collect_episodes: Number of episodes to play for collecting game state
-        prompts before each GRPO training pass.
+      prompts before each GRPO training pass.
     train_epochs: Number of training epochs per GRPO pass.
     passes: Number of collect-then-train passes for GRPO.
     max_completion_length: Maximum completion length for GRPO generation.
     lr: Learning rate for the optimizer.
     kl_coeff: KL penalty coefficient.
     max_grad_norm: Maximum gradient norm for clipping.
-    temperature: Sampling temperature for LLM action selection during
-        data collection.
+    temperature: Sampling temperature for LLM action selection during data
+      collection.
     num_eval_episodes: Number of episodes per evaluation round.
   """
-  num_generations: int = 4
+
+  num_generations: int = 8
   collect_episodes: int = 50
   train_epochs: int = 1
-  passes: int = 10
-  max_completion_length: int = 64
-  lr: float = 1e-5
+  passes: int = 25
+  max_completion_length: int = 16
+  lr: float = 3e-5
   kl_coeff: float = 0.05
   max_grad_norm: float = 1.0
   temperature: float = 0.8
@@ -102,11 +102,13 @@ class GRPORunner:
     _save_checkpoint_fn: Callable (episode, suffix) -> checkpoint path.
     _output_dir: Directory for logs and checkpoints.
     _config: The GRPOConfig.
-    _prompt_metadata: Dict mapping prompt text to game-state metadata
-        needed for reward simulation.
+    _prompt_metadata: Dict mapping prompt text to game-state metadata needed for
+      reward simulation.
     _log_eval_metrics_fn: Optional callable (episode, metrics_dict) -> None.
-    _log_training_step_fn: Optional callable (episode, reward, loss, start_time) -> None.
-    _log_episode_fn: Optional callable (episode, trajectories, loss, is_eval) -> None.
+    _log_training_step_fn: Optional callable (episode, reward, loss, start_time)
+      -> None.
+    _log_episode_fn: Optional callable (episode, trajectories, loss, is_eval) ->
+      None.
     _write_summary_fn: Optional callable (total_time) -> None.
     _update_metrics_fn: Optional callable (trajectories, loss) -> float.
   """
@@ -122,11 +124,19 @@ class GRPORunner:
       save_checkpoint_fn: Callable[..., str],
       output_dir: str,
       config: GRPOConfig,
-      log_eval_metrics_fn: Optional[Callable[[int, dict[str, float]], None]] = None,
-      log_training_step_fn: Optional[Callable[[int, float, float, float], None]] = None,
-      log_episode_fn: Optional[Callable[[int, list[PlayerTrajectory], float, bool], None]] = None,
+      log_eval_metrics_fn: Optional[
+          Callable[[int, dict[str, float]], None]
+      ] = None,
+      log_training_step_fn: Optional[
+          Callable[[int, float, float, float], None]
+      ] = None,
+      log_episode_fn: Optional[
+          Callable[[int, list[PlayerTrajectory], float, bool], None]
+      ] = None,
       write_summary_fn: Optional[Callable[[float], None]] = None,
-      update_metrics_fn: Optional[Callable[[list[PlayerTrajectory], float], float]] = None,
+      update_metrics_fn: Optional[
+          Callable[[list[PlayerTrajectory], float], float]
+      ] = None,
   ):
     """Initializes the GRPORunner.
 
@@ -134,18 +144,17 @@ class GRPORunner:
       env: The OpenSpiel rl_environment.Environment.
       renderers: List of BaseStateRenderer, one per player.
       agents: List of LLMAgent, one per player.
-      backend: The LLM backend (with model, tokenizer,
-          generate_with_logprobs).
+      backend: The LLM backend (with model, tokenizer, generate_with_logprobs).
       game_config: The GameConfig for the current game.
-      evaluate_fn: A callable ``(num_episodes: int) -> dict[str, float]``
-          for running evaluation.
+      evaluate_fn: A callable ``(num_episodes: int) -> dict[str, float]`` for
+        running evaluation.
       save_checkpoint_fn: A callable ``(episode: int, suffix: str) -> str`` for
-          saving checkpoints.
+        saving checkpoints.
       output_dir: The output directory path.
       config: A GRPOConfig instance.
       log_eval_metrics_fn: Optional callable for logging eval metrics to CSV.
-      log_training_step_fn: Optional callable for logging training step
-          metrics to CSV.
+      log_training_step_fn: Optional callable for logging training step metrics
+        to CSV.
       log_episode_fn: Optional callable for writing JSONL episode transcripts.
       write_summary_fn: Optional callable for writing summary.json.
       update_metrics_fn: Optional callable for accumulating trainer metrics.
@@ -288,7 +297,8 @@ class GRPORunner:
 
     mean_collected = float(np.mean(ep_rewards)) if ep_rewards else 0.0
     logging.info(
-        'Pass %d collection complete: %d prompts from %d episodes (mean reward: %.3f)',
+        'Pass %d collection complete: %d prompts from %d episodes (mean reward:'
+        ' %.3f)',
         pass_idx,
         len(all_prompts),
         num_episodes,
@@ -328,15 +338,40 @@ class GRPORunner:
     if not time_step.last():
       time_step = self._env.step([chosen_action])
 
-    # Play out the rest with random actions.
+    # Play out the rest of the game with the current policy (self-play).
     while not time_step.last():
       current_player = time_step.current_player()
       state = self._env._state  # pylint: disable=protected-access
-      legal_actions = state.legal_actions(current_player)
-      if not legal_actions:
-        break
-      random_action = int(np.random.choice(legal_actions))
-      time_step = self._env.step([random_action])
+
+      state_text = self._renderers[current_player].render_state(
+          state, current_player, self._env.game
+      )
+      legal_actions_with_desc = self._renderers[
+          current_player
+      ].render_legal_actions(state, current_player, self._env.game)
+      legal_actions = [a for a, _ in legal_actions_with_desc]
+      action_descriptions = [d for _, d in legal_actions_with_desc]
+
+      prompt = self._agents[current_player]._build_prompt(
+          state_text, legal_actions, action_descriptions
+      )
+
+      with torch.no_grad():
+        response, _ = self._backend.generate_with_logprobs(
+            prompt,
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_completion_length,
+        )
+
+      partner_action = self._renderers[current_player].parse_action(
+          response, legal_actions_with_desc
+      )
+      if partner_action is None:
+        partner_action = (
+            int(np.random.choice(legal_actions)) if legal_actions else 0
+        )
+
+      time_step = self._env.step([partner_action])
 
     if time_step.rewards is not None:
       return float(time_step.rewards[target_player])
@@ -402,7 +437,9 @@ class GRPORunner:
         del kwargs  # Unused.
         rewards = []
         for i, completion in enumerate(completions):
-          prompt_text = prompts[i] if prompts is not None and i < len(prompts) else ''
+          prompt_text = (
+              prompts[i] if prompts is not None and i < len(prompts) else ''
+          )
           metadata = self._prompt_metadata.get(prompt_text, {})
           action_history = metadata.get('action_history', [])
           player_id = metadata.get('player_id', 0)
@@ -456,9 +493,7 @@ class GRPORunner:
       # ── Step 3: Configure and run TRL GRPOTrainer ──
       self._backend.model.train()
       training_args = trl.GRPOConfig(
-          output_dir=os.path.join(
-              self._output_dir, f'grpo_pass_{pass_idx}'
-          ),
+          output_dir=os.path.join(self._output_dir, f'grpo_pass_{pass_idx}'),
           num_train_epochs=self._config.train_epochs,
           per_device_train_batch_size=min(len(unique_prompts), 4),
           gradient_accumulation_steps=4,
