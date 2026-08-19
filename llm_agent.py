@@ -47,7 +47,7 @@ import numpy as np
 
 from open_spiel.python import rl_agent
 
-import state_renderers
+from env import state_renderers
 
 
 # System prompt template for the LLM agent.

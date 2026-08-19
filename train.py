@@ -57,8 +57,11 @@ import numpy as np
 
 from open_spiel.python import rl_environment
 
+from env import game_env
+from env import state_renderers
+from env.game_config import GameConfig
+from env.game_config import _GAME_CONFIGS
 import llm_agent
-import state_renderers
 
 FLAGS = flags.FLAGS
 
@@ -91,51 +94,6 @@ flags.DEFINE_integer(
     'Random seed for reproducibility.')
 
 
-# ============================================================================
-# Game Configurations
-# ============================================================================
-
-
-@dataclasses.dataclass(frozen=True)
-class GameConfig:
-  """Configuration for an OpenSpiel game.
-
-  Attributes:
-    game_name: The OpenSpiel registered game name string.
-    game_params: Dictionary of game-specific parameters passed to the
-      OpenSpiel game constructor.
-    num_players: Number of players in the game.
-  """
-  game_name: str
-  game_params: dict[str, object]
-  num_players: int
-
-
-NEGOTIATION_CONFIG = GameConfig(
-    game_name='negotiation',
-    game_params={},
-    num_players=2,
-)
-
-HANABI_CONFIG = GameConfig(
-    game_name='hanabi',
-    game_params={
-        'players': 2,
-    },
-    num_players=2,
-)
-
-TINY_HANABI_CONFIG = GameConfig(
-    game_name='tiny_hanabi',
-    game_params={},
-    num_players=2,
-)
-
-_GAME_CONFIGS = {
-    'negotiation': NEGOTIATION_CONFIG,
-    'hanabi': HANABI_CONFIG,
-    'tiny_hanabi': TINY_HANABI_CONFIG,
-}
 
 
 # ============================================================================
@@ -561,27 +519,24 @@ class RLTrainer:
 # ============================================================================
 
 
-def _create_renderer(game_config: GameConfig, player_id: int) -> object:
+def _create_renderer(
+    game_config: GameConfig,
+    player_id: int,
+) -> state_renderers.BaseStateRenderer:
   """Creates a state renderer appropriate for the given game and player.
+
+  Delegates to the shared factory in env.game_env.
 
   Args:
     game_config: The GameConfig specifying which game is being played.
-    player_id: The player ID this renderer is for.
+    player_id: The player ID this renderer is for (unused, kept for
+      backward compatibility).
 
   Returns:
-    A StateRenderer instance.
+    A BaseStateRenderer instance.
   """
-  game_name = game_config.game_name
-  if game_name == 'tiny_hanabi':
-    return state_renderers.TinyHanabiRenderer()
-  elif game_name == 'hanabi':
-    return state_renderers.HanabiRenderer()
-  elif game_name == 'negotiation':
-    return state_renderers.NegotiationRenderer()
-  else:
-    # Fallback to a generic renderer that uses OpenSpiel's string
-    # representation.
-    return state_renderers.GenericRenderer()
+  del player_id  # All players use the same renderer type per game.
+  return game_env.create_renderer(game_config)
 
 
 def _create_agent(
@@ -589,9 +544,9 @@ def _create_agent(
     player_id: int,
     llm_type: str,
     temperature: float,
-    renderer,
-    env,
-) -> object:
+    renderer: state_renderers.BaseStateRenderer,
+    env: 'rl_environment.Environment',
+) -> llm_agent.LLMAgent:
   """Creates an LLM agent for the given game and player.
 
   Args:
@@ -608,6 +563,7 @@ def _create_agent(
   Raises:
     ValueError: If llm_type is not recognized.
   """
+  del game_config  # Unused — kept for interface compatibility.
   if llm_type == 'mock':
     llm_backend = llm_agent.MockLLM()
   elif llm_type == 'gemini':
@@ -649,12 +605,8 @@ def main(argv: list[str]) -> None:
   logging.info('Eval every: %d episodes', FLAGS.eval_every)
   logging.info('Log dir: %s', FLAGS.output_dir)
 
-  # Create a temporary environment for spec extraction.
-  if game_config.game_params:
-    env = rl_environment.Environment(
-        game_config.game_name, **game_config.game_params)
-  else:
-    env = rl_environment.Environment(game_config.game_name)
+  # Create environment using the shared factory.
+  env = game_env.create_env(game_config)
 
   # Create per-player renderers and agents.
   renderers = []
@@ -662,11 +614,12 @@ def main(argv: list[str]) -> None:
   for player_id in range(game_config.num_players):
     renderers.append(_create_renderer(game_config, player_id))
     agents.append(_create_agent(
-        game_config, player_id, FLAGS.llm_type, FLAGS.temperature, renderers[-1], env))
+        game_config, player_id, FLAGS.llm_type,
+        FLAGS.temperature, renderers[-1], env))
 
   # Create log directory.
   os.makedirs(FLAGS.output_dir, exist_ok=True)
-  log_path = os.path.join(FLAGS.output_dir, f'train_{game_name}.jsonl')
+
   # Create the trainer and run.
   trainer = RLTrainer(
       game_name=game_name,
@@ -682,3 +635,4 @@ def main(argv: list[str]) -> None:
 
 if __name__ == '__main__':
   app.run(main)
+

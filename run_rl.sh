@@ -98,7 +98,7 @@ mkdir -p slurm/output
 
 # ── Run training ─────────────────────────────────────────────────────────────
 
-python3 gemma_rl_trainer.py \
+python3 trainer/gemma_rl_trainer.py \
   --game="${GAME}" \
   --model_name="${MODEL_ID}" \
   --lora_rank="${LORA_RANK}" \
