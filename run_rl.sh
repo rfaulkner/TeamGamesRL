@@ -46,6 +46,7 @@ output_dir="/scratch/$USER/teamgamesrl/${GAME}_lr${LR}_rank${LORA_RANK}_ep${NUM_
 export HF_HOME="/scratch/$USER/hf_cache"
 export WANDB_DISABLED=true  # Set to "false" and add --use_wandb below to enable
 export PYTHONUNBUFFERED=1   # Flush all Python output immediately to SLURM logs
+export PYTHONPATH="${project_dir}:${PYTHONPATH:-.}"
 
 # ── Hugging Face auth (Gemma is a gated model) ──────────────────────────────
 # The token is needed to download gated models like google/gemma-2-2b.
