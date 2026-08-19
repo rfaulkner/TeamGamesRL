@@ -1312,13 +1312,27 @@ class GemmaRLTrainer:
         if action_id is None:
           if legal_actions:
             action_id = int(np.random.choice(legal_actions))
+            action_desc = f'random({action_id})'
           else:
             rewards.append(torch.tensor(0.0))
             continue
+        else:
+          # Look up action description from legal actions.
+          action_desc = str(action_id)
+          for aid, desc in zip(
+              meta.get('legal_actions', []),
+              meta.get('legal_actions_desc', [])):
+            if aid == action_id:
+              action_desc = desc
+              break
 
         # Simulate the game from the saved state.
         reward = self._simulate_from_state(action_history, action_id, player_id)
         rewards.append(torch.tensor(float(reward)))
+
+        print(f'  [GRPO] P{player_id} action="{action_desc}" '
+              f'reward={reward:.0f} completion="{comp_text[:60]}"',
+              flush=True)
 
       return rewards
 
