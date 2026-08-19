@@ -623,6 +623,14 @@ class RLTrainer:
     """
     from learn.grpo import GRPORunner  # pylint: disable=g-import-not-at-top
 
+    if self.use_wandb:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      wandb.init(
+          project=self.wandb_project,
+          config=self.wandb_config,
+      )
+
     runner = GRPORunner(
         env=self.env,
         renderers=self.renderers,
@@ -633,5 +641,16 @@ class RLTrainer:
         save_checkpoint_fn=self.save_checkpoint,
         output_dir=self.output_dir,
         config=grpo_config,
+        log_eval_metrics_fn=self._log_eval_metrics,
+        log_training_step_fn=self._log_training_step,
+        log_episode_fn=self._log_episode,
+        write_summary_fn=self._write_final_summary,
+        update_metrics_fn=self._update_metrics,
     )
     runner.run()
+
+    if self.use_wandb:
+      import wandb  # pylint: disable=g-import-not-at-top
+
+      wandb.finish()
+

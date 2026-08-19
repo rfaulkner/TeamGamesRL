@@ -38,11 +38,14 @@ Usage:
 import dataclasses
 import os
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 from absl import logging
 import numpy as np
 import torch
+
+from learn.trajectory import PlayerTrajectory
+from learn.trajectory import RLTrajectoryStep
 
 
 @dataclasses.dataclass
@@ -81,11 +84,13 @@ class GRPORunner:
 
   This runner:
     1. Collects game-state prompts by playing episodes with LLM agents.
-    2. Defines a reward function that simulates game completion from
-       collected states.
-    3. Trains the model using TRL's GRPOTrainer with group-relative
+    2. Logs per-episode actions to console and episode_log.jsonl.
+    3. Defines a reward function that simulates game completion from
+       collected states using the appropriate state renderer.
+    4. Trains the model using TRL's GRPOTrainer with group-relative
        advantage estimation.
-    4. Periodically evaluates and saves checkpoints.
+    5. Evaluates and logs metrics to CSV after each pass.
+    6. Saves checkpoints and writes a final summary JSON.
 
   Attributes:
     _env: The OpenSpiel rl_environment.Environment.
@@ -94,11 +99,16 @@ class GRPORunner:
     _backend: The LLM backend (with model, tokenizer, generate_with_logprobs).
     _game_config: The GameConfig for the current game.
     _evaluate_fn: Callable (num_episodes) -> dict of eval metrics.
-    _save_checkpoint_fn: Callable (episode) -> checkpoint path.
+    _save_checkpoint_fn: Callable (episode, suffix) -> checkpoint path.
     _output_dir: Directory for logs and checkpoints.
     _config: The GRPOConfig.
     _prompt_metadata: Dict mapping prompt text to game-state metadata
         needed for reward simulation.
+    _log_eval_metrics_fn: Optional callable (episode, metrics_dict) -> None.
+    _log_training_step_fn: Optional callable (episode, reward, loss, start_time) -> None.
+    _log_episode_fn: Optional callable (episode, trajectories, loss, is_eval) -> None.
+    _write_summary_fn: Optional callable (total_time) -> None.
+    _update_metrics_fn: Optional callable (trajectories, loss) -> float.
   """
 
   def __init__(
@@ -109,9 +119,14 @@ class GRPORunner:
       backend,
       game_config,
       evaluate_fn: Callable[[int], dict[str, float]],
-      save_checkpoint_fn: Callable[[int], str],
+      save_checkpoint_fn: Callable[..., str],
       output_dir: str,
       config: GRPOConfig,
+      log_eval_metrics_fn: Optional[Callable[[int, dict[str, float]], None]] = None,
+      log_training_step_fn: Optional[Callable[[int, float, float, float], None]] = None,
+      log_episode_fn: Optional[Callable[[int, list[PlayerTrajectory], float, bool], None]] = None,
+      write_summary_fn: Optional[Callable[[float], None]] = None,
+      update_metrics_fn: Optional[Callable[[list[PlayerTrajectory], float], float]] = None,
   ):
     """Initializes the GRPORunner.
 
@@ -124,10 +139,16 @@ class GRPORunner:
       game_config: The GameConfig for the current game.
       evaluate_fn: A callable ``(num_episodes: int) -> dict[str, float]``
           for running evaluation.
-      save_checkpoint_fn: A callable ``(episode: int) -> str`` for
+      save_checkpoint_fn: A callable ``(episode: int, suffix: str) -> str`` for
           saving checkpoints.
       output_dir: The output directory path.
       config: A GRPOConfig instance.
+      log_eval_metrics_fn: Optional callable for logging eval metrics to CSV.
+      log_training_step_fn: Optional callable for logging training step
+          metrics to CSV.
+      log_episode_fn: Optional callable for writing JSONL episode transcripts.
+      write_summary_fn: Optional callable for writing summary.json.
+      update_metrics_fn: Optional callable for accumulating trainer metrics.
     """
     self._env = env
     self._renderers = renderers
@@ -138,9 +159,16 @@ class GRPORunner:
     self._save_checkpoint_fn = save_checkpoint_fn
     self._output_dir = output_dir
     self._config = config
+    self._log_eval_metrics_fn = log_eval_metrics_fn
+    self._log_training_step_fn = log_training_step_fn
+    self._log_episode_fn = log_episode_fn
+    self._write_summary_fn = write_summary_fn
+    self._update_metrics_fn = update_metrics_fn
     self._prompt_metadata: dict = {}
 
-  def collect_game_prompts(self, num_episodes: int) -> list[dict]:
+  def collect_game_prompts(
+      self, num_episodes: int, pass_idx: int = 1, start_time: float = 0.0
+  ) -> list[dict]:
     """Collects game-state prompts by playing episodes with LLM agents.
 
     Plays ``num_episodes`` games and records the prompts shown to each
@@ -150,6 +178,8 @@ class GRPORunner:
 
     Args:
       num_episodes: Number of episodes to play for prompt collection.
+      pass_idx: The current GRPO pass index.
+      start_time: Training start timestamp for elapsed time calculation.
 
     Returns:
       A list of dicts, each containing:
@@ -157,12 +187,17 @@ class GRPORunner:
         - 'player_id': The player who saw this prompt.
         - 'action_history': List of action IDs taken so far in the game.
         - 'legal_actions': List of legal action IDs at this state.
+        - 'legal_actions_desc': List of (action_id, desc) tuples.
+        - 'state_text': Rendered state text.
     """
     all_prompts = []
+    num_players = self._game_config.num_players
+    ep_rewards = []
 
-    for _ in range(num_episodes):
+    for ep in range(1, num_episodes + 1):
       time_step = self._env.reset()
       action_history = []
+      trajectories = [PlayerTrajectory(player_id=p) for p in range(num_players)]
 
       while not time_step.last():
         current_player = time_step.current_player()
@@ -183,20 +218,11 @@ class GRPORunner:
             state_text, legal_actions, action_descriptions
         )
 
-        prompt_entry = {
-            'prompt': prompt,
-            'player_id': current_player,
-            'action_history': list(action_history),
-            'legal_actions': legal_actions,
-        }
-        all_prompts.append(prompt_entry)
-
-        # Store metadata for reward computation.
-        self._prompt_metadata[prompt] = prompt_entry
-
         # Select action using the LLM.
-        response, _ = self._backend.generate_with_logprobs(
-            prompt, temperature=self._config.temperature, max_tokens=64
+        response, log_prob = self._backend.generate_with_logprobs(
+            prompt,
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_completion_length,
         )
         action_id = self._renderers[current_player].parse_action(
             response, legal_actions_with_desc
@@ -204,11 +230,69 @@ class GRPORunner:
         if action_id is None:
           action_id = int(np.random.choice(legal_actions))
 
+        action_text = state.action_to_string(current_player, action_id)
+
+        prompt_entry = {
+            'prompt': prompt,
+            'player_id': current_player,
+            'action_history': list(action_history),
+            'legal_actions': legal_actions,
+            'legal_actions_desc': legal_actions_with_desc,
+            'state_text': state_text,
+        }
+        all_prompts.append(prompt_entry)
+        self._prompt_metadata[prompt] = prompt_entry
+
+        trajectories[current_player].steps.append(
+            RLTrajectoryStep(
+                prompt=prompt,
+                action_text=response.strip(),
+                action_id=action_id,
+                log_prob=log_prob,
+                state_text=state_text,
+                llm_response=response,
+                game_action_text=action_text,
+            )
+        )
+
         action_history.append(action_id)
         time_step = self._env.step([action_id])
 
+      # Assign rewards.
+      if time_step.rewards is not None:
+        for p in range(num_players):
+          trajectories[p].reward = time_step.rewards[p]
+
+      mean_r = float(np.mean([t.reward for t in trajectories]))
+      ep_rewards.append(mean_r)
+
+      # Log episode transcript to file if logger available.
+      global_ep = (pass_idx - 1) * num_episodes + ep
+      if self._log_episode_fn is not None:
+        self._log_episode_fn(global_ep, trajectories, 0.0, False)
+
+      if self._update_metrics_fn is not None:
+        self._update_metrics_fn(trajectories, 0.0)
+
+      # Print concise progress to stdout so actions are clearly visible in logs.
+      ep_elapsed = time.time() - start_time if start_time > 0 else 0.0
+      actions_summary = ' | '.join(
+          f'P{t.player_id}:[{",".join(s.game_action_text for s in t.steps)}]'
+          for t in trajectories
+      )
+      print(
+          f'[pass {pass_idx} collect {ep}/{num_episodes}] reward={mean_r:.2f} '
+          f'({ep_elapsed:.1f}s) {actions_summary}',
+          flush=True,
+      )
+
+    mean_collected = float(np.mean(ep_rewards)) if ep_rewards else 0.0
     logging.info(
-        'Collected %d prompts from %d episodes.', len(all_prompts), num_episodes
+        'Pass %d collection complete: %d prompts from %d episodes (mean reward: %.3f)',
+        pass_idx,
+        len(all_prompts),
+        num_episodes,
+        mean_collected,
     )
     return all_prompts
 
@@ -262,11 +346,12 @@ class GRPORunner:
     """Runs the full GRPO training loop.
 
     For each pass:
-      1. Collect game-state prompts by playing episodes.
-      2. Build a reward function using game simulation.
+      1. Collect game-state prompts by playing episodes (logging actions).
+      2. Build a reward function using state renderers and simulation.
       3. Create a TRL GRPOTrainer and train for one epoch.
-      4. Evaluate the updated policy.
-      5. Save a checkpoint.
+      4. Log training metrics to CSV.
+      5. Evaluate the updated policy and log eval metrics to CSV.
+      6. Save a checkpoint.
     """
     from backend.gemma_backend import _lazy_import_hf  # pylint: disable=g-import-not-at-top
 
@@ -281,13 +366,21 @@ class GRPORunner:
     )
 
     start_time = time.time()
+    total_episodes_so_far = 0
 
     for pass_idx in range(1, self._config.passes + 1):
       pass_start = time.time()
       logging.info('=== GRPO pass %d/%d ===', pass_idx, self._config.passes)
 
       # ── Step 1: Collect prompts ──
-      prompt_entries = self.collect_game_prompts(self._config.collect_episodes)
+      self._backend.model.eval()
+      prompt_entries = self.collect_game_prompts(
+          num_episodes=self._config.collect_episodes,
+          pass_idx=pass_idx,
+          start_time=start_time,
+      )
+      total_episodes_so_far += self._config.collect_episodes
+
       if not prompt_entries:
         logging.warning('No prompts collected in pass %d, skipping.', pass_idx)
         continue
@@ -301,52 +394,82 @@ class GRPORunner:
           len(prompt_entries),
       )
 
-      # ── Step 2: Define reward function ──
+      # ── Step 2: Define reward function with action parsing and logging ──
+      eval_counter = [0]
+
       def reward_fn(completions, prompts=None, **kwargs):
         """Compute rewards for GRPO completions via game simulation."""
+        del kwargs  # Unused.
         rewards = []
         for i, completion in enumerate(completions):
-          prompt_text = prompts[i] if prompts is not None else ''
+          prompt_text = prompts[i] if prompts is not None and i < len(prompts) else ''
           metadata = self._prompt_metadata.get(prompt_text, {})
           action_history = metadata.get('action_history', [])
           player_id = metadata.get('player_id', 0)
           legal_actions = metadata.get('legal_actions', [])
+          legal_actions_desc = metadata.get('legal_actions_desc', [])
 
-          # Parse the completion as an action.
-          if legal_actions:
-            # Try to match the completion to a legal action.
-            action_id = None
-            comp_text = completion if isinstance(completion, str) else str(completion)
-            for a in legal_actions:
-              if str(a) in comp_text:
-                action_id = a
-                break
-            if action_id is None:
-              action_id = int(np.random.choice(legal_actions))
+          # Extract completion text.
+          if hasattr(completion, 'text'):
+            comp_text = completion.text
+          elif isinstance(completion, list):
+            comp_text = self._backend.tokenizer.decode(
+                completion, skip_special_tokens=True
+            )
           else:
-            action_id = 0
+            comp_text = str(completion)
+
+          # Parse completion into an action ID using the renderer.
+          action_id = self._renderers[player_id].parse_action(
+              comp_text, legal_actions_desc
+          )
+          parsed = True
+          if action_id is None:
+            parsed = False
+            if legal_actions:
+              action_id = int(np.random.choice(legal_actions))
+            else:
+              action_id = 0
 
           reward = self._simulate_from_state(
               action_history, action_id, player_id
           )
-          rewards.append(reward)
+          rewards.append(torch.tensor(float(reward)))
+
+          # Periodically log sample completions and parsed actions for visibility.
+          eval_counter[0] += 1
+          if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
+            status = 'parsed' if parsed else 'random_fallback'
+            logging.info(
+                '[GRPO eval #%d] P%d | completion=%r -> action=%s (%s) |'
+                ' reward=%.1f',
+                eval_counter[0],
+                player_id,
+                comp_text.strip()[:60],
+                action_id,
+                status,
+                reward,
+            )
+
         return rewards
 
       # ── Step 3: Configure and run TRL GRPOTrainer ──
+      self._backend.model.train()
       training_args = trl.GRPOConfig(
           output_dir=os.path.join(
               self._output_dir, f'grpo_pass_{pass_idx}'
           ),
           num_train_epochs=self._config.train_epochs,
-          per_device_train_batch_size=1,
+          per_device_train_batch_size=min(len(unique_prompts), 4),
           gradient_accumulation_steps=4,
           learning_rate=self._config.lr,
           max_grad_norm=self._config.max_grad_norm,
-          logging_steps=10,
+          logging_steps=1,
           save_strategy='no',
           max_completion_length=self._config.max_completion_length,
           num_generations=self._config.num_generations,
           beta=self._config.kl_coeff,
+          temperature=self._config.temperature,
           report_to='none',
       )
 
@@ -360,22 +483,64 @@ class GRPORunner:
 
       trainer.train()
 
+      # Extract pass training loss/reward from trainer log history.
+      pass_loss = 0.0
+      pass_reward = 0.0
+      if hasattr(trainer, 'state') and hasattr(trainer.state, 'log_history'):
+        losses = [
+            e['loss']
+            for e in trainer.state.log_history
+            if 'loss' in e and isinstance(e['loss'], (int, float))
+        ]
+        rewards = [
+            e.get('reward', e.get('rewards/game_reward_fn/mean', 0.0))
+            for e in trainer.state.log_history
+            if 'reward' in e or 'rewards/game_reward_fn/mean' in e
+        ]
+        if losses:
+          pass_loss = float(np.mean(losses))
+        if rewards:
+          pass_reward = float(np.mean(rewards))
+
       pass_elapsed = time.time() - pass_start
       logging.info(
-          'GRPO pass %d complete in %.1f sec.', pass_idx, pass_elapsed
+          'GRPO pass %d complete in %.1f sec (loss=%.4f, reward=%.4f).',
+          pass_idx,
+          pass_elapsed,
+          pass_loss,
+          pass_reward,
       )
 
-      # ── Step 4: Evaluate ──
+      # ── Step 4: Log training metrics to CSV ──
+      if self._log_training_step_fn is not None:
+        self._log_training_step_fn(
+            total_episodes_so_far, pass_reward, pass_loss, start_time
+        )
+
+      # ── Step 5: Evaluate & log eval metrics to CSV ──
+      self._backend.model.eval()
       eval_metrics = self._evaluate_fn(self._config.num_eval_episodes)
+      logging.info('--- Evaluation after GRPO pass %d ---', pass_idx)
       for k, v in sorted(eval_metrics.items()):
         logging.info('  %s: %.4f', k, v)
 
-      # ── Step 5: Checkpoint ──
-      self._save_checkpoint_fn(pass_idx)
+      if self._log_eval_metrics_fn is not None:
+        self._log_eval_metrics_fn(total_episodes_so_far, eval_metrics)
 
+      # ── Step 6: Checkpoint ──
+      self._save_checkpoint_fn(total_episodes_so_far)
+
+    # ── Final summary and checkpoint ──
     total_time = time.time() - start_time
-    logging.info('GRPO training complete: %d passes in %.1f sec.',
-                 self._config.passes, total_time)
+    logging.info(
+        'GRPO training complete: %d passes (%d episodes) in %.1f sec.',
+        self._config.passes,
+        total_episodes_so_far,
+        total_time,
+    )
+    if self._write_summary_fn is not None:
+      self._write_summary_fn(total_time)
+    self._save_checkpoint_fn(total_episodes_so_far, suffix='final')
 
   def _build_prompt_dataset(self, prompts: list[str]):
     """Builds a HuggingFace Dataset from a list of prompt strings.
