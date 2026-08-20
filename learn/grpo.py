@@ -647,6 +647,7 @@ class GRPORunner:
         save_strategy='no',
         max_completion_length=self._config.max_completion_length,
         num_generations=self._config.num_generations,
+        generation_batch_size=self._config.num_generations,
         beta=self._config.kl_coeff,
         temperature=self._current_temperature,
         report_to='none',
