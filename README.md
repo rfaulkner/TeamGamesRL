@@ -302,7 +302,11 @@ python trainer/gemma_rl_trainer.py \
 ### 4. Submit via SLURM
 
 ```bash
-sbatch run_rl.sh tiny_hanabi google/gemma-2-2b 16 1e-4 500
+# GRPO (default: tiny_hanabi, 30 passes)
+sbatch scripts/run_grpo.sh tiny_hanabi google/gemma-2-2b 16 3e-5 30 50
+
+# REINFORCE (default: tiny_hanabi, 500 episodes)
+sbatch scripts/run_reinforce.sh tiny_hanabi google/gemma-2-2b 16 1e-4 500
 ```
 
 ### 5. Resume from a checkpoint

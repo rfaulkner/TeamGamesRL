@@ -65,20 +65,20 @@ class GRPOConfig:
     temperature: Sampling temperature for LLM action selection during data
       collection.
     num_eval_episodes: Number of episodes per evaluation round.
-    per_player_updates: If True, group collected prompts by player_id and
-      run a separate GRPO training step for each player group. This gives
-      cleaner gradient signal in cooperative games where players have
-      different information (e.g. Tiny Hanabi).
+    per_player_updates: If True, group collected prompts by player_id and run a
+      separate GRPO training step for each player group. This gives cleaner
+      gradient signal in cooperative games where players have different
+      information (e.g. Tiny Hanabi).
     temperature_anneal_end: If set, linearly anneal the sampling temperature
-      from ``temperature`` to this value over the course of training.
-      None means no annealing (constant temperature).
-    reward_variance_penalty: Coefficient for penalizing high-variance
-      reward outcomes. The effective reward becomes
-      ``mean_reward - penalty * std_reward`` when ``reward_num_simulations
-      > 1``. Encourages convergence to consistent strategies.
-    reward_num_simulations: Number of independent game simulations to run
-      per completion for estimating reward mean and variance. Only used
-      when ``reward_variance_penalty > 0``.
+      from ``temperature`` to this value over the course of training. None means
+      no annealing (constant temperature).
+    reward_variance_penalty: Coefficient for penalizing high-variance reward
+      outcomes. The effective reward becomes ``mean_reward - penalty *
+      std_reward`` when ``reward_num_simulations > 1``. Encourages convergence
+      to consistent strategies.
+    reward_num_simulations: Number of independent game simulations to run per
+      completion for estimating reward mean and variance. Only used when
+      ``reward_variance_penalty > 0``.
   """
 
   num_generations: int = 8
@@ -242,7 +242,7 @@ class GRPORunner:
         action_descriptions = [d for _, d in legal_actions_with_desc]
 
         # Build prompt.
-        prompt = self._agents[current_player]._build_prompt(
+        prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
             state_text, legal_actions, action_descriptions
         )
 
@@ -371,7 +371,7 @@ class GRPORunner:
       legal_actions = [a for a, _ in legal_actions_with_desc]
       action_descriptions = [d for _, d in legal_actions_with_desc]
 
-      prompt = self._agents[current_player]._build_prompt(
+      prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
           state_text, legal_actions, action_descriptions
       )
 
@@ -429,10 +429,8 @@ class GRPORunner:
       # ── Temperature annealing ──
       if self._config.temperature_anneal_end is not None:
         progress = (pass_idx - 1) / max(self._config.passes - 1, 1)
-        self._current_temperature = (
-            self._config.temperature
-            + progress
-            * (self._config.temperature_anneal_end - self._config.temperature)
+        self._current_temperature = self._config.temperature + progress * (
+            self._config.temperature_anneal_end - self._config.temperature
         )
         logging.info(
             'Temperature annealed to %.3f (pass %d/%d)',
@@ -479,9 +477,7 @@ class GRPORunner:
               len(unique_prompts),
               pid,
           )
-          self._train_grpo_on_prompts(
-              unique_prompts, pass_idx, pid, trl
-          )
+          self._train_grpo_on_prompts(unique_prompts, pass_idx, pid, trl)
       else:
         # Original behavior: all prompts together.
         unique_prompts = list({e['prompt'] for e in prompt_entries})
@@ -491,9 +487,7 @@ class GRPORunner:
             len(unique_prompts),
             len(prompt_entries),
         )
-        self._train_grpo_on_prompts(
-            unique_prompts, pass_idx, None, trl
-        )
+        self._train_grpo_on_prompts(unique_prompts, pass_idx, None, trl)
 
       pass_elapsed = time.time() - pass_start
       logging.info(
@@ -504,9 +498,7 @@ class GRPORunner:
 
       # ── Step 4: Log training metrics to CSV ──
       if self._log_training_step_fn is not None:
-        self._log_training_step_fn(
-            total_episodes_so_far, 0.0, 0.0, start_time
-        )
+        self._log_training_step_fn(total_episodes_so_far, 0.0, 0.0, start_time)
 
       # ── Step 5: Evaluate & log eval metrics to CSV ──
       self._backend.model.eval()
@@ -545,8 +537,8 @@ class GRPORunner:
     Args:
       unique_prompts: Deduplicated prompt strings to train on.
       pass_idx: Current pass index (for output directory naming).
-      player_id: If not None, only prompts for this player are included
-          (used for per-player updates). Affects output dir naming.
+      player_id: If not None, only prompts for this player are included (used
+        for per-player updates). Affects output dir naming.
       trl_module: The imported trl module.
 
     Returns:
@@ -596,18 +588,14 @@ class GRPORunner:
             and self._config.reward_variance_penalty > 0
         ):
           sim_rewards = [
-              self._simulate_from_state(
-                  action_history, action_id, p_id
-              )
+              self._simulate_from_state(action_history, action_id, p_id)
               for _ in range(self._config.reward_num_simulations)
           ]
           mean_r = float(np.mean(sim_rewards))
           std_r = float(np.std(sim_rewards))
           reward = mean_r - self._config.reward_variance_penalty * std_r
         else:
-          reward = self._simulate_from_state(
-              action_history, action_id, p_id
-          )
+          reward = self._simulate_from_state(action_history, action_id, p_id)
         rewards.append(torch.tensor(float(reward)))
 
         # Periodically log sample completions.
@@ -636,10 +624,26 @@ class GRPORunner:
       out_dir = os.path.join(self._output_dir, f'grpo_pass_{pass_idx}')
 
     self._backend.model.train()
+    # TRL GRPO requires:
+    # 1. generation_batch_size % num_generations == 0
+    # 2. generation_batch_size % (
+    #       per_device_train_batch_size * num_processes) == 0
+    # By setting generation_batch_size = num_generations and picking
+    # per_device_train_batch_size as the largest divisor of
+    #       num_generations <= 4,
+    # both constraints are always satisfied regardless of len(unique_prompts).
+    max_train_batch = 4
+    candidates = [
+        d
+        for d in range(1, max_train_batch + 1)
+        if self._config.num_generations % d == 0
+    ]
+    batch_size = max(candidates) if candidates else 1
+    gen_batch_size = self._config.num_generations
     training_args = trl_module.GRPOConfig(
         output_dir=out_dir,
         num_train_epochs=self._config.train_epochs,
-        per_device_train_batch_size=min(len(unique_prompts), 4),
+        per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=4,
         learning_rate=self._config.lr,
         max_grad_norm=self._config.max_grad_norm,
@@ -647,7 +651,7 @@ class GRPORunner:
         save_strategy='no',
         max_completion_length=self._config.max_completion_length,
         num_generations=self._config.num_generations,
-        generation_batch_size=self._config.num_generations,
+        generation_batch_size=gen_batch_size,
         beta=self._config.kl_coeff,
         temperature=self._current_temperature,
         report_to='none',
@@ -682,9 +686,7 @@ class GRPORunner:
       if rew_vals:
         pass_reward = float(np.mean(rew_vals))
 
-    player_label = (
-        f' (Player {player_id})' if player_id is not None else ''
-    )
+    player_label = f' (Player {player_id})' if player_id is not None else ''
     logging.info(
         'GRPO training step%s: loss=%.4f, reward=%.4f',
         player_label,

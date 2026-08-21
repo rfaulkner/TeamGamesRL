@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=teamgamesrl
+#SBATCH --job-name=teamgamesrl_grpo
 #SBATCH --account=aip-rgrosse
 #SBATCH --output=slurm/output/%j_%x.out
 #SBATCH --error=slurm/output/%j_%x.err
@@ -12,21 +12,21 @@
 #SBATCH --mem=32G
 
 # ============================================================================
-# TeamGamesRL — SLURM submission script
+# TeamGamesRL — GRPO SLURM submission script
 #
 # Usage:
-#   sbatch run_rl.slurm                              # all defaults
-#   sbatch run_rl.slurm tiny_hanabi                   # specify game
-#   sbatch run_rl.slurm hanabi google/gemma-2-2b 32   # game, model, lora_rank
-#   sbatch run_rl.slurm tiny_hanabi google/gemma-2-2b 16 1e-4 500
+#   sbatch scripts/run_grpo.sh                              # all defaults (tiny_hanabi, 30 passes)
+#   sbatch scripts/run_grpo.sh tiny_hanabi                  # specify game
+#   sbatch scripts/run_grpo.sh hanabi google/gemma-2-2b 32  # game, model, lora_rank
+#   sbatch scripts/run_grpo.sh tiny_hanabi google/gemma-2-2b 16 3e-5 30 50
 #
 # Positional args:
-#   $1 = game           (default: tiny_hanabi)
-#   $2 = model_id       (default: google/gemma-2-2b)
-#   $3 = lora_rank      (default: 16)
-#   $4 = learning_rate  (default: 1e-4)
-#   $5 = num_episodes   (default: 500)
-#   $6 = grpo_passes    (default: 30)
+#   $1 = game                  (default: tiny_hanabi)
+#   $2 = model_id              (default: google/gemma-2-2b)
+#   $3 = lora_rank             (default: 16)
+#   $4 = learning_rate         (default: 3e-5)
+#   $5 = grpo_passes           (default: 30)
+#   $6 = grpo_collect_episodes (default: 50)
 # ============================================================================
 
 set -euo pipefail
@@ -37,13 +37,13 @@ GAME="${1:-tiny_hanabi}"
 MODEL_ID="${2:-google/gemma-2-2b}"
 LORA_RANK="${3:-16}"
 LR="${4:-3e-5}"
-NUM_EPISODES="${5:-500}"
-GRPO_PASSES="${6:-30}"
+GRPO_PASSES="${5:-30}"
+GRPO_COLLECT_EPISODES="${6:-50}"
 
 # ── Derived settings ─────────────────────────────────────────────────────────
 
 project_dir="/home/$USER/projects/aip-rgrosse/$USER/TeamGamesRL"
-output_dir="/scratch/$USER/teamgamesrl/${GAME}_lr${LR}_rank${LORA_RANK}_passes${GRPO_PASSES}_${SLURM_JOB_ID}"
+output_dir="/scratch/$USER/teamgamesrl/${GAME}_grpo_lr${LR}_rank${LORA_RANK}_passes${GRPO_PASSES}_${SLURM_JOB_ID}"
 
 export HF_HOME="/scratch/$USER/hf_cache"
 export WANDB_DISABLED=true  # Set to "false" and add --use_wandb below to enable
@@ -68,22 +68,21 @@ source .venv/bin/activate
 # ── Print run info ───────────────────────────────────────────────────────────
 
 echo "============================================"
-echo " TeamGamesRL — SLURM Job ${SLURM_JOB_ID}"
+echo " TeamGamesRL — GRPO SLURM Job ${SLURM_JOB_ID}"
 echo "============================================"
+echo "  Algorithm:    GRPO"
 echo "  Game:         ${GAME}"
 echo "  Model:        ${MODEL_ID}"
 echo "  LoRA rank:    ${LORA_RANK}"
 echo "  LR:           ${LR}"
-echo "  Episodes:     ${NUM_EPISODES}"
 echo "  GRPO Passes:  ${GRPO_PASSES}"
+echo "  Collect Eps:  ${GRPO_COLLECT_EPISODES}"
 echo "  Output dir:   ${output_dir}"
 echo "  Node:         $(hostname)"
 echo "  GPUs:         ${CUDA_VISIBLE_DEVICES:-N/A}"
 echo "  Python:       $(which python3)"
 echo "  PyTorch CUDA: $(python3 -c 'import torch; print(torch.cuda.is_available())')"
 echo "============================================"
-
-# ── Create output directories ────────────────────────────────────────────────
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 
@@ -109,8 +108,8 @@ python3 trainer/gemma_rl_trainer.py \
   --lora_rank="${LORA_RANK}" \
   --lora_alpha=$((LORA_RANK * 2)) \
   --lr="${LR}" \
-  --num_episodes="${NUM_EPISODES}" \
   --grpo_passes="${GRPO_PASSES}" \
+  --grpo_collect_episodes="${GRPO_COLLECT_EPISODES}" \
   --eval_every=50 \
   --num_eval_episodes=10 \
   --checkpoint_every=100 \
@@ -121,6 +120,5 @@ python3 trainer/gemma_rl_trainer.py \
   --log_every=10
 
 echo "============================================"
-echo " Training complete. Output: ${output_dir}"
+echo " GRPO Training complete. Output: ${output_dir}"
 echo "============================================"
-

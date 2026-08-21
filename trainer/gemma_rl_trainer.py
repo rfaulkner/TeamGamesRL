@@ -238,9 +238,12 @@ def main(argv: list[str]) -> None:
     #   5. Reward variance penalty to favor consistent strategies.
     # These only apply to tiny_hanabi; other games use the base defaults.
     if FLAGS.game == 'tiny_hanabi':
+      tiny_hanabi_passes = (
+          FLAGS.grpo_passes if FLAGS['grpo_passes'].present else 100
+      )
       grpo_config = dataclasses.replace(
           grpo_config,
-          passes=100,
+          passes=tiny_hanabi_passes,
           num_generations=16,
           per_player_updates=True,
           temperature_anneal_end=0.2,
