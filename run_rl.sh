@@ -15,30 +15,45 @@
 # TeamGamesRL — SLURM submission script
 #
 # Usage:
-#   sbatch run_rl.slurm                              # all defaults
-#   sbatch run_rl.slurm tiny_hanabi                   # specify game
-#   sbatch run_rl.slurm hanabi google/gemma-2-2b 32   # game, model, lora_rank
-#   sbatch run_rl.slurm tiny_hanabi google/gemma-2-2b 16 1e-4 500
+#   sbatch run_rl.sh                              # all defaults
+#   sbatch run_rl.sh --grpo_passes=50             # override one flag
+#   sbatch run_rl.sh --game=hanabi --lr=1e-4      # override several
+#   sbatch run_rl.sh --game=tiny_hanabi --model=google/gemma-2-2b --lora_rank=32
 #
-# Positional args:
-#   $1 = game           (default: tiny_hanabi)
-#   $2 = model_id       (default: google/gemma-2-2b)
-#   $3 = lora_rank      (default: 16)
-#   $4 = learning_rate  (default: 1e-4)
-#   $5 = num_episodes   (default: 500)
-#   $6 = grpo_passes    (default: 30)
+# Flags (all optional, order doesn't matter):
+#   --game=NAME         Game to play        (default: tiny_hanabi)
+#   --model=ID          HF model identifier (default: google/gemma-2-2b)
+#   --lora_rank=R       LoRA rank           (default: 16)
+#   --lr=RATE           Learning rate       (default: 3e-5)
+#   --num_episodes=N    Training episodes   (default: 500)
+#   --grpo_passes=P     GRPO passes         (default: 30)
 # ============================================================================
 
 set -euo pipefail
 
 # ── Parse arguments with defaults ────────────────────────────────────────────
 
-GAME="${1:-tiny_hanabi}"
-MODEL_ID="${2:-google/gemma-2-2b}"
-LORA_RANK="${3:-16}"
-LR="${4:-3e-5}"
-NUM_EPISODES="${5:-500}"
-GRPO_PASSES="${6:-30}"
+GAME="tiny_hanabi"
+MODEL_ID="google/gemma-2-2b"
+LORA_RANK=16
+LR="3e-5"
+NUM_EPISODES=500
+GRPO_PASSES=30
+
+for arg in "$@"; do
+  case "$arg" in
+    --game=*)         GAME="${arg#*=}" ;;
+    --model=*)        MODEL_ID="${arg#*=}" ;;
+    --lora_rank=*)    LORA_RANK="${arg#*=}" ;;
+    --lr=*)           LR="${arg#*=}" ;;
+    --num_episodes=*) NUM_EPISODES="${arg#*=}" ;;
+    --grpo_passes=*)  GRPO_PASSES="${arg#*=}" ;;
+    --help|-h)
+      echo "Usage: sbatch run_rl.sh [--game=G] [--model=M] [--lora_rank=R] [--lr=L] [--num_episodes=N] [--grpo_passes=P]"
+      exit 0 ;;
+    *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
+  esac
+done
 
 # ── Derived settings ─────────────────────────────────────────────────────────
 
