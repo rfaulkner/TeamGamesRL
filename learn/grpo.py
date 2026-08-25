@@ -35,6 +35,7 @@ Usage:
   runner.run()
 """
 
+import copy
 import dataclasses
 import os
 import time
@@ -44,6 +45,7 @@ from absl import logging
 from learn.trajectory import PlayerTrajectory
 from learn.trajectory import RLTrajectoryStep
 import numpy as np
+import pyspiel
 import torch
 
 
@@ -91,10 +93,10 @@ class GRPOConfig:
   max_grad_norm: float = 1.0
   temperature: float = 0.8
   num_eval_episodes: int = 10
-  per_player_updates: bool = False
+  per_player_updates: bool = True
   temperature_anneal_end: float | None = None
   reward_variance_penalty: float = 0.0
-  reward_num_simulations: int = 1
+  reward_num_simulations: int = 5
 
 
 class GRPORunner:
@@ -193,6 +195,7 @@ class GRPORunner:
     self._update_metrics_fn = update_metrics_fn
     self._prompt_metadata: dict = {}
     self._current_temperature = config.temperature
+    self._frozen_lora_state: dict | None = None
 
   def collect_game_prompts(
       self, num_episodes: int, pass_idx: int = 1, start_time: float = 0.0
@@ -217,6 +220,8 @@ class GRPORunner:
         - 'legal_actions': List of legal action IDs at this state.
         - 'legal_actions_desc': List of (action_id, desc) tuples.
         - 'state_text': Rendered state text.
+        - 'serialized_state': Serialized game+state string for exact
+            restoration during reward simulation.
     """
     all_prompts = []
     num_players = self._game_config.num_players
@@ -267,6 +272,9 @@ class GRPORunner:
             'legal_actions': legal_actions,
             'legal_actions_desc': legal_actions_with_desc,
             'state_text': state_text,
+            'serialized_state': pyspiel.serialize_game_and_state(
+                self._env.game, state
+            ),
         }
         all_prompts.append(prompt_entry)
         self._prompt_metadata[prompt] = prompt_entry
@@ -330,70 +338,105 @@ class GRPORunner:
       action_history: list[int],
       chosen_action: int,
       target_player: int,
+      serialized_state: str | None = None,
   ) -> float:
     """Simulates a game to completion from a given state to get the reward.
 
-    Replays ``action_history`` to reconstruct the game state, applies
-    ``chosen_action``, then plays out the rest of the game with random
-    actions to estimate the reward for ``target_player``.
+    Restores the exact game state (preserving the original card deal) via
+    ``serialized_state``, applies ``chosen_action``, then plays out the
+    partner's remaining turns using frozen LoRA weights from the start of
+    the current pass. This provides a stable training target so that the
+    signaler can learn conventions the responder will decode consistently.
 
     Args:
       action_history: List of action IDs taken before the current decision.
       chosen_action: The action to apply at the current decision point.
       target_player: The player whose reward we want.
+      serialized_state: Serialized game-and-state string from
+        ``pyspiel.serialize_game_and_state()``. If provided, the exact
+        game state (including the card deal) is restored. Falls back to
+        action-replay on ``self._env`` if ``None``.
 
     Returns:
       The reward for ``target_player`` at the end of the simulated game.
     """
-    time_step = self._env.reset()
-
-    # Replay action history.
-    for action_id in action_history:
-      if time_step.last():
-        break
-      time_step = self._env.step([action_id])
+    # ── Restore the exact game state ──
+    if serialized_state is not None:
+      # Extract the state portion from the serialized game+state string.
+      # Format: "<game_string>\n<state_string>", separated by a blank line.
+      # We use the env's own game object so set_state()'s identity check passes.
+      _, state = pyspiel.deserialize_game_and_state(serialized_state)
+      # Re-create state using the env's game to pass identity check.
+      restored = self._env.game.deserialize_state(state.serialize())
+      self._env.set_state(restored)
+    else:
+      # Legacy fallback: replay from a fresh reset (re-deals cards).
+      self._env.reset()
+      state = self._env._state  # pylint: disable=protected-access
+      for action_id in action_history:
+        if state.is_terminal():
+          break
+        state.apply_action(action_id)
 
     # Apply the chosen action.
-    if not time_step.last():
-      time_step = self._env.step([chosen_action])
+    state = self._env._state  # pylint: disable=protected-access
+    if not state.is_terminal():
+      state.apply_action(chosen_action)
 
-    # Play out the rest of the game with the current policy (self-play).
-    while not time_step.last():
-      current_player = time_step.current_player()
-      state = self._env._state  # pylint: disable=protected-access
-
-      state_text = self._renderers[current_player].render_state(
-          state, current_player, self._env.game
+    # ── Swap in frozen LoRA weights for partner simulation ──
+    live_lora_state = None
+    if self._frozen_lora_state is not None:
+      live_lora_state = copy.deepcopy(
+          {k: v for k, v in self._backend.model.named_parameters()
+           if v.requires_grad}
       )
-      legal_actions_with_desc = self._renderers[
-          current_player
-      ].render_legal_actions(state, current_player, self._env.game)
-      legal_actions = [a for a, _ in legal_actions_with_desc]
-      action_descriptions = [d for _, d in legal_actions_with_desc]
+      for name, param in self._backend.model.named_parameters():
+        if name in self._frozen_lora_state:
+          param.data.copy_(self._frozen_lora_state[name])
 
-      prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
-          state_text, legal_actions, action_descriptions
-      )
+    try:
+      # Play out the rest of the game with the frozen partner policy.
+      while not state.is_terminal():
+        current_player = state.current_player()
 
-      with torch.no_grad():
-        response, _ = self._backend.generate_with_logprobs(
-            prompt,
-            temperature=self._current_temperature,
-            max_tokens=self._config.max_completion_length,
+        state_text = self._renderers[current_player].render_state(
+            state, current_player, self._env.game
+        )
+        legal_actions_with_desc = self._renderers[
+            current_player
+        ].render_legal_actions(state, current_player, self._env.game)
+        legal_actions = [a for a, _ in legal_actions_with_desc]
+        action_descriptions = [d for _, d in legal_actions_with_desc]
+
+        prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+            state_text, legal_actions, action_descriptions
         )
 
-      partner_action = self._renderers[current_player].parse_action(
-          response, legal_actions_with_desc
-      )
-      if partner_action is None:
-        partner_action = (
-            int(np.random.choice(legal_actions)) if legal_actions else 0
+        with torch.no_grad():
+          response, _ = self._backend.generate_with_logprobs(
+              prompt,
+              temperature=self._current_temperature,
+              max_tokens=self._config.max_completion_length,
+          )
+
+        partner_action = self._renderers[current_player].parse_action(
+            response, legal_actions_with_desc
         )
+        if partner_action is None:
+          partner_action = (
+              int(np.random.choice(legal_actions)) if legal_actions else 0
+          )
 
-      time_step = self._env.step([partner_action])
+        state.apply_action(partner_action)
+    finally:
+      # ── Restore live LoRA weights ──
+      if live_lora_state is not None:
+        for name, param in self._backend.model.named_parameters():
+          if name in live_lora_state:
+            param.data.copy_(live_lora_state[name].data)
 
-    if time_step.rewards is not None:
-      return float(time_step.rewards[target_player])
+    if state.is_terminal() and state.rewards() is not None:
+      return float(state.rewards()[target_player])
     return 0.0
 
   def run(self) -> None:
@@ -438,6 +481,15 @@ class GRPORunner:
             pass_idx,
             self._config.passes,
         )
+
+      # ── Snapshot LoRA weights for stable partner simulation ──
+      # Freeze a copy of the trainable parameters at the start of each pass
+      # so that reward simulation uses a consistent partner policy.
+      self._frozen_lora_state = {
+          name: param.data.clone()
+          for name, param in self._backend.model.named_parameters()
+          if param.requires_grad
+      }
 
       # ── Step 1: Collect prompts ──
       self._backend.model.eval()
@@ -559,6 +611,7 @@ class GRPORunner:
         p_id = metadata.get('player_id', 0)
         legal_actions = metadata.get('legal_actions', [])
         legal_actions_desc = metadata.get('legal_actions_desc', [])
+        ser_state = metadata.get('serialized_state', None)
 
         # Extract completion text.
         if hasattr(completion, 'text'):
@@ -588,14 +641,18 @@ class GRPORunner:
             and self._config.reward_variance_penalty > 0
         ):
           sim_rewards = [
-              self._simulate_from_state(action_history, action_id, p_id)
+              self._simulate_from_state(
+                  action_history, action_id, p_id, ser_state
+              )
               for _ in range(self._config.reward_num_simulations)
           ]
           mean_r = float(np.mean(sim_rewards))
           std_r = float(np.std(sim_rewards))
           reward = mean_r - self._config.reward_variance_penalty * std_r
         else:
-          reward = self._simulate_from_state(action_history, action_id, p_id)
+          reward = self._simulate_from_state(
+              action_history, action_id, p_id, ser_state
+          )
         rewards.append(torch.tensor(float(reward)))
 
         # Periodically log sample completions.
