@@ -543,6 +543,10 @@ class GRPORunner:
         continue
 
       # ── Step 2–3: Train (per-player or combined) ──
+      total_pass_loss = 0.0
+      total_pass_reward = 0.0
+      num_train_steps = 0
+
       if self._config.per_player_updates:
         # Group prompts by player for separate GRPO updates.
         # Each player's decision points get their own training step so that
@@ -567,7 +571,12 @@ class GRPORunner:
               len(unique_prompts),
               pid,
           )
-          self._train_grpo_on_prompts(unique_prompts, pass_idx, pid, trl)
+          p_loss, p_reward = self._train_grpo_on_prompts(
+              unique_prompts, pass_idx, pid, trl
+          )
+          total_pass_loss += p_loss
+          total_pass_reward += p_reward
+          num_train_steps += 1
       else:
         # Original behavior: all prompts together.
         unique_prompts = list({e['prompt'] for e in prompt_entries})
@@ -577,18 +586,33 @@ class GRPORunner:
             len(unique_prompts),
             len(prompt_entries),
         )
-        self._train_grpo_on_prompts(unique_prompts, pass_idx, None, trl)
+        p_loss, p_reward = self._train_grpo_on_prompts(
+            unique_prompts, pass_idx, None, trl
+        )
+        total_pass_loss += p_loss
+        total_pass_reward += p_reward
+        num_train_steps += 1
 
       pass_elapsed = time.time() - pass_start
+      avg_pass_loss = (
+          total_pass_loss / num_train_steps if num_train_steps else 0.0
+      )
+      avg_pass_reward = (
+          total_pass_reward / num_train_steps if num_train_steps else 0.0
+      )
       logging.info(
-          'GRPO pass %d complete in %.1f sec.',
+          'GRPO pass %d complete in %.1f sec (loss=%.4f, reward=%.2f).',
           pass_idx,
           pass_elapsed,
+          avg_pass_loss,
+          avg_pass_reward,
       )
 
       # ── Step 4: Log training metrics to CSV ──
       if self._log_training_step_fn is not None:
-        self._log_training_step_fn(total_episodes_so_far, 0.0, 0.0, start_time)
+        self._log_training_step_fn(
+            pass_idx, avg_pass_reward, avg_pass_loss, start_time
+        )
 
       # ── Step 5: Evaluate & log eval metrics to CSV ──
       self._backend.model.eval()
@@ -1097,7 +1121,7 @@ class GRPORunner:
       # ── Step 5: Log training metrics ──
       if self._log_training_step_fn is not None:
         self._log_training_step_fn(
-            total_episodes_so_far, 0.0, 0.0, start_time
+            pass_idx, avg_reward, avg_loss, start_time
         )
 
       # ── Step 6: Evaluate ──

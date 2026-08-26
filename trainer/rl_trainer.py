@@ -275,16 +275,52 @@ class RLTrainer:
     num_players = self.game_config.num_players
     all_rewards = [[] for _ in range(num_players)]
     wins = np.zeros(num_players, dtype=np.int64)
+    action_counts: list[dict[int, int]] = [{} for _ in range(num_players)]
 
-    for _ in range(num_episodes):
+    for ep_i in range(num_episodes):
       trajectories = self.run_episode(is_evaluation=True)
       rewards = [t.reward for t in trajectories]
       for p in range(num_players):
         all_rewards[p].append(rewards[p])
+        for step in trajectories[p].steps:
+          a_id = step.action_id
+          action_counts[p][a_id] = action_counts[p].get(a_id, 0) + 1
+
       max_r = max(rewards)
       winners = [p for p in range(num_players) if rewards[p] == max_r]
       if len(winners) == 1:
         wins[winners[0]] += 1
+
+      # Format per-episode action string.
+      actions_summary = []
+      for t in trajectories:
+        steps_summary = ','.join(
+            s.game_action_text or f'a{s.action_id}' for s in t.steps
+        )
+        actions_summary.append(f'P{t.player_id}:[{steps_summary}]')
+
+      mean_r = float(np.mean(rewards))
+      logging.info(
+          '  [eval %d/%d] reward=%.1f | %s',
+          ep_i + 1,
+          num_episodes,
+          mean_r,
+          ' | '.join(actions_summary),
+      )
+
+      # Log full transcript to episode_log.jsonl.
+      if self.log_episodes_every > 0:
+        self._log_episode(ep_i + 1, trajectories, 0.0, is_evaluation=True)
+
+    # Log action distribution summary across eval episodes.
+    for p in range(num_players):
+      total_actions = sum(action_counts[p].values())
+      if total_actions > 0:
+        dist_str = ', '.join(
+            f'Action {a}: {count/total_actions*100:.0f}% ({count})'
+            for a, count in sorted(action_counts[p].items())
+        )
+        logging.info('  Player %d eval action distribution: %s', p, dist_str)
 
     self.backend.model.train()
 
@@ -411,13 +447,27 @@ class RLTrainer:
       start_time: Training start timestamp.
     """
     elapsed = time.time() - start_time
-    avg_r = float(np.mean(self._episode_rewards[-self.log_every:]))
-    avg_l = float(np.mean(self._episode_losses[-self.log_every:]))
+    # If episode_rewards was not populated by run_episode (e.g. in GRPO),
+    # record the step metrics directly so running averages work properly.
+    if not self._episode_rewards or self._episode_rewards[-1] != mean_reward:
+      self._episode_rewards.append(mean_reward)
+      self._episode_losses.append(loss)
+
+    window = min(len(self._episode_rewards), self.log_every)
+    avg_r = (
+        float(np.mean(self._episode_rewards[-window:]))
+        if self._episode_rewards
+        else mean_reward
+    )
+    avg_l = (
+        float(np.mean(self._episode_losses[-window:]))
+        if self._episode_losses
+        else loss
+    )
     logging.info(
-        'Ep %d/%d | reward=%.4f (avg=%.4f) | loss=%.4f (avg=%.4f) | '
+        'Step %d | reward=%.4f (avg=%.4f) | loss=%.4f (avg=%.4f) | '
         '%.1f sec elapsed',
         ep,
-        self.num_episodes,
         mean_reward,
         avg_r,
         loss,
