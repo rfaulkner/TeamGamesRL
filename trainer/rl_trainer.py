@@ -299,12 +299,23 @@ class RLTrainer:
         )
         actions_summary.append(f'P{t.player_id}:[{steps_summary}]')
 
+      # Extract dealt cards (chance outcomes) from the terminal state.
+      # In OpenSpiel, the first num_players history entries are chance actions
+      # (e.g. card deals).
+      state = self.env._state  # pylint: disable=protected-access
+      history = state.history()
+      cards_str = ''
+      if len(history) >= num_players:
+        cards = [history[p] for p in range(num_players)]
+        cards_str = ' | cards=' + ','.join(str(c) for c in cards)
+
       mean_r = float(np.mean(rewards))
       logging.info(
-          '  [eval %d/%d] reward=%.1f | %s',
+          '  [eval %d/%d] reward=%.1f%s | %s',
           ep_i + 1,
           num_episodes,
           mean_r,
+          cards_str,
           ' | '.join(actions_summary),
       )
 
