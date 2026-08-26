@@ -142,7 +142,21 @@ flags.DEFINE_integer(
     16,
     'Maximum completion length for GRPO generation.',
 )
-
+flags.DEFINE_bool(
+    'grpo_exhaustive_groups',
+    False,
+    'If True, enumerate all possible game states and form GRPO groups '
+    'where only the target player\'s action varies. Produces deterministic '
+    'advantage estimates. Best for small games (e.g. tiny_hanabi).',
+)
+flags.DEFINE_float(
+    'grpo_optimistic_alpha',
+    1.0,
+    'Blending weight for optimistic (max-over-partner) rewards. '
+    'When 1.0, P0 rewards assume best possible partner cooperation. '
+    'Linearly annealed toward 0 over training. Only used with '
+    '--grpo_exhaustive_groups.',
+)
 
 # ============================================================================
 # Entry point
@@ -228,38 +242,35 @@ def main(argv: list[str]) -> None:
         max_grad_norm=FLAGS.max_grad_norm,
         temperature=FLAGS.temperature,
         num_eval_episodes=FLAGS.num_eval_episodes,
+        exhaustive_groups=FLAGS.grpo_exhaustive_groups,
+        optimistic_reward_alpha=FLAGS.grpo_optimistic_alpha,
     )
     # ── Tiny Hanabi-specific tuning ──
-    # These overrides implement recommendations from experiment analysis:
-    #   1. More passes (100 vs 25) for better convergence.
-    #   2. Larger group size (K=16) for more reliable advantage estimation.
-    #   3. Per-player updates to avoid conflicting gradient signals.
-    #   4. Temperature annealing to shift from exploration to exploitation.
-    #   5. Reward variance penalty to favor consistent strategies.
-    # These only apply to tiny_hanabi; other games use the base defaults.
+    # For tiny_hanabi, enable exhaustive-group GRPO by default.  This
+    # enumerates all game states and forms groups where only the target
+    # player's action varies, producing zero-variance advantage estimates.
+    # This replaces the previous approach (temperature annealing, reward
+    # variance penalty, partner-weight freezing) which caused policy
+    # collapse in longer runs.
     if FLAGS.game == 'tiny_hanabi':
       tiny_hanabi_passes = (
           FLAGS.grpo_passes if FLAGS['grpo_passes'].present else 100
       )
+      use_exhaustive = (
+          FLAGS.grpo_exhaustive_groups
+          if FLAGS['grpo_exhaustive_groups'].present
+          else True
+      )
       grpo_config = dataclasses.replace(
           grpo_config,
           passes=tiny_hanabi_passes,
-          num_generations=16,
-          per_player_updates=True,
-          temperature_anneal_end=0.2,
-          reward_variance_penalty=1.0,
-          reward_num_simulations=10,
+          exhaustive_groups=use_exhaustive,
       )
       logging.info(
-          'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, K=%d, '
-          'per_player_updates=%s, temp_anneal_end=%.1f, '
-          'reward_var_penalty=%.1f, reward_num_sims=%d',
+          'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, '
+          'exhaustive_groups=%s',
           grpo_config.passes,
-          grpo_config.num_generations,
-          grpo_config.per_player_updates,
-          grpo_config.temperature_anneal_end,
-          grpo_config.reward_variance_penalty,
-          grpo_config.reward_num_simulations,
+          grpo_config.exhaustive_groups,
       )
     trainer.train_grpo(grpo_config)
   else:

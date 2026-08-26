@@ -55,32 +55,56 @@ class GRPOConfig:
 
   Attributes:
     num_generations: Number of completions to sample per prompt in GRPO (group
-      size K).
+      size K). Only used when ``exhaustive_groups`` is False.
     collect_episodes: Number of episodes to play for collecting game state
-      prompts before each GRPO training pass.
+      prompts before each GRPO training pass. Only used when
+      ``exhaustive_groups`` is False.
     train_epochs: Number of training epochs per GRPO pass.
     passes: Number of collect-then-train passes for GRPO.
     max_completion_length: Maximum completion length for GRPO generation.
     lr: Learning rate for the optimizer.
     kl_coeff: KL penalty coefficient.
     max_grad_norm: Maximum gradient norm for clipping.
+    gradient_accumulation_steps: Number of groups to accumulate gradients over
+      before taking an optimizer step. Defaults to 1 (step after every group).
     temperature: Sampling temperature for LLM action selection during data
       collection.
     num_eval_episodes: Number of episodes per evaluation round.
     per_player_updates: If True, group collected prompts by player_id and run a
       separate GRPO training step for each player group. This gives cleaner
       gradient signal in cooperative games where players have different
-      information (e.g. Tiny Hanabi).
+      information (e.g. Tiny Hanabi). Only used when ``exhaustive_groups`` is
+      False.
     temperature_anneal_end: If set, linearly anneal the sampling temperature
       from ``temperature`` to this value over the course of training. None means
       no annealing (constant temperature).
     reward_variance_penalty: Coefficient for penalizing high-variance reward
       outcomes. The effective reward becomes ``mean_reward - penalty *
       std_reward`` when ``reward_num_simulations > 1``. Encourages convergence
-      to consistent strategies.
+      to consistent strategies. Only used when ``exhaustive_groups`` is False.
     reward_num_simulations: Number of independent game simulations to run per
       completion for estimating reward mean and variance. Only used when
       ``reward_variance_penalty > 0``.
+    exhaustive_groups: If True, enumerate all possible game states and form
+      GRPO groups where only the target player's action varies while all other
+      variables (chance outcomes, other players' actions) are fixed. This
+      produces deterministic, zero-variance advantage estimates by reading
+      rewards directly from the game's payoff structure. For small games like
+      Tiny Hanabi this covers the full game tree; for larger games, set this
+      to False and use sampled rollouts instead.
+    optimistic_reward_alpha: Blending weight for optimistic (max-over-partner)
+      rewards in exhaustive-group GRPO.  For the first-acting player, rewards
+      are computed as::
+
+        reward = α * max_over_partner_actions(r) + (1 - α) * simulated(r)
+
+      When α=1.0 (fully optimistic), the reward assumes the best possible
+      partner cooperation, breaking the chicken-and-egg bootstrapping problem
+      in signaling games.  When α=0.0, rewards reflect the partner's current
+      policy.  The value is linearly annealed from ``optimistic_reward_alpha``
+      toward 0 over training passes, so the model starts optimistic and
+      gradually shifts to realistic self-play.  Only used when
+      ``exhaustive_groups`` is True.  Set to 0.0 to disable.
   """
 
   num_generations: int = 8
@@ -91,12 +115,15 @@ class GRPOConfig:
   lr: float = 3e-5
   kl_coeff: float = 0.05
   max_grad_norm: float = 1.0
+  gradient_accumulation_steps: int = 1
   temperature: float = 0.8
   num_eval_episodes: int = 10
   per_player_updates: bool = True
   temperature_anneal_end: float | None = None
   reward_variance_penalty: float = 0.0
   reward_num_simulations: int = 5
+  exhaustive_groups: bool = False
+  optimistic_reward_alpha: float = 1.0
 
 
 class GRPORunner:
@@ -442,6 +469,9 @@ class GRPORunner:
   def run(self) -> None:
     """Runs the full GRPO training loop.
 
+    Dispatches to exhaustive-group GRPO when ``config.exhaustive_groups`` is
+    True, otherwise uses the TRL-based sampled approach.
+
     For each pass:
       1. Collect game-state prompts by playing episodes (logging actions).
       2. Build a reward function using state renderers and simulation.
@@ -450,6 +480,10 @@ class GRPORunner:
       5. Evaluate the updated policy and log eval metrics to CSV.
       6. Save a checkpoint.
     """
+    if self._config.exhaustive_groups:
+      self._run_exhaustive()
+      return
+
     from backend.gemma_backend import _lazy_import_hf  # pylint: disable=g-import-not-at-top
 
     _lazy_import_hf()
@@ -576,6 +610,507 @@ class GRPORunner:
     if self._write_summary_fn is not None:
       self._write_summary_fn(total_time)
     self._save_checkpoint_fn(total_episodes_so_far, suffix='final')
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Exhaustive-group GRPO
+  # ════════════════════════════════════════════════════════════════════════
+
+  def _enumerate_grpo_groups(
+      self,
+      optimistic_alpha: float = 0.0,
+  ) -> list[dict[str, object]]:
+    """Enumerate all GRPO groups by walking the game tree.
+
+    A *group* is a set of (prompt, action, reward) tuples where all game
+    variables — chance outcomes and other players' actions — are held fixed
+    and only the *target player's action* varies.  This gives the cleanest
+    possible GRPO advantage signal: zero variance, no cross-context noise.
+
+    The method walks the game tree depth-first, branching at chance nodes
+    and at the target-player's decision node.  At every other player's
+    decision node, it queries the current LLM policy to select a single
+    action (no branching), so the resulting groups reflect the *current*
+    partner strategy.
+
+    For small games like Tiny Hanabi (36 terminal states) this is an
+    exhaustive walk.  For larger games the same structure works but the
+    caller should set ``collect_episodes`` to limit the number of sampled
+    rollout contexts.
+
+    Returns:
+      A list of group dicts, each containing:
+        - ``'player_id'``: int — the player whose action varies.
+        - ``'prompt'``:     str — the LLM prompt for the target player.
+        - ``'actions'``:    list[int] — the legal action IDs.
+        - ``'action_texts'``: list[str] — the action text for each action
+            (what the LLM should output to select that action).
+        - ``'rewards'``:    list[float] — the reward for each action.
+        - ``'context'``:    str — a human-readable description of the
+            fixed context (for logging).
+    """
+    game = self._env.game
+    groups: list[dict[str, object]] = []
+
+    def _walk(state, context_parts: list[str], target_player: int | None):
+      """Recursively walk the game tree to build groups.
+
+      Args:
+        state: Current OpenSpiel game state.
+        context_parts: Human-readable list describing the fixed context.
+        target_player: Once set, this is the player whose decision node
+          will be expanded into a group.  None means we haven't committed
+          to a target player yet — the first player decision encountered
+          on each path will branch into a group.
+      """
+      if state.is_terminal():
+        return
+
+      if state.is_chance_node():
+        # Branch over all chance outcomes (e.g. card deals).
+        for chance_action, _ in state.chance_outcomes():
+          child = state.child(chance_action)
+          action_str = state.action_to_string(
+              pyspiel.PlayerId.CHANCE, chance_action
+          )
+          _walk(
+              child,
+              context_parts + [f'chance:{action_str}'],
+              target_player,
+          )
+        return
+
+      current_player = state.current_player()
+
+      if target_player is None or current_player == target_player:
+        # This is a decision point we want to expand into a GRPO group.
+        # Render the prompt from this player's perspective.
+        state_text = self._renderers[current_player].render_state(
+            state, current_player, game
+        )
+        legal_actions_with_desc = self._renderers[
+            current_player
+        ].render_legal_actions(state, current_player, game)
+        legal_ids = [a for a, _ in legal_actions_with_desc]
+        action_descs = [d for _, d in legal_actions_with_desc]
+
+        prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+            state_text, legal_ids, action_descs
+        )
+
+        # Compute the reward for each action.  When optimistic_alpha > 0,
+        # we blend the simulated reward (partner's current policy) with
+        # the max reward over all partner responses (optimistic/cooperative
+        # assumption).  This helps the first-acting player learn signaling
+        # before the partner has learned to decode.
+        action_rewards: list[float] = []
+        action_texts: list[str] = []
+        for action_id in legal_ids:
+          child = state.child(action_id)
+          sim_reward = self._play_out_for_reward(child, current_player)
+
+          if optimistic_alpha > 0 and not child.is_terminal():
+            max_reward = self._max_reward_over_partners(
+                child, current_player
+            )
+            reward = (
+                optimistic_alpha * max_reward
+                + (1.0 - optimistic_alpha) * sim_reward
+            )
+          else:
+            reward = sim_reward
+
+          action_rewards.append(reward)
+          # The action text is what the LLM should output to pick this
+          # action.  We use the action description (e.g. "Action 0").
+          idx = legal_ids.index(action_id)
+          action_texts.append(action_descs[idx])
+
+        context_str = ', '.join(context_parts)
+        groups.append({
+            'player_id': current_player,
+            'prompt': prompt,
+            'actions': legal_ids,
+            'action_texts': action_texts,
+            'rewards': action_rewards,
+            'context': context_str,
+        })
+
+        # Also recurse to find groups for downstream players.
+        # For each action, walk the subtree with this player as
+        # *not* the target — other players' decision points become
+        # the target.
+        for action_id in legal_ids:
+          child = state.child(action_id)
+          action_str = state.action_to_string(current_player, action_id)
+          _walk(
+              child,
+              context_parts + [f'p{current_player}:{action_str}'],
+              None,  # Reset target so next player gets groups too.
+          )
+
+      else:
+        # This is another player's decision point and we already have a
+        # target player.  Use the LLM to pick a single action.
+        state_text = self._renderers[current_player].render_state(
+            state, current_player, game
+        )
+        legal_actions_with_desc = self._renderers[
+            current_player
+        ].render_legal_actions(state, current_player, game)
+        legal_ids = [a for a, _ in legal_actions_with_desc]
+        action_descs = [d for _, d in legal_actions_with_desc]
+
+        prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+            state_text, legal_ids, action_descs
+        )
+
+        with torch.no_grad():
+          response, _ = self._backend.generate_with_logprobs(
+              prompt,
+              temperature=self._current_temperature,
+              max_tokens=self._config.max_completion_length,
+          )
+
+        action_id = self._renderers[current_player].parse_action(
+            response, legal_actions_with_desc
+        )
+        if action_id is None:
+          action_id = int(np.random.choice(legal_ids))
+
+        child = state.child(action_id)
+        action_str = state.action_to_string(current_player, action_id)
+        _walk(
+            child,
+            context_parts + [f'p{current_player}:{action_str}'],
+            target_player,
+        )
+
+    # Start the walk from the initial state.
+    initial_state = game.new_initial_state()
+    _walk(initial_state, [], None)
+
+    # Deduplicate groups that have identical (player_id, prompt, rewards).
+    # This happens when multiple chance-outcome paths lead to the same
+    # observable state and the same reward structure.
+    seen: set[str] = set()
+    unique_groups = []
+    for g in groups:
+      key = (
+          g['player_id'],
+          g['prompt'],
+          tuple(g['rewards']),
+      )
+      key_str = str(key)
+      if key_str not in seen:
+        seen.add(key_str)
+        unique_groups.append(g)
+
+    logging.info(
+        'Enumerated %d GRPO groups (%d before dedup).',
+        len(unique_groups),
+        len(groups),
+    )
+    return unique_groups
+
+  def _play_out_for_reward(
+      self,
+      state: pyspiel.State,
+      target_player: int,
+  ) -> float:
+    """Play out a game from ``state`` to completion, returning the reward.
+
+    At each remaining decision point, uses the LLM policy (with
+    ``torch.no_grad()``) to select actions.  This is used to compute
+    deterministic rewards for exhaustive-group GRPO.
+
+    Args:
+      state: The game state to play from (not modified in place — the
+        method works on a copy).
+      target_player: The player whose reward to return.
+
+    Returns:
+      The terminal reward for ``target_player``.
+    """
+    game = self._env.game
+
+    while not state.is_terminal():
+      if state.is_chance_node():
+        # Should not happen in exhaustive mode — chance nodes are
+        # enumerated by _enumerate_grpo_groups.  If we reach one
+        # (e.g. in a game with mid-game chance), sample uniformly.
+        outcomes = state.chance_outcomes()
+        actions, probs = zip(*outcomes)
+        action = int(np.random.choice(actions, p=probs))
+        state.apply_action(action)
+        continue
+
+      current_player = state.current_player()
+      state_text = self._renderers[current_player].render_state(
+          state, current_player, game
+      )
+      legal_actions_with_desc = self._renderers[
+          current_player
+      ].render_legal_actions(state, current_player, game)
+      legal_ids = [a for a, _ in legal_actions_with_desc]
+      action_descs = [d for _, d in legal_actions_with_desc]
+
+      prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+          state_text, legal_ids, action_descs
+      )
+
+      with torch.no_grad():
+        response, _ = self._backend.generate_with_logprobs(
+            prompt,
+            temperature=self._current_temperature,
+            max_tokens=self._config.max_completion_length,
+        )
+
+      action_id = self._renderers[current_player].parse_action(
+          response, legal_actions_with_desc
+      )
+      if action_id is None:
+        action_id = int(np.random.choice(legal_ids))
+
+      state.apply_action(action_id)
+
+    rewards = state.rewards()
+    if rewards is not None:
+      return float(rewards[target_player])
+    return 0.0
+
+  def _max_reward_over_partners(
+      self,
+      state: pyspiel.State,
+      target_player: int,
+  ) -> float:
+    """Compute the max reward over all partner actions from ``state``.
+
+    Enumerates all legal actions for the current player at ``state`` and
+    recursively finds the maximum achievable reward for ``target_player``.
+    This gives an optimistic estimate: "what's the best reward if my
+    partner cooperated perfectly?"
+
+    At chance nodes, takes the max over all outcomes (fully optimistic).
+    At the target player's own decision nodes (if any remain), also
+    takes the max.
+
+    Args:
+      state: The game state to evaluate (typically after the target
+        player has already acted).
+      target_player: The player whose reward to maximize.
+
+    Returns:
+      The maximum possible terminal reward for ``target_player``.
+    """
+    if state.is_terminal():
+      rewards = state.rewards()
+      return float(rewards[target_player]) if rewards else 0.0
+
+    if state.is_chance_node():
+      # Max over all chance outcomes (fully optimistic).
+      best = float('-inf')
+      for chance_action, _ in state.chance_outcomes():
+        child = state.child(chance_action)
+        r = self._max_reward_over_partners(child, target_player)
+        best = max(best, r)
+      return best
+
+    # Player decision node — enumerate all actions and take the max.
+    current_player = state.current_player()
+    best = float('-inf')
+    for action in state.legal_actions(current_player):
+      child = state.child(action)
+      r = self._max_reward_over_partners(child, target_player)
+      best = max(best, r)
+    return best
+
+  def _run_exhaustive(self) -> None:
+    """Run GRPO training with exhaustive group enumeration.
+
+    For each pass:
+      1. Enumerate all GRPO groups by walking the game tree.  Each group
+         fixes all variables except one player's action.
+      2. For each group, compute log π(a|prompt) for every legal action
+         using the backend's differentiable ``compute_action_log_prob``.
+      3. Compute group-relative advantages: A_i = r_i - mean(r_group).
+      4. Compute the policy gradient loss:
+         L = -Σ_i advantage_i * log π(a_i | prompt).
+      5. Accumulate gradients across groups and step the optimizer.
+      6. Evaluate and log metrics.
+    """
+    logging.info(
+        'Starting exhaustive-group GRPO: %d passes, lr=%.1e',
+        self._config.passes,
+        self._config.lr,
+    )
+
+    # Build optimizer over trainable (LoRA) parameters.
+    trainable_params = [
+        p for p in self._backend.model.parameters() if p.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=self._config.lr
+    )
+
+    start_time = time.time()
+    total_episodes_so_far = 0
+
+    for pass_idx in range(1, self._config.passes + 1):
+      pass_start = time.time()
+      logging.info('=== Exhaustive GRPO pass %d/%d ===',
+                   pass_idx, self._config.passes)
+
+      # ── Anneal optimistic reward alpha ──
+      # Linearly decay from initial alpha to 0 over all passes.
+      if self._config.optimistic_reward_alpha > 0:
+        progress = (pass_idx - 1) / max(self._config.passes - 1, 1)
+        current_alpha = self._config.optimistic_reward_alpha * (1 - progress)
+      else:
+        current_alpha = 0.0
+
+      # ── Step 1: Enumerate all groups ──
+      self._backend.model.eval()
+      groups = self._enumerate_grpo_groups(optimistic_alpha=current_alpha)
+      logging.info('  optimistic_alpha=%.3f', current_alpha)
+
+      if not groups:
+        logging.warning('No groups enumerated in pass %d.', pass_idx)
+        continue
+
+      # ── Step 2–4: Compute GRPO loss across all groups ──
+      self._backend.model.train()
+      optimizer.zero_grad()
+
+      total_loss = 0.0
+      total_mean_reward = 0.0
+      total_mean_advantage = 0.0
+      groups_processed = 0
+
+      for group_idx, group in enumerate(groups):
+        player_id = group['player_id']
+        prompt = group['prompt']
+        action_texts = group['action_texts']
+        rewards_list = group['rewards']
+        context = group['context']
+
+        rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32)
+        mean_reward = rewards_tensor.mean().item()
+
+        # Skip groups where all rewards are identical (zero advantage).
+        if rewards_tensor.std().item() < 1e-8:
+          logging.info(
+              '  [Group %d] P%d | %s | all rewards=%.1f, skipping.',
+              group_idx, player_id, context, mean_reward,
+          )
+          continue
+
+        # Compute advantages: A_i = r_i - mean(r).
+        advantages = rewards_tensor - rewards_tensor.mean()
+
+        # Compute log π(a_i | prompt) for each action (with gradients).
+        log_probs = []
+        for action_text in action_texts:
+          log_prob = self._backend.compute_action_log_prob(
+              prompt, action_text
+          )
+          log_probs.append(log_prob)
+
+        log_probs_tensor = torch.stack(log_probs)
+
+        # GRPO policy gradient loss: L = -Σ A_i * log π(a_i | prompt).
+        # Normalize advantages by group std for stability.
+        advantages_normalized = advantages / (advantages.std() + 1e-8)
+        advantages_normalized = advantages_normalized.to(
+            log_probs_tensor.device
+        )
+
+        group_loss = -(advantages_normalized * log_probs_tensor).sum()
+
+        # Scale loss for gradient accumulation.
+        accum_steps = self._config.gradient_accumulation_steps
+        if accum_steps > 1:
+          group_loss = group_loss / accum_steps
+
+        group_loss.backward()
+        groups_processed += 1
+
+        total_loss += group_loss.item()
+        total_mean_reward += mean_reward
+        total_mean_advantage += advantages.abs().mean().item()
+
+        logging.info(
+            '  [Group %d] P%d | %s | rewards=%s | loss=%.4f',
+            group_idx,
+            player_id,
+            context,
+            [f'{r:.0f}' for r in rewards_list],
+            group_loss.item(),
+        )
+
+        # Step optimizer every gradient_accumulation_steps groups.
+        if groups_processed % accum_steps == 0:
+          torch.nn.utils.clip_grad_norm_(
+              trainable_params, self._config.max_grad_norm
+          )
+          optimizer.step()
+          optimizer.zero_grad()
+
+      # Flush any remaining accumulated gradients.
+      if groups_processed % self._config.gradient_accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(
+            trainable_params, self._config.max_grad_norm
+        )
+        optimizer.step()
+        optimizer.zero_grad()
+
+      # Count this pass as a batch of episodes for logging compatibility.
+      total_episodes_so_far += len(groups)
+
+      pass_elapsed = time.time() - pass_start
+      avg_reward = (
+          total_mean_reward / groups_processed if groups_processed else 0.0
+      )
+      avg_loss = total_loss / groups_processed if groups_processed else 0.0
+      logging.info(
+          'Pass %d complete: %d groups, avg_loss=%.4f, '
+          'avg_reward=%.2f (%.1f sec)',
+          pass_idx,
+          groups_processed,
+          avg_loss,
+          avg_reward,
+          pass_elapsed,
+      )
+
+      # ── Step 5: Log training metrics ──
+      if self._log_training_step_fn is not None:
+        self._log_training_step_fn(
+            total_episodes_so_far, 0.0, 0.0, start_time
+        )
+
+      # ── Step 6: Evaluate ──
+      self._backend.model.eval()
+      eval_metrics = self._evaluate_fn(self._config.num_eval_episodes)
+      logging.info('--- Evaluation after pass %d ---', pass_idx)
+      for k, v in sorted(eval_metrics.items()):
+        logging.info('  %s: %.4f', k, v)
+
+      if self._log_eval_metrics_fn is not None:
+        self._log_eval_metrics_fn(total_episodes_so_far, eval_metrics)
+
+      # ── Step 7: Checkpoint ──
+      self._save_checkpoint_fn(total_episodes_so_far)
+
+    # ── Final summary ──
+    total_time = time.time() - start_time
+    logging.info(
+        'Exhaustive GRPO complete: %d passes in %.1f sec.',
+        self._config.passes,
+        total_time,
+    )
+    if self._write_summary_fn is not None:
+      self._write_summary_fn(total_time)
+    self._save_checkpoint_fn(total_episodes_so_far, suffix='final')
+
 
   def _train_grpo_on_prompts(
       self,
