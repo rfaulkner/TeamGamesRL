@@ -154,8 +154,15 @@ flags.DEFINE_float(
     1.0,
     'Blending weight for optimistic (max-over-partner) rewards. '
     'When 1.0, P0 rewards assume best possible partner cooperation. '
-    'Linearly annealed toward 0 over training. Only used with '
+    'Linearly annealed toward alpha_min over training. Only used with '
     '--grpo_exhaustive_groups.',
+)
+flags.DEFINE_float(
+    'grpo_optimistic_alpha_min',
+    0.2,
+    'Minimum floor for optimistic reward alpha annealing. '
+    'Prevents premature collapse into uncoordinated equilibria (e.g. 8.0). '
+    'Only used with --grpo_exhaustive_groups.',
 )
 
 # ============================================================================
@@ -244,6 +251,7 @@ def main(argv: list[str]) -> None:
         num_eval_episodes=FLAGS.num_eval_episodes,
         exhaustive_groups=FLAGS.grpo_exhaustive_groups,
         optimistic_reward_alpha=FLAGS.grpo_optimistic_alpha,
+        optimistic_reward_alpha_min=FLAGS.grpo_optimistic_alpha_min,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This
@@ -268,9 +276,11 @@ def main(argv: list[str]) -> None:
       )
       logging.info(
           'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, '
-          'exhaustive_groups=%s',
+          'exhaustive_groups=%s, alpha=[%.2f -> %.2f]',
           grpo_config.passes,
           grpo_config.exhaustive_groups,
+          grpo_config.optimistic_reward_alpha,
+          grpo_config.optimistic_reward_alpha_min,
       )
     trainer.train_grpo(grpo_config)
   else:

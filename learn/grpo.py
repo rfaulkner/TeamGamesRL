@@ -102,9 +102,12 @@ class GRPOConfig:
       partner cooperation, breaking the chicken-and-egg bootstrapping problem
       in signaling games.  When α=0.0, rewards reflect the partner's current
       policy.  The value is linearly annealed from ``optimistic_reward_alpha``
-      toward 0 over training passes, so the model starts optimistic and
-      gradually shifts to realistic self-play.  Only used when
-      ``exhaustive_groups`` is True.  Set to 0.0 to disable.
+      toward ``optimistic_reward_alpha_min`` over training passes.
+      Only used when ``exhaustive_groups`` is True.  Set to 0.0 to disable.
+    optimistic_reward_alpha_min: Minimum floor for optimistic reward alpha
+      annealing.  Maintains a baseline optimistic drive to prevent premature
+      collapse into non-cooperative equilibria (such as the 8.0 fallback in
+      Tiny Hanabi).  Defaults to 0.2.
   """
 
   num_generations: int = 8
@@ -124,6 +127,7 @@ class GRPOConfig:
   reward_num_simulations: int = 5
   exhaustive_groups: bool = False
   optimistic_reward_alpha: float = 1.0
+  optimistic_reward_alpha_min: float = 0.2
 
 
 class GRPORunner:
@@ -961,10 +965,19 @@ class GRPORunner:
                    pass_idx, self._config.passes)
 
       # ── Anneal optimistic reward alpha ──
-      # Linearly decay from initial alpha to 0 over all passes.
+      # Linearly decay from initial alpha toward alpha_min over all passes.
       if self._config.optimistic_reward_alpha > 0:
         progress = (pass_idx - 1) / max(self._config.passes - 1, 1)
-        current_alpha = self._config.optimistic_reward_alpha * (1 - progress)
+        alpha_range = (
+            self._config.optimistic_reward_alpha
+            - self._config.optimistic_reward_alpha_min
+        )
+        current_alpha = (
+            self._config.optimistic_reward_alpha - alpha_range * progress
+        )
+        current_alpha = max(
+            current_alpha, self._config.optimistic_reward_alpha_min
+        )
       else:
         current_alpha = 0.0
 
