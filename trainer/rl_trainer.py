@@ -475,50 +475,74 @@ class RLTrainer:
     Args:
       total_time: Total training time in seconds.
     """
+    total_episodes = max(self._total_episodes, 1)
+    mean_reward = (
+        float(np.mean(self._episode_rewards))
+        if self._episode_rewards
+        else 0.0
+    )
+    mean_loss = (
+        float(np.mean(self._episode_losses))
+        if self._episode_losses
+        else 0.0
+    )
+    last_10_reward = (
+        float(np.mean(self._episode_rewards[-10:]))
+        if self._episode_rewards
+        else 0.0
+    )
+    last_10_loss = (
+        float(np.mean(self._episode_losses[-10:]))
+        if self._episode_losses
+        else 0.0
+    )
+
     logging.info(
         'Training complete: %d episodes in %.1f seconds.',
-        self.num_episodes,
+        self._total_episodes if self._total_episodes > 0 else self.num_episodes,
         total_time,
     )
-    logging.info(
-        'Final mean reward: %.4f', float(np.mean(self._episode_rewards))
-    )
-    logging.info('Final mean loss: %.4f', float(np.mean(self._episode_losses)))
-    for p in range(self.game_config.num_players):
+    logging.info('Final mean reward: %.4f', mean_reward)
+    logging.info('Final mean loss: %.4f', mean_loss)
+
+    if self._total_episodes > 0:
+      for p in range(self.game_config.num_players):
+        logging.info(
+            '  Player %d win rate: %.1f%% (%d/%d)',
+            p,
+            100.0 * self._player_wins[p] / total_episodes,
+            self._player_wins[p],
+            self._total_episodes,
+        )
       logging.info(
-          '  Player %d win rate: %.1f%% (%d/%d)',
-          p,
-          100.0 * self._player_wins[p] / self._total_episodes,
-          self._player_wins[p],
+          '  Team win rate (reward >= 8): %.1f%% (%d/%d)',
+          100.0 * self._team_wins / total_episodes,
+          self._team_wins,
           self._total_episodes,
       )
-    logging.info(
-        '  Team win rate (reward >= 8): %.1f%% (%d/%d)',
-        100.0 * self._team_wins / self._total_episodes,
-        self._team_wins,
-        self._total_episodes,
-    )
 
     summary = {
         'game': self.game_name,
-        'num_episodes': self.num_episodes,
+        'num_episodes': (
+            self._total_episodes
+            if self._total_episodes > 0
+            else self.num_episodes
+        ),
         'total_time_sec': round(total_time, 1),
-        'final_mean_reward': round(float(np.mean(self._episode_rewards)), 4),
-        'final_mean_loss': round(float(np.mean(self._episode_losses)), 4),
-        'last_10_mean_reward': round(
-            float(np.mean(self._episode_rewards[-10:])), 4
-        ),
-        'last_10_mean_loss': round(
-            float(np.mean(self._episode_losses[-10:])), 4
-        ),
+        'final_mean_reward': round(mean_reward, 4),
+        'final_mean_loss': round(mean_loss, 4),
+        'last_10_mean_reward': round(last_10_reward, 4),
+        'last_10_mean_loss': round(last_10_loss, 4),
         'player_win_rates': {
             f'player_{p}': round(
-                100.0 * self._player_wins[p] / self._total_episodes, 2
+                100.0 * self._player_wins[p] / total_episodes, 2
             )
             for p in range(self.game_config.num_players)
         },
-        'team_win_rate': round(
-            100.0 * self._team_wins / self._total_episodes, 2
+        'team_win_rate': (
+            round(100.0 * self._team_wins / total_episodes, 2)
+            if self._total_episodes > 0
+            else 0.0
         ),
     }
     summary_path = os.path.join(self.results_dir, 'summary.json')
