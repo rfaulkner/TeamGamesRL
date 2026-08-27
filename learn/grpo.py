@@ -148,6 +148,28 @@ class GRPOConfig:
   Only used when ``exhaustive_groups`` is True.  A value of 0.1–0.5 is
   recommended.  The bonus applies only to player 0 (the signaler).
   """
+  phased_training: bool = False
+  """Enable phased (curriculum) training with per-player LoRA adapters.
+
+  When True, training proceeds in phases:
+    - Phase 1: Train P1 only against oracle-best P0 actions.
+    - Phase 2: Freeze P1 and train P0 against P1's learned policy.
+    - Phase 3 (optional): Joint fine-tuning with both adapters.
+
+  Each player gets its own LoRA adapter so gradients don't interfere.
+  Only used when ``exhaustive_groups`` is True.
+  """
+  phase1_max_passes: int = 50
+  """Maximum passes for Phase 1 (P1 training against oracle P0)."""
+  phase2_max_passes: int = 50
+  """Maximum passes for Phase 2 (P0 training against frozen P1)."""
+  phase3_max_passes: int = 10
+  """Maximum passes for Phase 3 (joint fine-tuning). Set to 0 to skip."""
+  convergence_patience: int = 5
+  """Stop a phase early if eval reward hasn't improved by more than
+  ``convergence_min_delta`` for this many consecutive passes."""
+  convergence_min_delta: float = 0.1
+  """Minimum reward improvement to reset the patience counter."""
 
 
 class GRPORunner:
@@ -506,6 +528,10 @@ class GRPORunner:
       5. Evaluate the updated policy and log eval metrics to CSV.
       6. Save a checkpoint.
     """
+    if self._config.exhaustive_groups and self._config.phased_training:
+      self._run_phased_exhaustive()
+      return
+
     if self._config.exhaustive_groups:
       self._run_exhaustive()
       return
@@ -1083,6 +1109,22 @@ class GRPORunner:
             self._config.kl_coeff,
         )
 
+      # ── Pre-compute old log-probs for PPO-style clipping ──
+      # Capture the policy's log-probs at the START of this pass
+      # (before any gradient updates).  Used to form importance ratios
+      # that bound how much the policy can change per pass.
+      old_log_probs_by_group: dict[int, torch.Tensor] = {}
+      self._backend.model.eval()
+      with torch.no_grad():
+        for gi, group in enumerate(groups):
+          old_lps = []
+          for action_text in group['action_texts']:
+            old_lp = self._backend.compute_action_log_prob(
+                group['prompt'], action_text
+            )
+            old_lps.append(old_lp.detach())
+          old_log_probs_by_group[gi] = torch.stack(old_lps)
+
       # ── Step 2–4: Compute GRPO loss across all groups ──
       self._backend.model.train()
       optimizer.zero_grad()
@@ -1123,19 +1165,34 @@ class GRPORunner:
 
         log_probs_tensor = torch.stack(log_probs)
 
-        # GRPO policy gradient loss: L = -Σ A_i * log π(a_i | prompt).
+        # GRPO policy gradient with PPO-style clipping.
         # Normalize advantages by group std for stability.
         advantages_normalized = advantages / (advantages.std() + 1e-8)
         advantages_normalized = advantages_normalized.to(
             log_probs_tensor.device
         )
 
-        group_loss = -(advantages_normalized * log_probs_tensor).sum()
+        # PPO clipped surrogate: use importance ratios r = π_θ / π_old
+        # instead of raw log π.  The raw REINFORCE loss -(A * log π) is
+        # unbounded as log π → -∞, which no KL penalty can compensate
+        # (KL saturates at a finite constant).  Clipping the ratio to
+        # [1-ε, 1+ε] bounds the loss and prevents per-pass divergence.
+        if group_idx in old_log_probs_by_group:
+          old_lps_g = old_log_probs_by_group[group_idx].to(
+              log_probs_tensor.device
+          )
+          ratios = torch.exp(log_probs_tensor - old_lps_g)
+          clip_eps = 0.2
+          clipped_ratios = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps)
+          surr1 = advantages_normalized * ratios
+          surr2 = advantages_normalized * clipped_ratios
+          group_loss = -torch.min(surr1, surr2).sum()
+        else:
+          group_loss = -(advantages_normalized * log_probs_tensor).sum()
 
         # ── KL penalty against reference model ──
-        # Prevents the policy from diverging too far from the pre-trained
-        # model, which otherwise causes log-probs to go to extreme values
-        # and the loss to diverge (observed: loss → -35 without this).
+        # Long-term regularizer: limits total drift from the pre-trained
+        # model across all passes (complementary to per-pass PPO clipping).
         if group_idx in ref_log_probs_by_group:
           ref_lps = ref_log_probs_by_group[group_idx].to(
               log_probs_tensor.device
@@ -1280,6 +1337,825 @@ class GRPORunner:
       self._write_summary_fn(total_time)
     self._save_checkpoint_fn(total_episodes_so_far, suffix='final')
 
+  # ════════════════════════════════════════════════════════════════════════
+  # Phased (curriculum) exhaustive GRPO
+  # ════════════════════════════════════════════════════════════════════════
+
+  def _enumerate_single_player_groups(
+      self,
+      target_player_id: int,
+      other_player_mode: str = 'oracle',
+  ) -> list[dict[str, object]]:
+    """Enumerate GRPO groups for a single player.
+
+    Unlike ``_enumerate_grpo_groups`` which creates groups for *both*
+    players, this method creates groups only for ``target_player_id``.
+    The other player's action is determined by ``other_player_mode``:
+
+      - ``'oracle'``: The other player plays the action that maximizes
+        ``target_player_id``'s reward (best possible cooperation).
+        Used in Phase 1 to give P1 the cleanest learning signal.
+
+      - ``'simulate'``: The other player's action is sampled from the
+        LLM using the *other* player's LoRA adapter.  Used in Phase 2
+        so P0 learns to signal given P1's actual learned policy.
+
+    Args:
+      target_player_id: The player whose groups to enumerate (0 or 1).
+      other_player_mode: How to determine the non-target player's action.
+        Either ``'oracle'`` or ``'simulate'``.
+
+    Returns:
+      A list of group dicts in the same format as
+      ``_enumerate_grpo_groups``.
+    """
+    game = self._env.game
+    groups: list[dict[str, object]] = []
+    other_player_id = 1 - target_player_id
+
+    def _walk(state, context_parts: list[str]):
+      if state.is_terminal():
+        return
+
+      if state.is_chance_node():
+        for chance_action, _ in state.chance_outcomes():
+          child = state.child(chance_action)
+          action_str = state.action_to_string(
+              pyspiel.PlayerId.CHANCE, chance_action
+          )
+          _walk(child, context_parts + [f'chance:{action_str}'])
+        return
+
+      current_player = state.current_player()
+
+      if current_player == target_player_id:
+        # This is the player we're training — expand into a GRPO group.
+        state_text = self._renderers[current_player].render_state(
+            state, current_player, game
+        )
+        legal_actions_with_desc = self._renderers[
+            current_player
+        ].render_legal_actions(state, current_player, game)
+        legal_ids = [a for a, _ in legal_actions_with_desc]
+        action_descs = [d for _, d in legal_actions_with_desc]
+
+        prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+            state_text, legal_ids, action_descs
+        )
+
+        # Compute rewards for each action.
+        action_rewards: list[float] = []
+        action_texts: list[str] = []
+        for action_id in legal_ids:
+          child = state.child(action_id)
+          if child.is_terminal():
+            rewards = child.rewards()
+            reward = float(rewards[target_player_id]) if rewards else 0.0
+          elif other_player_mode == 'oracle':
+            # Best possible reward assuming perfect partner cooperation.
+            reward = self._max_reward_over_partners(child, target_player_id)
+          else:
+            # Simulate using the other player's learned policy.
+            reward = self._simulate_with_adapter(
+                child, target_player_id, f'player_{other_player_id}'
+            )
+          action_rewards.append(reward)
+          idx = legal_ids.index(action_id)
+          action_texts.append(action_descs[idx])
+
+        context_str = ', '.join(context_parts)
+        groups.append({
+            'player_id': current_player,
+            'prompt': prompt,
+            'actions': legal_ids,
+            'action_texts': action_texts,
+            'rewards': action_rewards,
+            'context': context_str,
+        })
+
+        # Recurse into each action's subtree.
+        for action_id in legal_ids:
+          child = state.child(action_id)
+          action_str = state.action_to_string(current_player, action_id)
+          _walk(
+              child,
+              context_parts + [f'p{current_player}:{action_str}'],
+          )
+
+      else:
+        # This is the OTHER player's decision node.
+        if other_player_mode == 'oracle':
+          # Enumerate all actions and recurse into each — the oracle
+          # reward computation in the target player's groups will pick
+          # the best one.  We need to try all paths so we find all
+          # downstream target-player decision nodes.
+          for action_id in state.legal_actions(current_player):
+            child = state.child(action_id)
+            action_str = state.action_to_string(current_player, action_id)
+            _walk(
+                child,
+                context_parts + [f'p{current_player}:{action_str}'],
+            )
+        else:
+          # Simulate: use the other player's adapter to pick one action.
+          prev_adapter = self._backend.get_active_adapter()
+          self._backend.set_active_adapter(f'player_{current_player}')
+
+          state_text = self._renderers[current_player].render_state(
+              state, current_player, game
+          )
+          legal_actions_with_desc = self._renderers[
+              current_player
+          ].render_legal_actions(state, current_player, game)
+          legal_ids = [a for a, _ in legal_actions_with_desc]
+          action_descs = [d for _, d in legal_actions_with_desc]
+          prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+              state_text, legal_ids, action_descs
+          )
+
+          with torch.no_grad():
+            response, _ = self._backend.generate_with_logprobs(
+                prompt,
+                temperature=0.01,  # Near-greedy for stable simulation.
+                max_tokens=self._config.max_completion_length,
+            )
+
+          self._backend.set_active_adapter(prev_adapter)
+
+          action_id = self._renderers[current_player].parse_action(
+              response, legal_actions_with_desc
+          )
+          if action_id is None:
+            action_id = int(np.random.choice(legal_ids))
+
+          child = state.child(action_id)
+          action_str = state.action_to_string(current_player, action_id)
+          _walk(
+              child,
+              context_parts + [f'p{current_player}:{action_str}'],
+          )
+
+    initial_state = game.new_initial_state()
+    _walk(initial_state, [])
+
+    # Deduplicate groups.
+    seen: set[str] = set()
+    unique_groups = []
+    for g in groups:
+      key = (g['player_id'], g['prompt'], tuple(g['rewards']))
+      key_str = str(key)
+      if key_str not in seen:
+        seen.add(key_str)
+        unique_groups.append(g)
+
+    logging.info(
+        'Enumerated %d %s groups for P%d (%d before dedup).',
+        len(unique_groups),
+        other_player_mode,
+        target_player_id,
+        len(groups),
+    )
+    return unique_groups
+
+  def _simulate_with_adapter(
+      self,
+      state: pyspiel.State,
+      target_player: int,
+      other_adapter: str,
+  ) -> float:
+    """Simulate a game to completion using a specific adapter for the other player.
+
+    Args:
+      state: The game state to play from (not modified — works on a copy).
+      target_player: The player whose reward to return.
+      other_adapter: Name of the adapter to use for the other player.
+
+    Returns:
+      The terminal reward for ``target_player``.
+    """
+    game = self._env.game
+    state = state.clone()
+
+    while not state.is_terminal():
+      if state.is_chance_node():
+        outcomes = state.chance_outcomes()
+        actions, probs = zip(*outcomes)
+        action = int(np.random.choice(actions, p=probs))
+        state.apply_action(action)
+        continue
+
+      current_player = state.current_player()
+      # Use the appropriate adapter for this player.
+      prev_adapter = self._backend.get_active_adapter()
+      self._backend.set_active_adapter(
+          other_adapter if current_player != target_player
+          else f'player_{target_player}'
+      )
+
+      state_text = self._renderers[current_player].render_state(
+          state, current_player, game
+      )
+      legal_actions_with_desc = self._renderers[
+          current_player
+      ].render_legal_actions(state, current_player, game)
+      legal_ids = [a for a, _ in legal_actions_with_desc]
+      action_descs = [d for _, d in legal_actions_with_desc]
+      prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+          state_text, legal_ids, action_descs
+      )
+
+      with torch.no_grad():
+        response, _ = self._backend.generate_with_logprobs(
+            prompt,
+            temperature=0.01,  # Near-greedy.
+            max_tokens=self._config.max_completion_length,
+        )
+
+      self._backend.set_active_adapter(prev_adapter)
+
+      action_id = self._renderers[current_player].parse_action(
+          response, legal_actions_with_desc
+      )
+      if action_id is None:
+        action_id = int(np.random.choice(legal_ids))
+      state.apply_action(action_id)
+
+    rewards = state.rewards()
+    return float(rewards[target_player]) if rewards else 0.0
+
+  def _run_phased_training_pass(
+      self,
+      phase_name: str,
+      target_player: int,
+      max_passes: int,
+      optimizer: torch.optim.Optimizer,
+      total_episodes_so_far: int,
+      start_time: float,
+      other_player_mode: str = 'oracle',
+  ) -> tuple[int, bool]:
+    """Run one phase of phased training (train a single player).
+
+    Args:
+      phase_name: Label for logging (e.g. 'Phase 1: P1 vs oracle P0').
+      target_player: The player to train (0 or 1).
+      max_passes: Maximum number of passes for this phase.
+      optimizer: The optimizer for this player's adapter.
+      total_episodes_so_far: Running episode count for logging.
+      start_time: Overall training start time.
+      other_player_mode: 'oracle' or 'simulate'.
+
+    Returns:
+      Tuple of (updated_total_episodes, converged).
+    """
+    adapter_name = f'player_{target_player}'
+    logging.info(
+        '╔══════════════════════════════════════════════════╗'
+    )
+    logging.info(
+        '║ %s', phase_name,
+    )
+    logging.info(
+        '║ Training: P%d adapter=%s, max_passes=%d',
+        target_player, adapter_name, max_passes,
+    )
+    logging.info(
+        '║ Other player mode: %s', other_player_mode,
+    )
+    logging.info(
+        '╚══════════════════════════════════════════════════╝'
+    )
+
+    # Activate the target player's adapter for training.
+    self._backend.set_active_adapter(adapter_name)
+    self._backend.unfreeze_adapter(adapter_name)
+
+    best_eval_reward = float('-inf')
+    patience_counter = 0
+    converged = False
+
+    for pass_idx in range(1, max_passes + 1):
+      pass_start = time.time()
+      logging.info(
+          '=== %s — pass %d/%d ===', phase_name, pass_idx, max_passes
+      )
+
+      # Ensure correct adapter is active.
+      self._backend.set_active_adapter(adapter_name)
+
+      # ── Enumerate groups for target player only ──
+      self._backend.model.eval()
+      groups = self._enumerate_single_player_groups(
+          target_player, other_player_mode
+      )
+
+      if not groups:
+        logging.warning('No groups in %s pass %d.', phase_name, pass_idx)
+        continue
+
+      # ── Pre-compute reference log-probs for KL penalty ──
+      ref_log_probs_by_group: dict[int, torch.Tensor] = {}
+      if self._ref_state_dict is not None and self._config.kl_coeff > 0:
+        current_params = {}
+        for name, param in self._backend.model.named_parameters():
+          if name in self._ref_state_dict:
+            current_params[name] = param.data.clone()
+            param.data.copy_(self._ref_state_dict[name])
+
+        self._backend.model.eval()
+        with torch.no_grad():
+          for gi, group in enumerate(groups):
+            ref_lps = []
+            for action_text in group['action_texts']:
+              ref_lp = self._backend.compute_action_log_prob(
+                  group['prompt'], action_text
+              )
+              ref_lps.append(ref_lp.detach())
+            ref_log_probs_by_group[gi] = torch.stack(ref_lps)
+
+        for name, param in self._backend.model.named_parameters():
+          if name in current_params:
+            param.data.copy_(current_params[name])
+
+      # ── Pre-compute old log-probs for PPO clipping ──
+      old_log_probs_by_group: dict[int, torch.Tensor] = {}
+      self._backend.model.eval()
+      with torch.no_grad():
+        for gi, group in enumerate(groups):
+          old_lps = []
+          for action_text in group['action_texts']:
+            old_lp = self._backend.compute_action_log_prob(
+                group['prompt'], action_text
+            )
+            old_lps.append(old_lp.detach())
+          old_log_probs_by_group[gi] = torch.stack(old_lps)
+
+      # ── GRPO loss computation ──
+      self._backend.model.train()
+      optimizer.zero_grad()
+
+      total_loss = 0.0
+      total_mean_reward = 0.0
+      groups_processed = 0
+
+      for group_idx, group in enumerate(groups):
+        player_id = group['player_id']
+        prompt = group['prompt']
+        action_texts = group['action_texts']
+        rewards_list = group['rewards']
+        context = group['context']
+
+        rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32)
+        mean_reward = rewards_tensor.mean().item()
+
+        if rewards_tensor.std().item() < 1e-8:
+          logging.info(
+              '  [Group %d] P%d | %s | all rewards=%.1f, skipping.',
+              group_idx, player_id, context, mean_reward,
+          )
+          continue
+
+        advantages = rewards_tensor - rewards_tensor.mean()
+        log_probs = []
+        for action_text in action_texts:
+          log_prob = self._backend.compute_action_log_prob(prompt, action_text)
+          log_probs.append(log_prob)
+        log_probs_tensor = torch.stack(log_probs)
+
+        advantages_normalized = advantages / (advantages.std() + 1e-8)
+        advantages_normalized = advantages_normalized.to(
+            log_probs_tensor.device
+        )
+
+        # PPO clipped surrogate.
+        if group_idx in old_log_probs_by_group:
+          old_lps_g = old_log_probs_by_group[group_idx].to(
+              log_probs_tensor.device
+          )
+          ratios = torch.exp(log_probs_tensor - old_lps_g)
+          clip_eps = 0.2
+          clipped_ratios = torch.clamp(
+              ratios, 1.0 - clip_eps, 1.0 + clip_eps
+          )
+          surr1 = advantages_normalized * ratios
+          surr2 = advantages_normalized * clipped_ratios
+          group_loss = -torch.min(surr1, surr2).sum()
+        else:
+          group_loss = -(advantages_normalized * log_probs_tensor).sum()
+
+        # KL penalty.
+        if group_idx in ref_log_probs_by_group:
+          ref_lps = ref_log_probs_by_group[group_idx].to(
+              log_probs_tensor.device
+          )
+          probs = torch.softmax(log_probs_tensor, dim=0)
+          kl_div = (probs * (log_probs_tensor - ref_lps)).sum()
+          group_loss = group_loss + self._config.kl_coeff * kl_div
+
+        accum_steps = self._config.gradient_accumulation_steps
+        if accum_steps > 1:
+          group_loss = group_loss / accum_steps
+
+        group_loss.backward()
+        groups_processed += 1
+        total_loss += group_loss.item()
+        total_mean_reward += mean_reward
+
+        logging.info(
+            '  [Group %d] P%d | %s | rewards=%s | loss=%.4f',
+            group_idx, player_id, context,
+            [f'{r:.0f}' for r in rewards_list],
+            group_loss.item(),
+        )
+
+        if groups_processed % accum_steps == 0:
+          torch.nn.utils.clip_grad_norm_(
+              [p for p in self._backend.model.parameters() if p.requires_grad],
+              self._config.max_grad_norm,
+          )
+          optimizer.step()
+          optimizer.zero_grad()
+
+      # Flush remaining gradients.
+      if groups_processed % self._config.gradient_accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in self._backend.model.parameters() if p.requires_grad],
+            self._config.max_grad_norm,
+        )
+        optimizer.step()
+        optimizer.zero_grad()
+
+      total_episodes_so_far += len(groups)
+      pass_elapsed = time.time() - pass_start
+      avg_reward = (
+          total_mean_reward / groups_processed if groups_processed else 0.0
+      )
+      avg_loss = total_loss / groups_processed if groups_processed else 0.0
+
+      logging.info(
+          '%s pass %d complete: %d groups, avg_loss=%.4f, '
+          'avg_reward=%.2f (%.1f sec)',
+          phase_name, pass_idx, groups_processed, avg_loss,
+          avg_reward, pass_elapsed,
+      )
+
+      # ── Log training metrics ──
+      if self._log_training_step_fn is not None:
+        self._log_training_step_fn(
+            total_episodes_so_far, avg_reward, avg_loss, start_time
+        )
+
+      # ── Evaluate (using both adapters for full game simulation) ──
+      self._backend.model.eval()
+      eval_metrics = self._evaluate_fn(self._config.num_eval_episodes)
+      logging.info('--- %s evaluation after pass %d ---', phase_name, pass_idx)
+      for k, v in sorted(eval_metrics.items()):
+        logging.info('  %s: %.4f', k, v)
+
+      if self._log_eval_metrics_fn is not None:
+        self._log_eval_metrics_fn(total_episodes_so_far, eval_metrics)
+
+      # ── Convergence detection ──
+      # Use the mean of both players' eval rewards for convergence.
+      eval_reward = sum(
+          v for k, v in eval_metrics.items()
+          if k.startswith('eval/mean_reward')
+      ) / max(
+          sum(1 for k in eval_metrics if k.startswith('eval/mean_reward')), 1
+      )
+
+      if eval_reward > best_eval_reward + self._config.convergence_min_delta:
+        best_eval_reward = eval_reward
+        patience_counter = 0
+        logging.info(
+            '  ✓ New best eval reward: %.4f (patience reset)',
+            best_eval_reward,
+        )
+      else:
+        patience_counter += 1
+        logging.info(
+            '  ✗ No improvement: eval=%.4f, best=%.4f, '
+            'patience=%d/%d',
+            eval_reward, best_eval_reward,
+            patience_counter, self._config.convergence_patience,
+        )
+
+      if patience_counter >= self._config.convergence_patience:
+        logging.info(
+            '  ★ %s CONVERGED after %d passes (best=%.4f).',
+            phase_name, pass_idx, best_eval_reward,
+        )
+        converged = True
+        break
+
+      # ── Checkpoint ──
+      self._save_checkpoint_fn(total_episodes_so_far)
+
+    if not converged:
+      logging.info(
+          '  %s reached max passes (%d) without convergence '
+          '(best=%.4f).',
+          phase_name, max_passes, best_eval_reward,
+      )
+
+    return total_episodes_so_far, converged
+
+  def _run_phased_exhaustive(self) -> None:
+    """Run phased (curriculum) exhaustive GRPO training.
+
+    Phase 1: Train P1 only, with P0 playing oracle-best actions.
+              P1 learns the optimal response to perfect signals.
+    Phase 2: Freeze P1, train P0 only, simulating P1 with its
+              learned policy. P0 learns to signal effectively.
+    Phase 3: (Optional) Joint fine-tuning with both adapters active.
+
+    Each player has its own LoRA adapter so gradients don't interfere.
+    Convergence is detected per-phase using eval reward patience.
+    """
+    logging.info(
+        '╔══════════════════════════════════════════════════════════╗'
+    )
+    logging.info(
+        '║     PHASED EXHAUSTIVE GRPO TRAINING                    ║'
+    )
+    logging.info(
+        '║  Phase 1: Train P1 vs oracle P0  (max %d passes)       ║',
+        self._config.phase1_max_passes,
+    )
+    logging.info(
+        '║  Phase 2: Train P0 vs frozen P1  (max %d passes)       ║',
+        self._config.phase2_max_passes,
+    )
+    logging.info(
+        '║  Phase 3: Joint fine-tuning      (max %d passes)       ║',
+        self._config.phase3_max_passes,
+    )
+    logging.info(
+        '║  Convergence: patience=%d, min_delta=%.2f              ║',
+        self._config.convergence_patience,
+        self._config.convergence_min_delta,
+    )
+    logging.info(
+        '╚══════════════════════════════════════════════════════════╝'
+    )
+
+    start_time = time.time()
+    total_episodes_so_far = 0
+
+    # ── Create per-player LoRA adapters ──
+    num_players = self._game_config.num_players
+    self._backend.create_player_adapters(num_players)
+
+    # ════════════════════════════════════════════════════════════════
+    # Phase 1: Train P1 against oracle P0
+    # ════════════════════════════════════════════════════════════════
+    self._backend.set_active_adapter('player_1')
+    self._backend.unfreeze_adapter('player_1')
+    p1_trainable = [
+        p for p in self._backend.model.parameters() if p.requires_grad
+    ]
+    p1_optimizer = torch.optim.AdamW(p1_trainable, lr=self._config.lr)
+
+    total_episodes_so_far, p1_converged = self._run_phased_training_pass(
+        phase_name='Phase 1: P1 vs oracle P0',
+        target_player=1,
+        max_passes=self._config.phase1_max_passes,
+        optimizer=p1_optimizer,
+        total_episodes_so_far=total_episodes_so_far,
+        start_time=start_time,
+        other_player_mode='oracle',
+    )
+
+    phase1_time = time.time() - start_time
+    logging.info(
+        'Phase 1 complete: %s in %.1f sec.',
+        'converged' if p1_converged else 'max passes reached',
+        phase1_time,
+    )
+
+    # ── Freeze P1's adapter ──
+    logging.info('Freezing P1 adapter weights.')
+    self._backend.freeze_adapter('player_1')
+    self._save_checkpoint_fn(total_episodes_so_far, suffix='phase1_done')
+
+    # ════════════════════════════════════════════════════════════════
+    # Phase 2: Train P0 against frozen P1
+    # ════════════════════════════════════════════════════════════════
+    self._backend.set_active_adapter('player_0')
+    self._backend.unfreeze_adapter('player_0')
+    p0_trainable = [
+        p for p in self._backend.model.parameters() if p.requires_grad
+    ]
+    p0_optimizer = torch.optim.AdamW(p0_trainable, lr=self._config.lr)
+
+    total_episodes_so_far, p0_converged = self._run_phased_training_pass(
+        phase_name='Phase 2: P0 vs frozen P1',
+        target_player=0,
+        max_passes=self._config.phase2_max_passes,
+        optimizer=p0_optimizer,
+        total_episodes_so_far=total_episodes_so_far,
+        start_time=start_time,
+        other_player_mode='simulate',
+    )
+
+    phase2_time = time.time() - start_time - phase1_time
+    logging.info(
+        'Phase 2 complete: %s in %.1f sec.',
+        'converged' if p0_converged else 'max passes reached',
+        phase2_time,
+    )
+    self._save_checkpoint_fn(total_episodes_so_far, suffix='phase2_done')
+
+    # ════════════════════════════════════════════════════════════════
+    # Phase 3: Joint fine-tuning (optional)
+    # ════════════════════════════════════════════════════════════════
+    if self._config.phase3_max_passes > 0:
+      logging.info(
+          '╔══════════════════════════════════════════════════╗'
+      )
+      logging.info(
+          '║ Phase 3: Joint fine-tuning (%d passes)           ║',
+          self._config.phase3_max_passes,
+      )
+      logging.info(
+          '╚══════════════════════════════════════════════════╝'
+      )
+
+      # Unfreeze both adapters and train them jointly.
+      self._backend.unfreeze_adapter('player_0')
+      self._backend.unfreeze_adapter('player_1')
+
+      # Train P1 with lower LR, then P0 with lower LR, alternating.
+      joint_lr = self._config.lr * 0.1  # Reduced LR for fine-tuning.
+      best_eval_reward = float('-inf')
+      patience_counter = 0
+
+      for pass_idx in range(1, self._config.phase3_max_passes + 1):
+        pass_start = time.time()
+        logging.info(
+            '=== Phase 3: Joint pass %d/%d (lr=%.1e) ===',
+            pass_idx, self._config.phase3_max_passes, joint_lr,
+        )
+
+        # Train P1 for one pass.
+        self._backend.set_active_adapter('player_1')
+        p1_trainable_joint = [
+            p for p in self._backend.model.parameters() if p.requires_grad
+        ]
+        p1_opt_joint = torch.optim.AdamW(p1_trainable_joint, lr=joint_lr)
+
+        groups_p1 = self._enumerate_single_player_groups(1, 'simulate')
+        if groups_p1:
+          self._train_groups_one_step(
+              groups_p1, p1_opt_joint, 'Phase 3 P1'
+          )
+
+        # Train P0 for one pass.
+        self._backend.set_active_adapter('player_0')
+        p0_trainable_joint = [
+            p for p in self._backend.model.parameters() if p.requires_grad
+        ]
+        p0_opt_joint = torch.optim.AdamW(p0_trainable_joint, lr=joint_lr)
+
+        groups_p0 = self._enumerate_single_player_groups(0, 'simulate')
+        if groups_p0:
+          self._train_groups_one_step(
+              groups_p0, p0_opt_joint, 'Phase 3 P0'
+          )
+
+        total_episodes_so_far += len(groups_p1) + len(groups_p0)
+        pass_elapsed = time.time() - pass_start
+
+        # Evaluate.
+        self._backend.model.eval()
+        eval_metrics = self._evaluate_fn(self._config.num_eval_episodes)
+        logging.info(
+            '--- Phase 3 evaluation after pass %d (%.1f sec) ---',
+            pass_idx, pass_elapsed,
+        )
+        for k, v in sorted(eval_metrics.items()):
+          logging.info('  %s: %.4f', k, v)
+
+        if self._log_eval_metrics_fn is not None:
+          self._log_eval_metrics_fn(total_episodes_so_far, eval_metrics)
+        if self._log_training_step_fn is not None:
+          self._log_training_step_fn(
+              total_episodes_so_far, 0.0, 0.0, start_time
+          )
+
+        # Convergence check.
+        eval_reward = sum(
+            v for k, v in eval_metrics.items()
+            if k.startswith('eval/mean_reward')
+        ) / max(
+            sum(1 for k in eval_metrics if k.startswith('eval/mean_reward')),
+            1,
+        )
+        if eval_reward > best_eval_reward + self._config.convergence_min_delta:
+          best_eval_reward = eval_reward
+          patience_counter = 0
+          logging.info(
+              '  ✓ Phase 3 best: %.4f', best_eval_reward,
+          )
+        else:
+          patience_counter += 1
+          logging.info(
+              '  ✗ Phase 3 patience: %d/%d',
+              patience_counter, self._config.convergence_patience,
+          )
+        if patience_counter >= self._config.convergence_patience:
+          logging.info('  ★ Phase 3 converged after %d passes.', pass_idx)
+          break
+
+    # ── Final summary ──
+    total_time = time.time() - start_time
+    logging.info(
+        '═══════════════════════════════════════════════════════════'
+    )
+    logging.info(
+        'Phased GRPO complete: %.1f sec total.', total_time,
+    )
+    logging.info(
+        '  Phase 1 (P1 vs oracle): %.1f sec', phase1_time,
+    )
+    logging.info(
+        '  Phase 2 (P0 vs P1):     %.1f sec', phase2_time,
+    )
+    if self._config.phase3_max_passes > 0:
+      logging.info(
+          '  Phase 3 (joint):        %.1f sec',
+          total_time - phase1_time - phase2_time,
+      )
+    logging.info(
+        '═══════════════════════════════════════════════════════════'
+    )
+
+    if self._write_summary_fn is not None:
+      self._write_summary_fn(total_time)
+    self._save_checkpoint_fn(total_episodes_so_far, suffix='final')
+
+  def _train_groups_one_step(
+      self,
+      groups: list[dict[str, object]],
+      optimizer: torch.optim.Optimizer,
+      label: str,
+  ) -> float:
+    """Train on a list of groups for a single optimizer step.
+
+    Shared helper for Phase 3 joint fine-tuning.
+
+    Args:
+      groups: GRPO groups to train on.
+      optimizer: The optimizer to use.
+      label: Label for logging.
+
+    Returns:
+      Average loss across processed groups.
+    """
+    self._backend.model.train()
+    optimizer.zero_grad()
+
+    total_loss = 0.0
+    groups_processed = 0
+
+    for group_idx, group in enumerate(groups):
+      rewards_list = group['rewards']
+      rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32)
+
+      if rewards_tensor.std().item() < 1e-8:
+        continue
+
+      advantages = rewards_tensor - rewards_tensor.mean()
+      advantages_normalized = advantages / (advantages.std() + 1e-8)
+
+      log_probs = []
+      for action_text in group['action_texts']:
+        lp = self._backend.compute_action_log_prob(
+            group['prompt'], action_text
+        )
+        log_probs.append(lp)
+      log_probs_tensor = torch.stack(log_probs)
+
+      advantages_normalized = advantages_normalized.to(
+          log_probs_tensor.device
+      )
+      group_loss = -(advantages_normalized * log_probs_tensor).sum()
+      group_loss.backward()
+      groups_processed += 1
+      total_loss += group_loss.item()
+
+    if groups_processed > 0:
+      torch.nn.utils.clip_grad_norm_(
+          [p for p in self._backend.model.parameters() if p.requires_grad],
+          self._config.max_grad_norm,
+      )
+      optimizer.step()
+      optimizer.zero_grad()
+
+    avg_loss = total_loss / groups_processed if groups_processed else 0.0
+    logging.info(
+        '  %s: %d groups, avg_loss=%.4f', label, groups_processed, avg_loss,
+    )
+    return avg_loss
 
   def _train_grpo_on_prompts(
       self,

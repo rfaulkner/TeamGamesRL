@@ -135,7 +135,7 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
       self.tokenizer.pad_token = self.tokenizer.eos_token
 
     # ── LoRA adapter ──
-    lora_config = peft.LoraConfig(
+    self._lora_config_template = peft.LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
@@ -147,10 +147,110 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
     if use_4bit:
       self.model = peft.prepare_model_for_kbit_training(self.model)
 
-    self.model = peft.get_peft_model(self.model, lora_config)
+    self.model = peft.get_peft_model(self.model, self._lora_config_template)
     self.model.print_trainable_parameters()
+    self._active_adapter: str = 'default'
 
     logging.info('Gemma backend ready on device=%s', self.device)
+
+  # ── Multi-adapter management for phased training ──
+
+  def create_player_adapters(self, num_players: int = 2) -> None:
+    """Create separate LoRA adapters for each player.
+
+    Adds named adapters 'player_0', 'player_1', etc. to the PEFT model.
+    The initial 'default' adapter remains and can be used as a reference.
+    Each new adapter is initialized from the current 'default' adapter
+    weights so training starts from the same pre-trained baseline.
+
+    Args:
+      num_players: Number of player adapters to create.
+    """
+    _lazy_import_hf()
+    for pid in range(num_players):
+      adapter_name = f'player_{pid}'
+      self.model.add_adapter(adapter_name, self._lora_config_template)
+      logging.info('Created LoRA adapter: %s', adapter_name)
+
+    # Activate the first player's adapter by default.
+    self.set_active_adapter('player_0')
+    logging.info(
+        'Created %d player adapters. Active: %s',
+        num_players,
+        self._active_adapter,
+    )
+
+  def set_active_adapter(self, adapter_name: str) -> None:
+    """Switch the active LoRA adapter.
+
+    Args:
+      adapter_name: Name of the adapter to activate (e.g. 'player_0').
+    """
+    self.model.set_adapter(adapter_name)
+    self._active_adapter = adapter_name
+
+  def get_active_adapter(self) -> str:
+    """Returns the name of the currently active adapter."""
+    return self._active_adapter
+
+  def get_adapter_state_dict(self, adapter_name: str) -> dict:
+    """Get a frozen copy of a specific adapter's parameters.
+
+    Args:
+      adapter_name: Name of the adapter to snapshot.
+
+    Returns:
+      A dict mapping parameter names to detached tensor clones.
+    """
+    self.set_active_adapter(adapter_name)
+    state = {}
+    for name, param in self.model.named_parameters():
+      if param.requires_grad:
+        state[name] = param.data.detach().clone()
+    return state
+
+  def load_adapter_state_dict(
+      self, adapter_name: str, state_dict: dict
+  ) -> None:
+    """Load parameters into a specific adapter.
+
+    Args:
+      adapter_name: Name of the adapter to load into.
+      state_dict: Dict mapping parameter names to tensors.
+    """
+    prev = self._active_adapter
+    self.set_active_adapter(adapter_name)
+    for name, param in self.model.named_parameters():
+      if name in state_dict:
+        param.data.copy_(state_dict[name])
+    self.set_active_adapter(prev)
+
+  def freeze_adapter(self, adapter_name: str) -> None:
+    """Freeze all parameters in the named adapter (no gradients).
+
+    Args:
+      adapter_name: Name of the adapter to freeze.
+    """
+    prev = self._active_adapter
+    self.set_active_adapter(adapter_name)
+    for param in self.model.parameters():
+      if param.requires_grad:
+        param.requires_grad_(False)
+    self.set_active_adapter(prev)
+
+  def unfreeze_adapter(self, adapter_name: str) -> None:
+    """Unfreeze all LoRA parameters in the named adapter.
+
+    Args:
+      adapter_name: Name of the adapter to unfreeze.
+    """
+    prev = self._active_adapter
+    self.set_active_adapter(adapter_name)
+    for name, param in self.model.named_parameters():
+      # Only unfreeze LoRA parameters (contain 'lora_' in the name).
+      if 'lora_' in name:
+        param.requires_grad_(True)
+    self.set_active_adapter(prev)
 
   def generate(
       self,

@@ -208,6 +208,16 @@ class RLTrainer:
     while not time_step.last():
       current_player = time_step.current_player()
 
+      # ── Swap LoRA adapter for phased training ──
+      # When per-player adapters exist, activate the current player's
+      # adapter so each player uses its own learned policy.
+      if hasattr(self.backend, 'set_active_adapter'):
+        adapter_name = f'player_{current_player}'
+        try:
+          self.backend.set_active_adapter(adapter_name)
+        except (ValueError, KeyError):
+          pass  # No per-player adapters — use default.
+
       # Render state text.
       state = self.env._state  # pylint: disable=protected-access
       state_text = self.renderers[current_player].render_state(

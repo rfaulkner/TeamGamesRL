@@ -39,6 +39,7 @@ LORA_RANK=16
 LR="3e-5"
 NUM_EPISODES=500
 GRPO_PASSES=30
+EXTRA_FLAGS=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -49,8 +50,9 @@ for arg in "$@"; do
     --num_episodes=*) NUM_EPISODES="${arg#*=}" ;;
     --grpo_passes=*)  GRPO_PASSES="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: sbatch run_rl.sh [--game=G] [--model=M] [--lora_rank=R] [--lr=L] [--num_episodes=N] [--grpo_passes=P]"
+      echo "Usage: sbatch run_rl.sh [--game=G] [--model=M] [--lora_rank=R] [--lr=L] [--num_episodes=N] [--grpo_passes=P] [--extra_trainer_flags...]"
       exit 0 ;;
+    --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
   esac
 done
@@ -133,7 +135,8 @@ python3 trainer/gemma_rl_trainer.py \
   --max_seq_len=512 \
   --use_4bit \
   --output_dir="${output_dir}" \
-  --log_every=10
+  --log_every=10 \
+  ${EXTRA_FLAGS}
 
 echo "============================================"
 echo " Training complete. Output: ${output_dir}"

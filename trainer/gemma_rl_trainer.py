@@ -173,7 +173,41 @@ flags.DEFINE_float(
     'game states. 0.1-0.5 recommended for Tiny Hanabi. '
     'Only used with --grpo_exhaustive_groups.',
 )
-
+flags.DEFINE_bool(
+    'grpo_phased_training',
+    False,
+    'Enable phased (curriculum) training with per-player LoRA adapters. '
+    'Phase 1: train P1 against oracle-best P0. Phase 2: freeze P1, train P0. '
+    'Phase 3: optional joint fine-tuning. '
+    'Only used with --grpo_exhaustive_groups.',
+)
+flags.DEFINE_integer(
+    'grpo_phase1_passes',
+    50,
+    'Maximum passes for Phase 1 (P1 training against oracle P0).',
+)
+flags.DEFINE_integer(
+    'grpo_phase2_passes',
+    50,
+    'Maximum passes for Phase 2 (P0 training against frozen P1).',
+)
+flags.DEFINE_integer(
+    'grpo_phase3_passes',
+    10,
+    'Maximum passes for Phase 3 (joint fine-tuning). Set to 0 to skip.',
+)
+flags.DEFINE_integer(
+    'grpo_convergence_patience',
+    5,
+    'Stop a phase early if eval reward has not improved for this many '
+    'consecutive passes.',
+)
+flags.DEFINE_float(
+    'grpo_convergence_min_delta',
+    0.1,
+    'Minimum improvement in eval reward to reset the convergence patience '
+    'counter.',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -262,6 +296,12 @@ def main(argv: list[str]) -> None:
         optimistic_reward_alpha=FLAGS.grpo_optimistic_alpha,
         optimistic_reward_alpha_min=FLAGS.grpo_optimistic_alpha_min,
         signal_entropy_coeff=FLAGS.grpo_signal_entropy_coeff,
+        phased_training=FLAGS.grpo_phased_training,
+        phase1_max_passes=FLAGS.grpo_phase1_passes,
+        phase2_max_passes=FLAGS.grpo_phase2_passes,
+        phase3_max_passes=FLAGS.grpo_phase3_passes,
+        convergence_patience=FLAGS.grpo_convergence_patience,
+        convergence_min_delta=FLAGS.grpo_convergence_min_delta,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This
@@ -305,13 +345,24 @@ def main(argv: list[str]) -> None:
       logging.info(
           'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, '
           'exhaustive_groups=%s, alpha=[%.2f -> %.2f], '
-          'signal_entropy_coeff=%.3f',
+          'signal_entropy_coeff=%.3f, phased_training=%s',
           grpo_config.passes,
           grpo_config.exhaustive_groups,
           grpo_config.optimistic_reward_alpha,
           grpo_config.optimistic_reward_alpha_min,
           grpo_config.signal_entropy_coeff,
+          grpo_config.phased_training,
       )
+      if grpo_config.phased_training:
+        logging.info(
+            '  Phased training: phase1=%d, phase2=%d, phase3=%d, '
+            'patience=%d, min_delta=%.2f',
+            grpo_config.phase1_max_passes,
+            grpo_config.phase2_max_passes,
+            grpo_config.phase3_max_passes,
+            grpo_config.convergence_patience,
+            grpo_config.convergence_min_delta,
+        )
     trainer.train_grpo(grpo_config)
   else:
     from learn.reinforce import ReinforceConfig  # pylint: disable=g-import-not-at-top
