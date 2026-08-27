@@ -164,6 +164,15 @@ flags.DEFINE_float(
     'Prevents premature collapse into uncoordinated equilibria (e.g. 8.0). '
     'Only used with --grpo_exhaustive_groups.',
 )
+flags.DEFINE_float(
+    'grpo_signal_entropy_coeff',
+    0.0,
+    'Coefficient for the cross-state signal entropy bonus on P0. '
+    'Encourages P0 to use different actions for different cards by '
+    'maximizing the entropy of the marginal action distribution across '
+    'game states. 0.1-0.5 recommended for Tiny Hanabi. '
+    'Only used with --grpo_exhaustive_groups.',
+)
 
 # ============================================================================
 # Entry point
@@ -252,14 +261,12 @@ def main(argv: list[str]) -> None:
         exhaustive_groups=FLAGS.grpo_exhaustive_groups,
         optimistic_reward_alpha=FLAGS.grpo_optimistic_alpha,
         optimistic_reward_alpha_min=FLAGS.grpo_optimistic_alpha_min,
+        signal_entropy_coeff=FLAGS.grpo_signal_entropy_coeff,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This
     # enumerates all game states and forms groups where only the target
     # player's action varies, producing zero-variance advantage estimates.
-    # This replaces the previous approach (temperature annealing, reward
-    # variance penalty, partner-weight freezing) which caused policy
-    # collapse in longer runs.
     if FLAGS.game == 'tiny_hanabi':
       tiny_hanabi_passes = (
           FLAGS.grpo_passes if FLAGS['grpo_passes'].present else 100
@@ -269,18 +276,38 @@ def main(argv: list[str]) -> None:
           if FLAGS['grpo_exhaustive_groups'].present
           else True
       )
+      # Default to no annealing (alpha_min=alpha) for tiny_hanabi.  The
+      # payoff matrix has a unique optimal P0 signaling convention and a
+      # fixed α=1.0 gives stable, correct gradient signal throughout
+      # training.  Override with --grpo_optimistic_alpha_min if needed.
+      use_alpha_min = (
+          FLAGS.grpo_optimistic_alpha_min
+          if FLAGS['grpo_optimistic_alpha_min'].present
+          else grpo_config.optimistic_reward_alpha
+      )
+      # Default signal entropy bonus for tiny_hanabi to break the
+      # action symmetry for P0 and encourage diverse signaling.
+      use_entropy = (
+          FLAGS.grpo_signal_entropy_coeff
+          if FLAGS['grpo_signal_entropy_coeff'].present
+          else 0.1
+      )
       grpo_config = dataclasses.replace(
           grpo_config,
           passes=tiny_hanabi_passes,
           exhaustive_groups=use_exhaustive,
+          optimistic_reward_alpha_min=use_alpha_min,
+          signal_entropy_coeff=use_entropy,
       )
       logging.info(
           'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, '
-          'exhaustive_groups=%s, alpha=[%.2f -> %.2f]',
+          'exhaustive_groups=%s, alpha=[%.2f -> %.2f], '
+          'signal_entropy_coeff=%.3f',
           grpo_config.passes,
           grpo_config.exhaustive_groups,
           grpo_config.optimistic_reward_alpha,
           grpo_config.optimistic_reward_alpha_min,
+          grpo_config.signal_entropy_coeff,
       )
     trainer.train_grpo(grpo_config)
   else:

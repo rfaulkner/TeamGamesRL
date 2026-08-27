@@ -128,6 +128,26 @@ class GRPOConfig:
   exhaustive_groups: bool = False
   optimistic_reward_alpha: float = 1.0
   optimistic_reward_alpha_min: float = 0.2
+  signal_entropy_coeff: float = 0.0
+  """Coefficient for the cross-state signal entropy bonus.
+
+  In signaling games, the first-acting player (P0) may converge to the
+  same action for all dealt cards, collapsing into a non-signaling
+  equilibrium (e.g. the 8.0 plateau in Tiny Hanabi).
+
+  When ``signal_entropy_coeff > 0``, an additional loss term is added
+  after each GRPO pass that maximizes the entropy of P0's *marginal*
+  action distribution across all game states::
+
+    π_marginal(a) = (1/N) Σ_s π(a | s)
+    L_entropy = -signal_entropy_coeff * H(π_marginal)
+
+  This encourages P0 to use different actions for different states,
+  breaking symmetry without prescribing a specific signaling convention.
+
+  Only used when ``exhaustive_groups`` is True.  A value of 0.1–0.5 is
+  recommended.  The bonus applies only to player 0 (the signaler).
+  """
 
 
 class GRPORunner:
@@ -1099,6 +1119,67 @@ class GRPORunner:
         )
         optimizer.step()
         optimizer.zero_grad()
+
+      # ── Signal entropy bonus ──
+      # Maximize entropy of P0's marginal action distribution across
+      # game states, restricted to *near-optimal* actions only.
+      # This encourages P0 to use different actions for different cards
+      # without pushing probability toward clearly bad actions.
+      #
+      # For each P0 group, actions whose reward is below the group's best
+      # reward (minus a small tolerance) are masked out.  The per-state
+      # probabilities are renormalized over the remaining "eligible"
+      # actions before computing the marginal and its entropy.
+      entropy_val = 0.0
+      if self._config.signal_entropy_coeff > 0:
+        p0_groups = [g for g in groups if g['player_id'] == 0]
+        if p0_groups:
+          optimizer.zero_grad()
+          all_probs = []
+          for group in p0_groups:
+            prompt = group['prompt']
+            action_texts = group['action_texts']
+            rewards_list_g = group['rewards']
+            log_probs = []
+            for action_text in action_texts:
+              log_prob = self._backend.compute_action_log_prob(
+                  prompt, action_text
+              )
+              log_probs.append(log_prob)
+            log_probs_tensor = torch.stack(log_probs)
+            probs = torch.softmax(log_probs_tensor, dim=0)
+
+            # Mask to near-optimal actions (within 1e-2 of max reward).
+            rewards_t = torch.tensor(rewards_list_g, dtype=torch.float32)
+            eligible = (rewards_t >= rewards_t.max() - 1e-2).float()
+            masked_probs = probs * eligible
+            masked_probs = masked_probs / (masked_probs.sum() + 1e-10)
+            all_probs.append(masked_probs)
+
+          # Marginal distribution: average over P0 states.
+          marginal = torch.stack(all_probs).mean(dim=0)
+          marginal = marginal / (marginal.sum() + 1e-10)
+
+          # Entropy: H = -Σ p(a) log p(a).
+          entropy = -(marginal * torch.log(marginal + 1e-10)).sum()
+          entropy_val = entropy.item()
+
+          # Maximize entropy → minimize -coeff * H.
+          entropy_loss = -self._config.signal_entropy_coeff * entropy
+          entropy_loss.backward()
+
+          torch.nn.utils.clip_grad_norm_(
+              trainable_params, self._config.max_grad_norm
+          )
+          optimizer.step()
+          optimizer.zero_grad()
+
+          logging.info(
+              '  Signal entropy: H=%.4f, loss=%.4f, marginal=%s',
+              entropy_val,
+              entropy_loss.item(),
+              [f'{p:.3f}' for p in marginal.detach().cpu().tolist()],
+          )
 
       # Count this pass as a batch of episodes for logging compatibility.
       total_episodes_so_far += len(groups)
