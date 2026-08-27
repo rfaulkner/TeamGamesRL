@@ -276,21 +276,24 @@ def main(argv: list[str]) -> None:
           if FLAGS['grpo_exhaustive_groups'].present
           else True
       )
-      # Default to no annealing (alpha_min=alpha) for tiny_hanabi.  The
-      # payoff matrix has a unique optimal P0 signaling convention and a
-      # fixed α=1.0 gives stable, correct gradient signal throughout
-      # training.  Override with --grpo_optimistic_alpha_min if needed.
+      # Anneal optimistic alpha from 1.0 → 0.0 for tiny_hanabi.
+      # Early passes use fully optimistic rewards (α=1.0) to bootstrap
+      # P0 signaling.  Later passes decay toward P1's actual policy so
+      # that P0's convention reflects what P1 can really decode.
       use_alpha_min = (
           FLAGS.grpo_optimistic_alpha_min
           if FLAGS['grpo_optimistic_alpha_min'].present
-          else grpo_config.optimistic_reward_alpha
+          else 0.0
       )
-      # Default signal entropy bonus for tiny_hanabi to break the
-      # action symmetry for P0 and encourage diverse signaling.
+      # Signal entropy bonus is disabled by default.  The optimistic
+      # rewards and KL regularization already break the R=8 plateau
+      # without risking gradient conflicts from a second optimizer step.
+      # Use a small value (0.01–0.05) only if the model still collapses
+      # to a single action for all cards.
       use_entropy = (
           FLAGS.grpo_signal_entropy_coeff
           if FLAGS['grpo_signal_entropy_coeff'].present
-          else 0.1
+          else 0.0
       )
       grpo_config = dataclasses.replace(
           grpo_config,

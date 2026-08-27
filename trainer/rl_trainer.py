@@ -731,6 +731,7 @@ class RLTrainer:
         log_episode_fn=self._log_episode,
         write_summary_fn=self._write_final_summary,
         update_metrics_fn=self._update_metrics,
+        ref_state_dict=self._ref_state_dict,
     )
     runner.run()
 

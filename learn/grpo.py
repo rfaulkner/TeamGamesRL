@@ -208,6 +208,7 @@ class GRPORunner:
       update_metrics_fn: Optional[
           Callable[[list[PlayerTrajectory], float], float]
       ] = None,
+      ref_state_dict: dict | None = None,
   ):
     """Initializes the GRPORunner.
 
@@ -247,6 +248,7 @@ class GRPORunner:
     self._prompt_metadata: dict = {}
     self._current_temperature = config.temperature
     self._frozen_lora_state: dict | None = None
+    self._ref_state_dict = ref_state_dict
 
   def collect_game_prompts(
       self, num_episodes: int, pass_idx: int = 1, start_time: float = 0.0
@@ -754,16 +756,26 @@ class GRPORunner:
         action_texts: list[str] = []
         for action_id in legal_ids:
           child = state.child(action_id)
-          sim_reward = self._play_out_for_reward(child, current_player)
+          max_reward = None
 
+          # Compute optimistic reward *before* simulation mutates child.
+          # _play_out_for_reward applies actions in-place, making child
+          # terminal, so the is_terminal() check must happen first.
           if optimistic_alpha > 0 and not child.is_terminal():
             max_reward = self._max_reward_over_partners(
                 child, current_player
             )
+
+          sim_reward = self._play_out_for_reward(
+              state.child(action_id), current_player
+          )
+
+          if optimistic_alpha > 0 and max_reward is not None:
             reward = (
                 optimistic_alpha * max_reward
                 + (1.0 - optimistic_alpha) * sim_reward
             )
+            max_reward = None  # Reset for next iteration.
           else:
             reward = sim_reward
 
@@ -1034,6 +1046,43 @@ class GRPORunner:
         logging.warning('No groups enumerated in pass %d.', pass_idx)
         continue
 
+      # ── Pre-compute reference log-probs for KL penalty ──
+      # Compute log π_ref(a|s) for all groups at once using the frozen
+      # reference weights.  These are constants (no gradient) used in
+      # the KL divergence term that prevents the policy from diverging
+      # too far from the pre-trained model.
+      ref_log_probs_by_group: dict[int, torch.Tensor] = {}
+      if self._ref_state_dict is not None and self._config.kl_coeff > 0:
+        # Temporarily swap in reference weights.
+        current_params = {}
+        for name, param in self._backend.model.named_parameters():
+          if name in self._ref_state_dict:
+            current_params[name] = param.data.clone()
+            param.data.copy_(self._ref_state_dict[name])
+
+        self._backend.model.eval()
+        with torch.no_grad():
+          for gi, group in enumerate(groups):
+            ref_lps = []
+            for action_text in group['action_texts']:
+              ref_lp = self._backend.compute_action_log_prob(
+                  group['prompt'], action_text
+              )
+              ref_lps.append(ref_lp.detach())
+            ref_log_probs_by_group[gi] = torch.stack(ref_lps)
+
+        # Restore current weights.
+        for name, param in self._backend.model.named_parameters():
+          if name in current_params:
+            param.data.copy_(current_params[name])
+
+        logging.info(
+            '  Pre-computed reference log-probs for %d groups '
+            '(kl_coeff=%.3f).',
+            len(ref_log_probs_by_group),
+            self._config.kl_coeff,
+        )
+
       # ── Step 2–4: Compute GRPO loss across all groups ──
       self._backend.model.train()
       optimizer.zero_grad()
@@ -1083,6 +1132,18 @@ class GRPORunner:
 
         group_loss = -(advantages_normalized * log_probs_tensor).sum()
 
+        # ── KL penalty against reference model ──
+        # Prevents the policy from diverging too far from the pre-trained
+        # model, which otherwise causes log-probs to go to extreme values
+        # and the loss to diverge (observed: loss → -35 without this).
+        if group_idx in ref_log_probs_by_group:
+          ref_lps = ref_log_probs_by_group[group_idx].to(
+              log_probs_tensor.device
+          )
+          probs = torch.softmax(log_probs_tensor, dim=0)
+          kl_div = (probs * (log_probs_tensor - ref_lps)).sum()
+          group_loss = group_loss + self._config.kl_coeff * kl_div
+
         # Scale loss for gradient accumulation.
         accum_steps = self._config.gradient_accumulation_steps
         if accum_steps > 1:
@@ -1122,14 +1183,11 @@ class GRPORunner:
 
       # ── Signal entropy bonus ──
       # Maximize entropy of P0's marginal action distribution across
-      # game states, restricted to *near-optimal* actions only.
-      # This encourages P0 to use different actions for different cards
-      # without pushing probability toward clearly bad actions.
-      #
-      # For each P0 group, actions whose reward is below the group's best
-      # reward (minus a small tolerance) are masked out.  The per-state
-      # probabilities are renormalized over the remaining "eligible"
-      # actions before computing the marginal and its entropy.
+      # game states.  This encourages P0 to use different actions for
+      # different cards without pushing probability toward any specific
+      # convention.  The entropy gradient is always active regardless
+      # of the reward landscape, preventing the policy from collapsing
+      # into a non-signaling equilibrium.
       entropy_val = 0.0
       if self._config.signal_entropy_coeff > 0:
         p0_groups = [g for g in groups if g['player_id'] == 0]
@@ -1139,7 +1197,6 @@ class GRPORunner:
           for group in p0_groups:
             prompt = group['prompt']
             action_texts = group['action_texts']
-            rewards_list_g = group['rewards']
             log_probs = []
             for action_text in action_texts:
               log_prob = self._backend.compute_action_log_prob(
@@ -1148,14 +1205,7 @@ class GRPORunner:
               log_probs.append(log_prob)
             log_probs_tensor = torch.stack(log_probs)
             probs = torch.softmax(log_probs_tensor, dim=0)
-
-            # Mask to near-optimal actions (within 1e-2 of max reward).
-            rewards_t = torch.tensor(rewards_list_g, dtype=torch.float32)
-            eligible = (rewards_t >= rewards_t.max() - 1e-2).float()
-            eligible = eligible.to(probs.device)
-            masked_probs = probs * eligible
-            masked_probs = masked_probs / (masked_probs.sum() + 1e-10)
-            all_probs.append(masked_probs)
+            all_probs.append(probs)
 
           # Marginal distribution: average over P0 states.
           marginal = torch.stack(all_probs).mean(dim=0)
