@@ -1152,6 +1152,7 @@ class GRPORunner:
             # Mask to near-optimal actions (within 1e-2 of max reward).
             rewards_t = torch.tensor(rewards_list_g, dtype=torch.float32)
             eligible = (rewards_t >= rewards_t.max() - 1e-2).float()
+            eligible = eligible.to(probs.device)
             masked_probs = probs * eligible
             masked_probs = masked_probs / (masked_probs.sum() + 1e-10)
             all_probs.append(masked_probs)
