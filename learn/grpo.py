@@ -1445,17 +1445,46 @@ class GRPORunner:
       else:
         # This is the OTHER player's decision node.
         if other_player_mode == 'oracle':
-          # Enumerate all actions and recurse into each — the oracle
-          # reward computation in the target player's groups will pick
-          # the best one.  We need to try all paths so we find all
-          # downstream target-player decision nodes.
-          for action_id in state.legal_actions(current_player):
-            child = state.child(action_id)
-            action_str = state.action_to_string(current_player, action_id)
+          # Use only the oracle-optimal action for the other player.
+          # This ensures the target player only trains on groups where
+          # the other player follows the optimal signaling convention,
+          # avoiding conflicting gradients from out-of-policy actions.
+          if not hasattr(self, '_oracle_p0_strategy'):
+            self._oracle_p0_strategy = self._compute_oracle_p0_strategy()
+          oracle_strategy = self._oracle_p0_strategy
+
+          # Determine the other player's card from context.
+          # The card is the chance action dealt to this player.
+          # In the game tree, chance actions correspond to card deals
+          # in player order, so we need to find the deal for this player.
+          # We can extract it from the state's history.
+          history = state.history()
+          # Chance actions are the first num_players entries in history.
+          other_card = history[current_player]
+
+          oracle_action = oracle_strategy.get(other_card)
+          if oracle_action is not None and oracle_action in state.legal_actions(current_player):
+            child = state.child(oracle_action)
+            action_str = state.action_to_string(current_player, oracle_action)
             _walk(
                 child,
                 context_parts + [f'p{current_player}:{action_str}'],
             )
+          else:
+            # Fallback: if oracle strategy doesn't cover this case,
+            # enumerate all actions (shouldn't happen in Tiny Hanabi).
+            logging.warning(
+                'Oracle strategy missing for P%d card=%d, '
+                'falling back to all actions.',
+                current_player, other_card,
+            )
+            for action_id in state.legal_actions(current_player):
+              child = state.child(action_id)
+              action_str = state.action_to_string(current_player, action_id)
+              _walk(
+                  child,
+                  context_parts + [f'p{current_player}:{action_str}'],
+              )
         else:
           # Simulate: use the other player's adapter to pick one action.
           prev_adapter = self._backend.get_active_adapter()
@@ -1583,6 +1612,483 @@ class GRPORunner:
     rewards = state.rewards()
     return float(rewards[target_player]) if rewards else 0.0
 
+  def _compute_oracle_p0_strategy(self) -> dict[int, int]:
+    """Compute the optimal P0 signaling strategy for the game.
+
+    Solves for the Stackelberg-optimal P0 pure strategy by brute-forcing
+    all possible mappings from P0's card to P0's action, and for each
+    one computing P1's best response **given P1's information
+    constraint** (P1 observes P0's action and P1's own card, but NOT
+    P0's card).
+
+    This is necessary because ``_max_reward_over_partners`` assumes P1
+    can see the full state, which makes every P0 action look equally
+    good.  The real oracle must account for the fact that P1 must play
+    the same action for all P0 cards that map to the same P0 action.
+
+    Returns:
+      Dict mapping P0's card (chance-action int) to the optimal P0
+      action (int).
+    """
+    game = self._env.game
+    from itertools import product as iter_product  # pylint: disable=g-import-not-at-top
+
+    # ── Step 1: Walk the full game tree to collect all terminal payoffs ──
+    # Indexed by (p0_card, p1_card, p0_action, p1_action) -> team_reward.
+    payoffs: dict[tuple[int, ...], float] = {}
+
+    def _walk_all(state, deal: list[int], actions: list[int]):
+      if state.is_terminal():
+        rewards = state.rewards()
+        team_r = float(np.mean(rewards)) if rewards else 0.0
+        payoffs[tuple(deal + actions)] = team_r
+        return
+      if state.is_chance_node():
+        for action, _ in state.chance_outcomes():
+          _walk_all(state.child(action), deal + [action], actions)
+        return
+      for action in state.legal_actions(state.current_player()):
+        _walk_all(state.child(action), deal, actions + [action])
+
+    _walk_all(game.new_initial_state(), [], [])
+
+    # ── Step 2: Extract game dimensions ──
+    p0_cards = sorted(set(k[0] for k in payoffs))
+    p1_cards = sorted(set(k[1] for k in payoffs))
+    p0_actions = sorted(set(k[2] for k in payoffs))
+    p1_actions = sorted(set(k[3] for k in payoffs))
+
+    logging.info(
+        'Computing optimal P0 oracle: %d P0 cards × %d P0 actions '
+        '= %d strategies to check.',
+        len(p0_cards), len(p0_actions), len(p0_actions) ** len(p0_cards),
+    )
+
+    # ── Step 3: Brute-force all P0 pure strategies ──
+    best_strategy: dict[int, int] = {}
+    best_expected_reward = float('-inf')
+    best_p1_response: dict[tuple[int, int], int] = {}
+
+    for p0_strategy_actions in iter_product(
+        p0_actions, repeat=len(p0_cards)
+    ):
+      p0_map = dict(zip(p0_cards, p0_strategy_actions))
+
+      # For this P0 strategy, compute P1's best response.
+      # P1's info state = (p1_card, p0_action).
+      # P1 must pick the same action for ALL p0_cards that led to
+      # the same p0_action — this is the info-set constraint.
+      p1_response: dict[tuple[int, int], int] = {}
+      for p1_card in p1_cards:
+        for p0_action in set(p0_map.values()):
+          p0_cards_for_action = [
+              c for c in p0_cards if p0_map[c] == p0_action
+          ]
+
+          best_p1_a = p1_actions[0]
+          best_p1_r = float('-inf')
+          for p1_action in p1_actions:
+            expected = float(np.mean([
+                payoffs.get(
+                    (p0c, p1_card, p0_action, p1_action), 0.0
+                )
+                for p0c in p0_cards_for_action
+            ]))
+            if expected > best_p1_r:
+              best_p1_r = expected
+              best_p1_a = p1_action
+          p1_response[(p1_card, p0_action)] = best_p1_a
+
+      # Compute expected reward.
+      total = 0.0
+      count = 0
+      for p0_card in p0_cards:
+        for p1_card in p1_cards:
+          p0_action = p0_map[p0_card]
+          p1_action = p1_response[(p1_card, p0_action)]
+          r = payoffs.get(
+              (p0_card, p1_card, p0_action, p1_action), 0.0
+          )
+          total += r
+          count += 1
+
+      expected_reward = total / count if count else 0.0
+
+      if expected_reward > best_expected_reward:
+        best_expected_reward = expected_reward
+        best_strategy = dict(p0_map)
+        best_p1_response = dict(p1_response)
+
+    # ── Log the optimal strategy ──
+    logging.info(
+        'Optimal P0 oracle strategy (expected reward=%.2f):',
+        best_expected_reward,
+    )
+    for card in sorted(best_strategy):
+      logging.info('  P0 card=%d → action=%d', card, best_strategy[card])
+    logging.info('P1 best response to oracle P0:')
+    for (p1_card, p0_action), p1_action in sorted(
+        best_p1_response.items()
+    ):
+      logging.info(
+          '  P1 card=%d, saw P0 action=%d → P1 action=%d',
+          p1_card, p0_action, p1_action,
+      )
+
+    return best_strategy
+
+  def _evaluate_with_oracle(
+      self,
+      num_episodes: int,
+      oracle_player: int,
+  ) -> dict[str, float]:
+    """Evaluate the trained player against an oracle partner.
+
+    Exhaustively enumerates every card combination and plays each one.
+    The oracle player uses the precomputed **optimal signaling strategy**
+    (from ``_compute_oracle_p0_strategy``) which correctly accounts for
+    P1's information constraint.
+
+    Args:
+      num_episodes: Advisory episode count.  The actual number of games
+        played is ``num_card_combos * repeats_per_deal``.
+      oracle_player: The player that uses oracle-best actions (0 or 1).
+
+    Returns:
+      Dict of evaluation metrics including
+      ``eval/oracle_mean_reward`` and per-card-combo breakdowns.
+    """
+    game = self._env.game
+    num_players = self._game_config.num_players
+    self._backend.model.eval()
+
+    # Compute the oracle strategy (cached after first call).
+    if not hasattr(self, '_oracle_p0_strategy'):
+      self._oracle_p0_strategy = self._compute_oracle_p0_strategy()
+    oracle_strategy = self._oracle_p0_strategy
+
+    # ── Enumerate all card deals ──
+    card_deals: list[list[int]] = []
+
+    def _enumerate_deals(state, deal_so_far: list[int]):
+      if state.is_chance_node():
+        for action, _ in state.chance_outcomes():
+          _enumerate_deals(state.child(action), deal_so_far + [action])
+      else:
+        card_deals.append(deal_so_far)
+
+    _enumerate_deals(game.new_initial_state(), [])
+
+    repeats_per_deal = max(1, num_episodes // max(len(card_deals), 1))
+    total_games = len(card_deals) * repeats_per_deal
+
+    logging.info(
+        '  Oracle eval: %d card combos × %d repeats = %d games '
+        '(P%d=oracle, strategy=%s)',
+        len(card_deals), repeats_per_deal, total_games, oracle_player,
+        {k: f'a{v}' for k, v in sorted(oracle_strategy.items())},
+    )
+
+    all_rewards: list[list[float]] = [[] for _ in range(num_players)]
+    per_deal_rewards: dict[str, list[float]] = {}
+    action_counts: list[dict[int, int]] = [{} for _ in range(num_players)]
+
+    game_num = 0
+    for deal in card_deals:
+      deal_key = ','.join(str(d) for d in deal)
+      per_deal_rewards[deal_key] = []
+
+      for rep in range(repeats_per_deal):
+        game_num += 1
+        state = game.new_initial_state()
+        for chance_action in deal:
+          state.apply_action(chance_action)
+
+        ep_actions: list[str] = ['' for _ in range(num_players)]
+
+        while not state.is_terminal():
+          current_player = state.current_player()
+
+          if current_player == oracle_player:
+            # Use the precomputed optimal signaling strategy.
+            p0_card = deal[oracle_player]
+            action_id = oracle_strategy.get(
+                p0_card, state.legal_actions(current_player)[0]
+            )
+            action_str = state.action_to_string(current_player, action_id)
+            ep_actions[current_player] = action_str
+            action_counts[current_player][action_id] = (
+                action_counts[current_player].get(action_id, 0) + 1
+            )
+            state.apply_action(action_id)
+
+          else:
+            # Trained player: use its adapter with near-greedy sampling.
+            self._backend.set_active_adapter(f'player_{current_player}')
+            state_text = self._renderers[current_player].render_state(
+                state, current_player, game
+            )
+            legal_actions_with_desc = self._renderers[
+                current_player
+            ].render_legal_actions(state, current_player, game)
+            legal_ids = [a for a, _ in legal_actions_with_desc]
+            action_descs = [d for _, d in legal_actions_with_desc]
+            prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+                state_text, legal_ids, action_descs
+            )
+
+            with torch.no_grad():
+              response, _ = self._backend.generate_with_logprobs(
+                  prompt,
+                  temperature=0.01,
+                  max_tokens=self._config.max_completion_length,
+              )
+
+            action_id = self._renderers[current_player].parse_action(
+                response, legal_actions_with_desc
+            )
+            if action_id is None:
+              action_id = int(np.random.choice(legal_ids))
+
+            action_str = state.action_to_string(current_player, action_id)
+            ep_actions[current_player] = action_str
+            action_counts[current_player][action_id] = (
+                action_counts[current_player].get(action_id, 0) + 1
+            )
+            state.apply_action(action_id)
+
+        # Collect rewards.
+        ep_rewards = state.rewards()
+        team_reward = 0.0
+        if ep_rewards is not None:
+          for p in range(num_players):
+            all_rewards[p].append(float(ep_rewards[p]))
+          team_reward = float(np.mean(
+              [ep_rewards[p] for p in range(num_players)]
+          ))
+        per_deal_rewards[deal_key].append(team_reward)
+
+        actions_str = ' | '.join(
+            f'P{p}:[{ep_actions[p]}]' for p in range(num_players)
+        )
+        logging.info(
+            '  [oracle eval %d/%d] cards=%s | reward=%.1f | %s '
+            '(P%d=oracle)',
+            game_num, total_games, deal_key, team_reward,
+            actions_str, oracle_player,
+        )
+
+    # ── Per-deal summary ──
+    logging.info('  --- Oracle eval per-deal breakdown ---')
+    for deal_key, rewards in sorted(per_deal_rewards.items()):
+      mean_r = float(np.mean(rewards))
+      logging.info(
+          '    cards=%s: mean_reward=%.2f (%s)',
+          deal_key, mean_r,
+          ', '.join(f'{r:.0f}' for r in rewards),
+      )
+
+    # ── Action distributions ──
+    for p in range(num_players):
+      total = sum(action_counts[p].values())
+      if total > 0:
+        dist_str = ', '.join(
+            f'Action {a}: {c/total*100:.0f}% ({c})'
+            for a, c in sorted(action_counts[p].items())
+        )
+        role = 'oracle' if p == oracle_player else 'trained'
+        logging.info(
+            '  P%d (%s) action distribution: %s', p, role, dist_str
+        )
+
+    # ── Compute metrics ──
+    metrics: dict[str, float] = {}
+    for p in range(num_players):
+      pr = np.array(all_rewards[p])
+      metrics[f'eval/mean_reward_p{p}'] = float(np.mean(pr))
+    overall = float(
+        np.mean([np.mean(all_rewards[p]) for p in range(num_players)])
+    )
+    metrics['eval/oracle_mean_reward'] = overall
+
+    # Fraction of deals where trained player got optimal reward.
+    optimal_count = sum(
+        1 for rewards in per_deal_rewards.values()
+        if np.mean(rewards) >= 8.0
+    )
+    metrics['eval/oracle_optimal_deal_frac'] = (
+        optimal_count / len(per_deal_rewards) if per_deal_rewards else 0.0
+    )
+
+    logging.info(
+        '  Oracle eval summary: mean_reward=%.2f, '
+        'optimal_deals=%d/%d (%.0f%%)',
+        overall, optimal_count, len(per_deal_rewards),
+        metrics['eval/oracle_optimal_deal_frac'] * 100,
+    )
+    return metrics
+
+  def _evaluate_exhaustive_adapters(
+      self,
+      num_episodes: int,
+  ) -> dict[str, float]:
+    """Exhaustive deterministic eval with both players using their adapters.
+
+    Enumerates every card combination from the game tree and plays each
+    one with both players using their trained LoRA adapters (near-greedy).
+    This eliminates variance from random card deals.
+
+    Used for Phase 2+ convergence to ensure P0 learns to signal correctly
+    for ALL card combinations, not just lucky random draws.
+
+    Args:
+      num_episodes: Advisory count. Actual games = combos × repeats.
+
+    Returns:
+      Dict with ``eval/exhaustive_mean_reward`` and
+      ``eval/exhaustive_optimal_deal_frac``.
+    """
+    game = self._env.game
+    num_players = self._game_config.num_players
+    self._backend.model.eval()
+
+    # ── Enumerate all card deals ──
+    card_deals: list[list[int]] = []
+
+    def _enumerate_deals(state, deal_so_far: list[int]):
+      if state.is_chance_node():
+        for action, _ in state.chance_outcomes():
+          _enumerate_deals(state.child(action), deal_so_far + [action])
+      else:
+        card_deals.append(deal_so_far)
+
+    _enumerate_deals(game.new_initial_state(), [])
+
+    repeats_per_deal = max(1, num_episodes // max(len(card_deals), 1))
+    total_games = len(card_deals) * repeats_per_deal
+
+    logging.info(
+        '  Exhaustive eval: %d card combos × %d repeats = %d games '
+        '(both adapters)',
+        len(card_deals), repeats_per_deal, total_games,
+    )
+
+    all_rewards: list[list[float]] = [[] for _ in range(num_players)]
+    per_deal_rewards: dict[str, list[float]] = {}
+    action_counts: list[dict[int, int]] = [{} for _ in range(num_players)]
+
+    game_num = 0
+    for deal in card_deals:
+      deal_key = ','.join(str(d) for d in deal)
+      per_deal_rewards[deal_key] = []
+
+      for rep in range(repeats_per_deal):
+        game_num += 1
+        state = game.new_initial_state()
+        for chance_action in deal:
+          state.apply_action(chance_action)
+
+        ep_actions: list[str] = ['' for _ in range(num_players)]
+
+        while not state.is_terminal():
+          current_player = state.current_player()
+          self._backend.set_active_adapter(f'player_{current_player}')
+
+          state_text = self._renderers[current_player].render_state(
+              state, current_player, game
+          )
+          legal_actions_with_desc = self._renderers[
+              current_player
+          ].render_legal_actions(state, current_player, game)
+          legal_ids = [a for a, _ in legal_actions_with_desc]
+          action_descs = [d for _, d in legal_actions_with_desc]
+          prompt = self._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+              state_text, legal_ids, action_descs
+          )
+
+          with torch.no_grad():
+            response, _ = self._backend.generate_with_logprobs(
+                prompt,
+                temperature=0.01,
+                max_tokens=self._config.max_completion_length,
+            )
+
+          action_id = self._renderers[current_player].parse_action(
+              response, legal_actions_with_desc
+          )
+          if action_id is None:
+            action_id = int(np.random.choice(legal_ids))
+
+          action_str = state.action_to_string(current_player, action_id)
+          ep_actions[current_player] = action_str
+          action_counts[current_player][action_id] = (
+              action_counts[current_player].get(action_id, 0) + 1
+          )
+          state.apply_action(action_id)
+
+        ep_rewards = state.rewards()
+        team_reward = 0.0
+        if ep_rewards is not None:
+          for p in range(num_players):
+            all_rewards[p].append(float(ep_rewards[p]))
+          team_reward = float(np.mean(
+              [ep_rewards[p] for p in range(num_players)]
+          ))
+        per_deal_rewards[deal_key].append(team_reward)
+
+        actions_str = ' | '.join(
+            f'P{p}:[{ep_actions[p]}]' for p in range(num_players)
+        )
+        logging.info(
+            '  [exhaustive eval %d/%d] cards=%s | reward=%.1f | %s',
+            game_num, total_games, deal_key, team_reward, actions_str,
+        )
+
+    # ── Per-deal summary ──
+    logging.info('  --- Exhaustive eval per-deal breakdown ---')
+    for deal_key, rewards in sorted(per_deal_rewards.items()):
+      mean_r = float(np.mean(rewards))
+      logging.info(
+          '    cards=%s: mean_reward=%.2f (%s)',
+          deal_key, mean_r,
+          ', '.join(f'{r:.0f}' for r in rewards),
+      )
+
+    for p in range(num_players):
+      total = sum(action_counts[p].values())
+      if total > 0:
+        dist_str = ', '.join(
+            f'Action {a}: {c/total*100:.0f}% ({c})'
+            for a, c in sorted(action_counts[p].items())
+        )
+        logging.info('  P%d action distribution: %s', p, dist_str)
+
+    # ── Compute metrics ──
+    metrics: dict[str, float] = {}
+    for p in range(num_players):
+      pr = np.array(all_rewards[p])
+      metrics[f'eval/mean_reward_p{p}'] = float(np.mean(pr))
+    overall = float(
+        np.mean([np.mean(all_rewards[p]) for p in range(num_players)])
+    )
+    metrics['eval/exhaustive_mean_reward'] = overall
+
+    optimal_count = sum(
+        1 for rewards in per_deal_rewards.values()
+        if np.mean(rewards) >= 8.0
+    )
+    metrics['eval/exhaustive_optimal_deal_frac'] = (
+        optimal_count / len(per_deal_rewards) if per_deal_rewards else 0.0
+    )
+
+    logging.info(
+        '  Exhaustive eval summary: mean_reward=%.2f, '
+        'optimal_deals=%d/%d (%.0f%%)',
+        overall, optimal_count, len(per_deal_rewards),
+        metrics['eval/exhaustive_optimal_deal_frac'] * 100,
+    )
+    return metrics
+
   def _run_phased_training_pass(
       self,
       phase_name: str,
@@ -1689,100 +2195,127 @@ class GRPORunner:
             old_lps.append(old_lp.detach())
           old_log_probs_by_group[gi] = torch.stack(old_lps)
 
-      # ── GRPO loss computation ──
-      self._backend.model.train()
-      optimizer.zero_grad()
+      # ── GRPO loss computation (with inner epochs for small groups) ──
+      # When group count is small (e.g. 2 for P0), repeat the gradient
+      # computation multiple times per pass to amplify the learning signal.
+      # The old_log_probs remain fixed (standard PPO practice).
+      inner_epochs = 3 if len(groups) <= 2 else 1
+      if inner_epochs > 1:
+        logging.info(
+            '  Using %d inner epochs (%d groups × %d = %d gradient steps)',
+            inner_epochs, len(groups), inner_epochs,
+            len(groups) * inner_epochs,
+        )
 
       total_loss = 0.0
       total_mean_reward = 0.0
       groups_processed = 0
 
-      for group_idx, group in enumerate(groups):
-        player_id = group['player_id']
-        prompt = group['prompt']
-        action_texts = group['action_texts']
-        rewards_list = group['rewards']
-        context = group['context']
+      for epoch in range(inner_epochs):
+        self._backend.model.train()
+        optimizer.zero_grad()
 
-        rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32)
-        mean_reward = rewards_tensor.mean().item()
+        for group_idx, group in enumerate(groups):
+          player_id = group['player_id']
+          prompt = group['prompt']
+          action_texts = group['action_texts']
+          rewards_list = group['rewards']
+          context = group['context']
 
-        if rewards_tensor.std().item() < 1e-8:
+          rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32)
+          mean_reward = rewards_tensor.mean().item()
+
+          if rewards_tensor.std().item() < 1e-8:
+            if epoch == 0:
+              logging.info(
+                  '  [Group %d] P%d | %s | all rewards=%.1f, skipping.',
+                  group_idx, player_id, context, mean_reward,
+              )
+            continue
+
+          advantages = rewards_tensor - rewards_tensor.mean()
+          log_probs = []
+          for action_text in action_texts:
+            log_prob = self._backend.compute_action_log_prob(
+                prompt, action_text
+            )
+            log_probs.append(log_prob)
+          log_probs_tensor = torch.stack(log_probs)
+
+          # ── Log action probabilities ──
+          with torch.no_grad():
+            action_probs = torch.softmax(log_probs_tensor, dim=0)
+            prob_strs = [
+                f'a{i}:{action_probs[i].item()*100:.1f}%'
+                for i in range(len(action_probs))
+            ]
+
+          advantages_normalized = advantages / (advantages.std() + 1e-8)
+          advantages_normalized = advantages_normalized.to(
+              log_probs_tensor.device
+          )
+
+          # PPO clipped surrogate.
+          if group_idx in old_log_probs_by_group:
+            old_lps_g = old_log_probs_by_group[group_idx].to(
+                log_probs_tensor.device
+            )
+            ratios = torch.exp(log_probs_tensor - old_lps_g)
+            clip_eps = 0.2
+            clipped_ratios = torch.clamp(
+                ratios, 1.0 - clip_eps, 1.0 + clip_eps
+            )
+            surr1 = advantages_normalized * ratios
+            surr2 = advantages_normalized * clipped_ratios
+            group_loss = -torch.min(surr1, surr2).sum()
+          else:
+            group_loss = -(advantages_normalized * log_probs_tensor).sum()
+
+          # KL penalty.
+          if group_idx in ref_log_probs_by_group:
+            ref_lps = ref_log_probs_by_group[group_idx].to(
+                log_probs_tensor.device
+            )
+            probs = torch.softmax(log_probs_tensor, dim=0)
+            kl_div = (probs * (log_probs_tensor - ref_lps)).sum()
+            group_loss = group_loss + self._config.kl_coeff * kl_div
+
+          accum_steps = self._config.gradient_accumulation_steps
+          if accum_steps > 1:
+            group_loss = group_loss / accum_steps
+
+          group_loss.backward()
+          groups_processed += 1
+          total_loss += group_loss.item()
+          total_mean_reward += mean_reward
+
+          epoch_tag = f' epoch {epoch+1}/{inner_epochs}' if inner_epochs > 1 else ''
           logging.info(
-              '  [Group %d] P%d | %s | all rewards=%.1f, skipping.',
-              group_idx, player_id, context, mean_reward,
+              '  [Group %d%s] P%d | %s | rewards=%s | loss=%.4f | [%s]',
+              group_idx, epoch_tag, player_id, context,
+              [f'{r:.0f}' for r in rewards_list],
+              group_loss.item(),
+              ', '.join(prob_strs),
           )
-          continue
 
-        advantages = rewards_tensor - rewards_tensor.mean()
-        log_probs = []
-        for action_text in action_texts:
-          log_prob = self._backend.compute_action_log_prob(prompt, action_text)
-          log_probs.append(log_prob)
-        log_probs_tensor = torch.stack(log_probs)
+          if groups_processed % accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self._backend.model.parameters()
+                 if p.requires_grad],
+                self._config.max_grad_norm,
+            )
+            optimizer.step()
+            optimizer.zero_grad()
 
-        advantages_normalized = advantages / (advantages.std() + 1e-8)
-        advantages_normalized = advantages_normalized.to(
-            log_probs_tensor.device
-        )
-
-        # PPO clipped surrogate.
-        if group_idx in old_log_probs_by_group:
-          old_lps_g = old_log_probs_by_group[group_idx].to(
-              log_probs_tensor.device
-          )
-          ratios = torch.exp(log_probs_tensor - old_lps_g)
-          clip_eps = 0.2
-          clipped_ratios = torch.clamp(
-              ratios, 1.0 - clip_eps, 1.0 + clip_eps
-          )
-          surr1 = advantages_normalized * ratios
-          surr2 = advantages_normalized * clipped_ratios
-          group_loss = -torch.min(surr1, surr2).sum()
-        else:
-          group_loss = -(advantages_normalized * log_probs_tensor).sum()
-
-        # KL penalty.
-        if group_idx in ref_log_probs_by_group:
-          ref_lps = ref_log_probs_by_group[group_idx].to(
-              log_probs_tensor.device
-          )
-          probs = torch.softmax(log_probs_tensor, dim=0)
-          kl_div = (probs * (log_probs_tensor - ref_lps)).sum()
-          group_loss = group_loss + self._config.kl_coeff * kl_div
-
-        accum_steps = self._config.gradient_accumulation_steps
-        if accum_steps > 1:
-          group_loss = group_loss / accum_steps
-
-        group_loss.backward()
-        groups_processed += 1
-        total_loss += group_loss.item()
-        total_mean_reward += mean_reward
-
-        logging.info(
-            '  [Group %d] P%d | %s | rewards=%s | loss=%.4f',
-            group_idx, player_id, context,
-            [f'{r:.0f}' for r in rewards_list],
-            group_loss.item(),
-        )
-
-        if groups_processed % accum_steps == 0:
+        # Flush remaining gradients at end of each inner epoch.
+        if groups_processed % self._config.gradient_accumulation_steps != 0:
           torch.nn.utils.clip_grad_norm_(
-              [p for p in self._backend.model.parameters() if p.requires_grad],
+              [p for p in self._backend.model.parameters()
+               if p.requires_grad],
               self._config.max_grad_norm,
           )
           optimizer.step()
           optimizer.zero_grad()
-
-      # Flush remaining gradients.
-      if groups_processed % self._config.gradient_accumulation_steps != 0:
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in self._backend.model.parameters() if p.requires_grad],
-            self._config.max_grad_norm,
-        )
-        optimizer.step()
-        optimizer.zero_grad()
 
       total_episodes_so_far += len(groups)
       pass_elapsed = time.time() - pass_start
@@ -1804,10 +2337,28 @@ class GRPORunner:
             total_episodes_so_far, avg_reward, avg_loss, start_time
         )
 
-      # ── Evaluate (using both adapters for full game simulation) ──
+      # ── Evaluate ──
       self._backend.model.eval()
-      eval_metrics = self._evaluate_fn(self._config.num_eval_episodes)
-      logging.info('--- %s evaluation after pass %d ---', phase_name, pass_idx)
+
+      if other_player_mode == 'oracle':
+        # Phase 1: eval P1 against oracle P0 to measure true progress.
+        other_player_id = 1 - target_player
+        eval_metrics = self._evaluate_with_oracle(
+            self._config.num_eval_episodes, oracle_player=other_player_id
+        )
+        logging.info(
+            '--- %s oracle evaluation after pass %d ---',
+            phase_name, pass_idx,
+        )
+      else:
+        # Phase 2+: exhaustive deterministic eval with both adapters.
+        eval_metrics = self._evaluate_exhaustive_adapters(
+            self._config.num_eval_episodes
+        )
+        logging.info(
+            '--- %s exhaustive evaluation after pass %d ---',
+            phase_name, pass_idx,
+        )
       for k, v in sorted(eval_metrics.items()):
         logging.info('  %s: %.4f', k, v)
 
@@ -1815,44 +2366,95 @@ class GRPORunner:
         self._log_eval_metrics_fn(total_episodes_so_far, eval_metrics)
 
       # ── Convergence detection ──
-      # Use the mean of both players' eval rewards for convergence.
-      eval_reward = sum(
-          v for k, v in eval_metrics.items()
-          if k.startswith('eval/mean_reward')
-      ) / max(
-          sum(1 for k in eval_metrics if k.startswith('eval/mean_reward')), 1
-      )
+      if other_player_mode == 'oracle':
+        # Phase 1: require ALL card deals to be optimal before moving on.
+        # P1 must get 10 on every combination.
+        optimal_frac = eval_metrics.get('eval/oracle_optimal_deal_frac', 0.0)
+        eval_reward = eval_metrics.get('eval/oracle_mean_reward', 0.0)
 
-      if eval_reward > best_eval_reward + self._config.convergence_min_delta:
-        best_eval_reward = eval_reward
-        patience_counter = 0
-        logging.info(
-            '  ✓ New best eval reward: %.4f (patience reset)',
-            best_eval_reward,
-        )
+        if optimal_frac >= 1.0:
+          logging.info(
+              '  ★ %s FULLY CONVERGED after %d passes: '
+              'all deals optimal (reward=%.4f).',
+              phase_name, pass_idx, eval_reward,
+          )
+          converged = True
+          break
+
+        # Track best for logging, but don't use patience to end the phase.
+        if eval_reward > best_eval_reward + self._config.convergence_min_delta:
+          best_eval_reward = eval_reward
+          patience_counter = 0
+          logging.info(
+              '  ✓ New best eval reward: %.4f, optimal_deals=%.0f%% '
+              '(need 100%%)',
+              best_eval_reward, optimal_frac * 100,
+          )
+        else:
+          patience_counter += 1
+          if patience_counter >= self._config.convergence_patience:
+            logging.info(
+                '  ⚠ Reward stalled for %d passes (best=%.4f, '
+                'optimal=%.0f%%), but continuing — need 100%% optimal.',
+                patience_counter, best_eval_reward, optimal_frac * 100,
+            )
+            # Don't break — keep training until max_passes or 100%.
+          else:
+            logging.info(
+                '  ✗ No improvement: eval=%.4f, best=%.4f, '
+                'optimal=%.0f%%, patience=%d/%d',
+                eval_reward, best_eval_reward, optimal_frac * 100,
+                patience_counter, self._config.convergence_patience,
+            )
+
       else:
-        patience_counter += 1
-        logging.info(
-            '  ✗ No improvement: eval=%.4f, best=%.4f, '
-            'patience=%d/%d',
-            eval_reward, best_eval_reward,
-            patience_counter, self._config.convergence_patience,
+        # Phase 2+: require ALL card deals to be optimal.
+        optimal_frac = eval_metrics.get(
+            'eval/exhaustive_optimal_deal_frac', 0.0
+        )
+        eval_reward = eval_metrics.get(
+            'eval/exhaustive_mean_reward', 0.0
         )
 
-      if patience_counter >= self._config.convergence_patience:
-        logging.info(
-            '  ★ %s CONVERGED after %d passes (best=%.4f).',
-            phase_name, pass_idx, best_eval_reward,
-        )
-        converged = True
-        break
+        if optimal_frac >= 1.0:
+          logging.info(
+              '  ★ %s FULLY CONVERGED after %d passes: '
+              'all deals optimal (reward=%.4f).',
+              phase_name, pass_idx, eval_reward,
+          )
+          converged = True
+          break
+
+        if eval_reward > best_eval_reward + self._config.convergence_min_delta:
+          best_eval_reward = eval_reward
+          patience_counter = 0
+          logging.info(
+              '  ✓ New best eval reward: %.4f, optimal_deals=%.0f%% '
+              '(need 100%%)',
+              best_eval_reward, optimal_frac * 100,
+          )
+        else:
+          patience_counter += 1
+          if patience_counter >= self._config.convergence_patience:
+            logging.info(
+                '  ⚠ Reward stalled for %d passes (best=%.4f, '
+                'optimal=%.0f%%), but continuing — need 100%% optimal.',
+                patience_counter, best_eval_reward, optimal_frac * 100,
+            )
+          else:
+            logging.info(
+                '  ✗ No improvement: eval=%.4f, best=%.4f, '
+                'optimal=%.0f%%, patience=%d/%d',
+                eval_reward, best_eval_reward, optimal_frac * 100,
+                patience_counter, self._config.convergence_patience,
+            )
 
       # ── Checkpoint ──
       self._save_checkpoint_fn(total_episodes_so_far)
 
     if not converged:
       logging.info(
-          '  %s reached max passes (%d) without convergence '
+          '  %s reached max passes (%d) without full convergence '
           '(best=%.4f).',
           phase_name, max_passes, best_eval_reward,
       )
