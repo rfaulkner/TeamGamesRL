@@ -4,7 +4,7 @@
 #SBATCH --output=slurm/output/%j_%x.out
 #SBATCH --error=slurm/output/%j_%x.err
 
-#SBATCH --time=10:00:00
+#SBATCH --time=2:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --ntasks-per-node=1
