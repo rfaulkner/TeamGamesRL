@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=teamgamesrl
+#SBATCH --job-name=hanabi-rl
 #SBATCH --account=aip-rgrosse
 #SBATCH --output=slurm/output/%j_%x.out
 #SBATCH --error=slurm/output/%j_%x.err
@@ -12,16 +12,17 @@
 #SBATCH --mem=32G
 
 # ============================================================================
-# TeamGamesRL — SLURM submission script
+# Hanabi RL — SLURM submission script
+#
+# Trains a Gemma model with GRPO on Tiny Hanabi.
 #
 # Usage:
-#   sbatch run_rl.sh                              # all defaults
-#   sbatch run_rl.sh --grpo_passes=50             # override one flag
-#   sbatch run_rl.sh --game=hanabi --lr=1e-4      # override several
-#   sbatch run_rl.sh --game=tiny_hanabi --model=google/gemma-2-2b --lora_rank=32
+#   sbatch run_hanabi.sh                              # all defaults
+#   sbatch run_hanabi.sh --grpo_passes=50             # override one flag
+#   sbatch run_hanabi.sh --lr=1e-4                    # override several
+#   sbatch run_hanabi.sh --model=google/gemma-2-2b --lora_rank=32
 #
 # Flags (all optional, order doesn't matter):
-#   --game=NAME         Game to play        (default: tiny_hanabi)
 #   --model=ID          HF model identifier (default: google/gemma-2-2b)
 #   --lora_rank=R       LoRA rank           (default: 16)
 #   --lr=RATE           Learning rate       (default: 3e-5)
@@ -31,9 +32,12 @@
 
 set -euo pipefail
 
-# ── Parse arguments with defaults ────────────────────────────────────────────
+# ── Fixed game ────────────────────────────────────────────────────────────────
 
 GAME="tiny_hanabi"
+
+# ── Parse arguments with defaults ────────────────────────────────────────────
+
 MODEL_ID="google/gemma-2-2b"
 LORA_RANK=16
 LR="3e-5"
@@ -43,14 +47,13 @@ EXTRA_FLAGS=""
 
 for arg in "$@"; do
   case "$arg" in
-    --game=*)         GAME="${arg#*=}" ;;
     --model=*)        MODEL_ID="${arg#*=}" ;;
     --lora_rank=*)    LORA_RANK="${arg#*=}" ;;
     --lr=*)           LR="${arg#*=}" ;;
     --num_episodes=*) NUM_EPISODES="${arg#*=}" ;;
     --grpo_passes=*)  GRPO_PASSES="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: sbatch run_rl.sh [--game=G] [--model=M] [--lora_rank=R] [--lr=L] [--num_episodes=N] [--grpo_passes=P] [--extra_trainer_flags...]"
+      echo "Usage: sbatch run_hanabi.sh [--model=M] [--lora_rank=R] [--lr=L] [--num_episodes=N] [--grpo_passes=P] [--extra_trainer_flags...]"
       exit 0 ;;
     --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
@@ -85,7 +88,7 @@ source .venv/bin/activate
 # ── Print run info ───────────────────────────────────────────────────────────
 
 echo "============================================"
-echo " TeamGamesRL — SLURM Job ${SLURM_JOB_ID}"
+echo " Hanabi RL — SLURM Job ${SLURM_JOB_ID}"
 echo "============================================"
 echo "  Game:         ${GAME}"
 echo "  Model:        ${MODEL_ID}"
@@ -141,4 +144,3 @@ python3 trainer/gemma_rl_trainer.py \
 echo "============================================"
 echo " Training complete. Output: ${output_dir}"
 echo "============================================"
-

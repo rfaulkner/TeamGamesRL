@@ -87,7 +87,7 @@ TeamGamesRL/
 ├── llm_agent.py                    # LLMInterface ABC, MockLLM, GeminiLLM, LLMAgent
 ├── train.py                        # Lightweight trainer for mock/API LLM backends
 ├── view_episodes.py                # CLI tool to inspect episode logs
-├── run_rl.sh                       # SLURM submission script
+├── run_hanabi.sh                    # SLURM submission script (Tiny Hanabi)
 ├── setup.sh                        # One-command environment bootstrap
 └── requirements.txt                # Python dependencies
 ```
