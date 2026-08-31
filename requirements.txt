@@ -3,6 +3,7 @@
 
 # ===== Core =====
 open-spiel>=1.5
+hanabi-learning-environment  # Standalone Hanabi engine (used by env/hanabi/)
 numpy>=1.24
 absl-py>=2.0
 
