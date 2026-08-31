@@ -24,18 +24,29 @@ from env.game_config import GameConfig
 
 
 def create_env(game_config: GameConfig):
-  """Create an OpenSpiel RL environment from a game configuration.
+  """Create a game environment from a game configuration.
 
-  The ``rl_environment`` import is performed lazily (inside the function
-  body) to mirror the original pattern and avoid importing heavy
-  OpenSpiel modules at package-import time.
+  For most games, this creates an OpenSpiel ``rl_environment.Environment``.
+  For full Hanabi, it uses our HLE adapter (``env.hanabi.hanabi_env``)
+  because OpenSpiel's Hanabi requires a custom C++ build.
+
+  The ``rl_environment`` and HLE adapter imports are performed lazily
+  to avoid importing heavy modules at package-import time.
 
   Args:
     game_config: A ``GameConfig`` describing the game to instantiate.
 
   Returns:
-    An ``open_spiel.python.rl_environment.Environment`` instance.
+    An environment instance with ``reset()``, ``step()``, ``_state``,
+    and ``game`` attributes.
   """
+  if game_config.game_name == 'hanabi':
+    from env.hanabi.hanabi_env import HanabiEnvironment  # pylint: disable=g-import-not-at-top
+    from env.hanabi.hanabi_env import HanabiGame  # pylint: disable=g-import-not-at-top
+
+    game = HanabiGame(**game_config.game_params)
+    return HanabiEnvironment(game)
+
   from open_spiel.python import rl_environment  # pylint: disable=g-import-not-at-top
 
   if game_config.game_params:

@@ -30,8 +30,34 @@ from absl import logging
 from learn.trajectory import PlayerTrajectory
 from learn.trajectory import RLTrajectoryStep
 import numpy as np
-import pyspiel
 import torch
+
+try:
+  import pyspiel
+except ImportError:
+  pyspiel = None  # HLE adapter used for Hanabi instead
+
+
+def _serialize_game_and_state(game, state):
+  """Serialize game+state, dispatching to adapter or pyspiel."""
+  from env.hanabi.hanabi_env import HanabiGame  # pylint: disable=g-import-not-at-top
+  from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
+  if isinstance(game, HanabiGame):
+    return hanabi_env.serialize_game_and_state(game, state)
+  return pyspiel.serialize_game_and_state(game, state)
+
+
+def _deserialize_game_and_state(data_str):
+  """Deserialize game+state, dispatching to adapter or pyspiel."""
+  import json as _json  # pylint: disable=g-import-not-at-top
+  try:
+    data = _json.loads(data_str)
+    if data.get('adapter') == 'hanabi_env':
+      from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
+      return hanabi_env.deserialize_game_and_state(data_str)
+  except (ValueError, TypeError, AttributeError):
+    pass
+  return pyspiel.deserialize_game_and_state(data_str)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -109,7 +135,7 @@ def collect_game_prompts(
           'legal_actions': legal_actions,
           'legal_actions_desc': legal_actions_with_desc,
           'state_text': state_text,
-          'serialized_state': pyspiel.serialize_game_and_state(
+          'serialized_state': _serialize_game_and_state(
               runner._env.game, state
           ),
       }
@@ -195,7 +221,7 @@ def simulate_from_state(
   """
   # ── Restore the exact game state ──
   if serialized_state is not None:
-    _, state = pyspiel.deserialize_game_and_state(serialized_state)
+    _, state = _deserialize_game_and_state(serialized_state)
     restored = runner._env.game.deserialize_state(state.serialize())
     runner._env.set_state(restored)
   else:

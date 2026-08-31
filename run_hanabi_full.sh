@@ -111,6 +111,11 @@ module load python/3.11.5 cuda/12.2 gcc arrow/21.0.0
 cd "$project_dir"
 source .venv/bin/activate
 
+# ── Ensure hanabi-learning-environment is installed ──────────────────────────
+# Our HLE adapter (env/hanabi/hanabi_env.py) wraps the standalone HLE package
+# instead of OpenSpiel's C++ Hanabi extension (avoids BUILD_WITH_HANABI build).
+pip install --quiet hanabi-learning-environment 2>/dev/null || true
+
 # ── Print run info ───────────────────────────────────────────────────────────
 
 echo "============================================"
