@@ -208,6 +208,26 @@ flags.DEFINE_float(
     'Minimum improvement in eval reward to reset the convergence patience '
     'counter.',
 )
+# Multi-turn episode flags.
+flags.DEFINE_integer(
+    'grpo_pivot_decisions_per_episode',
+    5,
+    'Maximum number of decision points to resample per episode. '
+    'Reduces simulation cost in long multi-turn games. '
+    'Set to 0 to resample all decision points (original behaviour).',
+)
+flags.DEFINE_bool(
+    'grpo_decision_priority_sampling',
+    True,
+    'Weight pivot-point selection toward high-information decisions '
+    '(e.g. hint decisions in Hanabi) rather than uniform random.',
+)
+flags.DEFINE_integer(
+    'grpo_truncated_rollout_horizon',
+    None,
+    'If set, simulate only this many turns ahead when computing rewards '
+    'for alternative actions. None means simulate to terminal state.',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -302,6 +322,9 @@ def main(argv: list[str]) -> None:
         phase3_max_passes=FLAGS.grpo_phase3_passes,
         convergence_patience=FLAGS.grpo_convergence_patience,
         convergence_min_delta=FLAGS.grpo_convergence_min_delta,
+        pivot_decisions_per_episode=FLAGS.grpo_pivot_decisions_per_episode,
+        decision_priority_sampling=FLAGS.grpo_decision_priority_sampling,
+        truncated_rollout_horizon=FLAGS.grpo_truncated_rollout_horizon,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

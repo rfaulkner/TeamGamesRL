@@ -142,3 +142,40 @@ class GRPOConfig:
   ``convergence_min_delta`` for this many consecutive passes."""
   convergence_min_delta: float = 0.1
   """Minimum reward improvement to reset the patience counter."""
+
+  # ── Multi-turn episode settings ──────────────────────────────────────
+  # These parameters control how GRPO handles longer, multi-turn games
+  # where exhaustive enumeration is infeasible.  They are only used by
+  # the sampled GRPO path (``exhaustive_groups = False``).
+
+  pivot_decisions_per_episode: int = 5
+  """Maximum number of decision points to resample per collected episode.
+
+  In multi-turn games, each episode contains many decision points.
+  Resampling all of them is computationally expensive (each requires
+  simulating the game to completion K times).  Instead, select a subset
+  of high-information "pivot" decisions per episode for GRPO groups.
+
+  Set to 0 or a very large value to resample all decision points
+  (original behaviour).  Only used when ``exhaustive_groups`` is False.
+  """
+
+  decision_priority_sampling: bool = True
+  """Weight pivot-point selection toward high-information decisions.
+
+  When True, decision points with more diverse legal actions (e.g. hint
+  decisions in Hanabi) are more likely to be selected as pivot points.
+  When False, pivot points are selected uniformly at random.
+
+  Only used when ``pivot_decisions_per_episode > 0``.
+  """
+
+  truncated_rollout_horizon: int | None = None
+  """If set, simulate only this many turns ahead (instead of to terminal
+  state) when computing rewards for alternative actions.
+
+  Reduces the cost of reward simulation in long games.  The reward for
+  a truncated rollout is the intermediate score at the truncation point.
+  ``None`` means simulate to the terminal state (original behaviour).
+  """
+

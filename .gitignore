@@ -34,6 +34,7 @@ MANIFEST
 
 # scripts
 run_rl_act.sh
+run_rl.sh
 
 # Logs
 /tmp/llm_rl_logs
