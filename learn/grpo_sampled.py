@@ -42,6 +42,7 @@ def _serialize_game_and_state(game, state):
   """Serialize game+state, dispatching to adapter or pyspiel."""
   from env.hanabi.hanabi_env import HanabiGame  # pylint: disable=g-import-not-at-top
   from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
+
   if isinstance(game, HanabiGame):
     return hanabi_env.serialize_game_and_state(game, state)
   return pyspiel.serialize_game_and_state(game, state)
@@ -50,13 +51,16 @@ def _serialize_game_and_state(game, state):
 def _deserialize_game_and_state(data_str):
   """Deserialize game+state, dispatching to adapter or pyspiel."""
   import json as _json  # pylint: disable=g-import-not-at-top
+
   try:
     data = _json.loads(data_str)
-    if data.get('adapter') == 'hanabi_env':
-      from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
-      return hanabi_env.deserialize_game_and_state(data_str)
-  except (ValueError, TypeError, AttributeError):
-    pass
+  except (ValueError, TypeError):
+    # Not JSON — fall through to pyspiel.
+    return pyspiel.deserialize_game_and_state(data_str)
+  if isinstance(data, dict) and data.get('adapter') == 'hanabi_env':
+    from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
+
+    return hanabi_env.deserialize_game_and_state(data_str)
   return pyspiel.deserialize_game_and_state(data_str)
 
 
@@ -185,7 +189,10 @@ def collect_game_prompts(
   logging.info(
       'Pass %d collection complete: %d prompts from %d episodes '
       '(mean reward: %.3f)',
-      pass_idx, len(all_prompts), num_episodes, mean_collected,
+      pass_idx,
+      len(all_prompts),
+      num_episodes,
+      mean_collected,
   )
   return all_prompts
 
@@ -222,8 +229,10 @@ def simulate_from_state(
   # ── Restore the exact game state ──
   if serialized_state is not None:
     _, state = _deserialize_game_and_state(serialized_state)
-    restored = runner._env.game.deserialize_state(state.serialize())
-    runner._env.set_state(restored)
+    # _deserialize_game_and_state already returns a fresh clone for
+    # Hanabi (in-memory cache) and a restored state for OpenSpiel.
+    # No need for a second serialize/deserialize round-trip.
+    runner._env.set_state(state)
   else:
     runner._env.reset()
     state = runner._env._state  # pylint: disable=protected-access
@@ -240,10 +249,11 @@ def simulate_from_state(
   # ── Swap in frozen LoRA weights for partner simulation ──
   live_lora_state = None
   if runner._frozen_lora_state is not None:
-    live_lora_state = copy.deepcopy(
-        {k: v for k, v in runner._backend.model.named_parameters()
-         if v.requires_grad}
-    )
+    live_lora_state = copy.deepcopy({
+        k: v
+        for k, v in runner._backend.model.named_parameters()
+        if v.requires_grad
+    })
     for name, param in runner._backend.model.named_parameters():
       if name in runner._frozen_lora_state:
         param.data.copy_(runner._frozen_lora_state[name])
@@ -355,8 +365,10 @@ def _train_grpo_on_prompts(
         parsed = False
         action_id = int(np.random.choice(legal_actions)) if legal_actions else 0
 
-      if (runner._config.reward_num_simulations > 1
-          and runner._config.reward_variance_penalty > 0):
+      if (
+          runner._config.reward_num_simulations > 1
+          and runner._config.reward_variance_penalty > 0
+      ):
         sim_rewards = [
             simulate_from_state(
                 runner, action_history, action_id, p_id, ser_state
@@ -378,8 +390,12 @@ def _train_grpo_on_prompts(
         logging.info(
             '[GRPO eval #%d] P%d | completion=%r '
             '-> action=%s (%s) | reward=%.1f',
-            eval_counter[0], p_id, comp_text.strip()[:60],
-            action_id, status, reward,
+            eval_counter[0],
+            p_id,
+            comp_text.strip()[:60],
+            action_id,
+            status,
+            reward,
         )
 
     return rewards
@@ -396,7 +412,8 @@ def _train_grpo_on_prompts(
 
   max_train_batch = 4
   candidates = [
-      d for d in range(1, max_train_batch + 1)
+      d
+      for d in range(1, max_train_batch + 1)
       if runner._config.num_generations % d == 0
   ]
   batch_size = max(candidates) if candidates else 1
@@ -450,7 +467,9 @@ def _train_grpo_on_prompts(
   player_label = f' (Player {player_id})' if player_id is not None else ''
   logging.info(
       'GRPO training step%s: loss=%.4f, reward=%.4f',
-      player_label, pass_loss, pass_reward,
+      player_label,
+      pass_loss,
+      pass_reward,
   )
   return pass_loss, pass_reward
 
@@ -492,6 +511,13 @@ def run_sampled(runner) -> None:
     pass_start = time.time()
     logging.info('=== GRPO pass %d/%d ===', pass_idx, runner._config.passes)
 
+    # Clear Hanabi state cache from previous pass (no-op for other games).
+    try:
+      from env.hanabi import hanabi_env as _hanabi_env  # pylint: disable=g-import-not-at-top
+      _hanabi_env.clear_state_cache()
+    except ImportError:
+      pass
+
     # ── Temperature annealing ──
     if runner._config.temperature_anneal_end is not None:
       progress = (pass_idx - 1) / max(runner._config.passes - 1, 1)
@@ -500,7 +526,9 @@ def run_sampled(runner) -> None:
       )
       logging.info(
           'Temperature annealed to %.3f (pass %d/%d)',
-          runner._current_temperature, pass_idx, runner._config.passes,
+          runner._current_temperature,
+          pass_idx,
+          runner._config.passes,
       )
 
     # ── Snapshot LoRA weights for stable partner simulation ──
@@ -544,7 +572,9 @@ def run_sampled(runner) -> None:
           continue
         logging.info(
             'Pass %d: training on %d unique prompts for Player %d.',
-            pass_idx, len(unique_prompts), pid,
+            pass_idx,
+            len(unique_prompts),
+            pid,
         )
         p_loss, p_reward = _train_grpo_on_prompts(
             runner, unique_prompts, pass_idx, pid, trl
@@ -556,7 +586,9 @@ def run_sampled(runner) -> None:
       unique_prompts = list({e['prompt'] for e in prompt_entries})
       logging.info(
           'Pass %d: %d unique prompts from %d total.',
-          pass_idx, len(unique_prompts), len(prompt_entries),
+          pass_idx,
+          len(unique_prompts),
+          len(prompt_entries),
       )
       p_loss, p_reward = _train_grpo_on_prompts(
           runner, unique_prompts, pass_idx, None, trl
@@ -570,7 +602,10 @@ def run_sampled(runner) -> None:
     avg_reward = total_pass_reward / num_train_steps if num_train_steps else 0.0
     logging.info(
         'GRPO pass %d complete in %.1f sec (loss=%.4f, reward=%.2f).',
-        pass_idx, pass_elapsed, avg_loss, avg_reward,
+        pass_idx,
+        pass_elapsed,
+        avg_loss,
+        avg_reward,
     )
 
     # ── Step 4: Log training metrics ──
@@ -594,7 +629,9 @@ def run_sampled(runner) -> None:
   total_time = time.time() - start_time
   logging.info(
       'GRPO training complete: %d passes (%d episodes) in %.1f sec.',
-      runner._config.passes, total_episodes_so_far, total_time,
+      runner._config.passes,
+      total_episodes_so_far,
+      total_time,
   )
   if runner._write_summary_fn is not None:
     runner._write_summary_fn(total_time)

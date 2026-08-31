@@ -42,9 +42,9 @@ Usage::
 from __future__ import annotations
 
 import json
+import logging
 
 from hanabi_learning_environment import pyhanabi
-
 
 # ── Color helpers ──────────────────────────────────────────────────────────
 
@@ -71,12 +71,35 @@ class HanabiState:
   OpenSpiel state.
   """
 
-  def __init__(
-      self, game: HanabiGame, hle_state: pyhanabi.HanabiState
-  ) -> None:
+  # In-memory cache for serialize/deserialize round-trips within this
+  # process.  Hanabi's stochastic card deals make action-replay
+  # deserialization non-deterministic, so we clone instead.
+  _serialize_cache: dict[str, 'HanabiState'] = {}
+
+  def __init__(self, game: HanabiGame, hle_state: pyhanabi.HanabiState) -> None:
     self._game = game
     self._hle_state = hle_state
     self._action_history: list[int] = []
+
+  def _advance_past_chance(self) -> None:
+    """Advance past any chance nodes (card dealing) in the HLE state.
+
+    In Hanabi, after a Play or Discard action a replacement card is
+    dealt from the deck.  The HLE models this as a chance node where
+    ``cur_player() == CHANCE_PLAYER_ID``.  This helper resolves all
+    pending chance events so the state always lands on a regular
+    player node (or terminal).
+    """
+    while (
+        not self._hle_state.is_terminal()
+        and self._hle_state.cur_player() == pyhanabi.CHANCE_PLAYER_ID
+    ):
+      if hasattr(self._hle_state, 'deal_random_card'):
+        self._hle_state.deal_random_card()
+      elif hasattr(self._hle_state, 'apply_random_chance'):
+        self._hle_state.apply_random_chance()
+      else:
+        break
 
   # ── Core queries ───────────────────────────────────────────────────────
 
@@ -107,7 +130,8 @@ class HanabiState:
     """Return list of legal action UIDs for the current player."""
     if player is not None and player != self.current_player():
       return []
-    return self._hle_state.legal_moves_as_int()
+    moves = self._hle_state.legal_moves()
+    return [self._game._hle_game.get_move_uid(m) for m in moves]
 
   def action_to_string(self, player: int, action_id: int) -> str:
     """Convert an action UID to a human-readable string.
@@ -120,10 +144,17 @@ class HanabiState:
     return _move_to_string(move, player, self._game.num_players())
 
   def apply_action(self, action_id: int) -> None:
-    """Apply an action and advance the game state."""
+    """Apply an action and advance the game state.
+
+    After the player's move, any chance events (card dealing after
+    play/discard) are resolved automatically so the state always
+    lands on a player node or terminal.
+    """
     move = self._game._hle_game.get_move(action_id)
     self._hle_state.apply_move(move)
     self._action_history.append(action_id)
+    # Advance past chance nodes (card dealing after play/discard).
+    self._advance_past_chance()
 
   # ── Observations ───────────────────────────────────────────────────────
 
@@ -149,7 +180,7 @@ class HanabiState:
     if player is None:
       player = self.current_player()
     obs = pyhanabi.HanabiObservation(
-        self._hle_state, self._hle_state.observation(player)
+        self._hle_state._state, self._game._hle_game._game, player
     )
     return _format_observation(
         obs, player, self._game._hle_game, self._hle_state
@@ -158,21 +189,21 @@ class HanabiState:
   # ── Serialization ──────────────────────────────────────────────────────
 
   def serialize(self) -> str:
-    """Serialize the state to a JSON string for save/restore."""
-    return json.dumps({
-        'action_history': self._action_history,
-    })
+    """Serialize the state — stores a clone in an in-memory cache."""
+    import uuid as _uuid  # pylint: disable=g-import-not-at-top
+    state_id = str(_uuid.uuid4())
+    HanabiState._serialize_cache[state_id] = self.clone()
+    return json.dumps({'state_id': state_id})
 
   @classmethod
   def deserialize(cls, game: HanabiGame, data_str: str) -> HanabiState:
-    """Restore a state by replaying its action history."""
+    """Restore a state from its serialized form (cache lookup)."""
     data = json.loads(data_str)
-    state = game.new_initial_state()
-    for action_id in data['action_history']:
-      if state.is_terminal():
-        break
-      state.apply_action(action_id)
-    return state
+    state_id = data.get('state_id')
+    if state_id and state_id in cls._serialize_cache:
+      return cls._serialize_cache[state_id].clone()
+    logging.warning('HanabiState cache miss for id=%s', state_id)
+    return game.new_initial_state()
 
   def clone(self) -> HanabiState:
     """Deep-copy this state."""
@@ -203,28 +234,46 @@ class HanabiGame:
       max_life_tokens: int = 3,
       random_start_player: bool = False,
   ) -> None:
-    params = {
+    # Store constructor-compatible keys for serialization round-trip.
+    self._params = {
         'players': players,
         'colors': colors,
-        'rank': ranks,
+        'ranks': ranks,
         'hand_size': hand_size,
         'max_information_tokens': max_information_tokens,
         'max_life_tokens': max_life_tokens,
         'random_start_player': random_start_player,
     }
-    self._hle_game = pyhanabi.HanabiGame(params)
-    self._params = params
+    # HLE expects the key 'rank' (not 'ranks').
+    hle_params = dict(self._params)
+    hle_params['rank'] = hle_params.pop('ranks')
+    self._hle_game = pyhanabi.HanabiGame(hle_params)
 
   def num_players(self) -> int:
     return self._params['players']
 
+  def num_distinct_actions(self) -> int:
+    """Return the total number of distinct action UIDs."""
+    return self._hle_game.max_moves()
+
+  def get_type(self):
+    """Return a game-type descriptor matching OpenSpiel's GameType API.
+
+    Only ``short_name`` is used by ``LLMAgent`` for prompt construction.
+    """
+
+    class _GameType:  # pylint: disable=invalid-name
+      short_name = 'hanabi'
+
+    return _GameType()
+
   def new_initial_state(self) -> HanabiState:
     """Create a new game state (deals cards randomly)."""
     hle_state = self._hle_game.new_initial_state()
-    # HLE deals cards via chance nodes — advance past them.
-    while hle_state.cur_player() == pyhanabi.CHANCE_PLAYER_ID:
-      hle_state.deal_random_card()
-    return HanabiState(self, hle_state)
+    state = HanabiState(self, hle_state)
+    # Advance past initial chance nodes (dealing starting hands).
+    state._advance_past_chance()
+    return state
 
   def deserialize_state(self, data_str: str) -> HanabiState:
     """Restore a state from its serialized form."""
@@ -255,6 +304,7 @@ class _TimeStep:
   def last(self) -> bool:
     return self._is_last
 
+  @property
   def rewards(self) -> list[float] | None:
     return self._rewards
 
@@ -283,9 +333,8 @@ class HanabiEnvironment:
     """Apply an action and return the new TimeStep.
 
     Args:
-      actions: A list with a single action ID (matches OpenSpiel's
-        multi-agent step convention where only the current player's
-        action slot matters).
+      actions: A list with a single action ID (matches OpenSpiel's multi-agent
+        step convention where only the current player's action slot matters).
 
     Returns:
       A ``_TimeStep`` with updated current_player and terminal status.
@@ -312,38 +361,56 @@ class HanabiEnvironment:
     self._state = state
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Serialization helpers compatible with grpo_sampled.py
-# ═══════════════════════════════════════════════════════════════════════════
+# Module-level cache for in-memory state cloning.
+# Hanabi is stochastic (random card deals between player actions), so
+# action-replay deserialization doesn't work — replaying the same player
+# actions produces illegal moves because different cards were dealt.
+# Instead we clone states in memory and look them up by UUID.
+_state_cache: dict[str, tuple[HanabiGame, HanabiState]] = {}
 
 
-def serialize_game_and_state(
-    game: HanabiGame, state: HanabiState
-) -> str:
+def clear_state_cache() -> None:
+  """Clear all state caches (call at the start of each GRPO pass)."""
+  _state_cache.clear()
+  HanabiState._serialize_cache.clear()
+
+
+def serialize_game_and_state(game: HanabiGame, state: HanabiState) -> str:
   """Serialize a game+state pair for later restoration.
 
-  Replaces ``pyspiel.serialize_game_and_state()`` for our adapter.
+  Stores a clone of the state in an in-memory cache and returns a
+  JSON string containing the cache key.  This avoids the stochastic
+  replay problem in Hanabi where random card deals between player
+  actions make action-replay deserialization non-deterministic.
   """
+  import uuid  # pylint: disable=g-import-not-at-top
+  state_id = str(uuid.uuid4())
+  _state_cache[state_id] = (game, state.clone())
   return json.dumps({
       'adapter': 'hanabi_env',
+      'state_id': state_id,
       'params': game._params,
-      'state': json.loads(state.serialize()),
   })
 
 
 def deserialize_game_and_state(data_str: str) -> tuple[HanabiGame, HanabiState]:
-  """Restore a game+state pair.
+  """Restore a game+state pair from the in-memory cache.
 
-  Replaces ``pyspiel.deserialize_game_and_state()`` for our adapter.
+  Returns a fresh clone each time so the caller can mutate freely.
   """
   data = json.loads(data_str)
+  state_id = data.get('state_id')
+  if state_id and state_id in _state_cache:
+    game, cached_state = _state_cache[state_id]
+    return game, cached_state.clone()
+  # Fallback: create a fresh initial state (loses mid-game position,
+  # but avoids a crash).
+  logging.warning(
+      'Hanabi state cache miss for id=%s — returning fresh initial state.',
+      state_id,
+  )
   game = HanabiGame(**data['params'])
-  state = game.new_initial_state()
-  for action_id in data['state']['action_history']:
-    if state.is_terminal():
-      break
-    state.apply_action(action_id)
-  return game, state
+  return game, game.new_initial_state()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -357,15 +424,17 @@ def _move_to_string(
   """Convert an HLE move to the OpenSpiel action string format."""
   move_type = move.type()
 
-  if move_type == pyhanabi.HanabiMove.Type.PLAY:
+  # HLE defines move types as integers via HanabiMoveType IntEnum:
+  #   PLAY=1, DISCARD=2, REVEAL_COLOR=3, REVEAL_RANK=4
+  if move_type == 1:  # PLAY
     return f'(Play {move.card_index()})'
-  elif move_type == pyhanabi.HanabiMove.Type.DISCARD:
+  elif move_type == 2:  # DISCARD
     return f'(Discard {move.card_index()})'
-  elif move_type == pyhanabi.HanabiMove.Type.REVEAL_COLOR:
+  elif move_type == 3:  # REVEAL_COLOR
     target = move.target_offset()
     color = _color_char(move.color())
     return f'(Reveal player +{target} color {color})'
-  elif move_type == pyhanabi.HanabiMove.Type.REVEAL_RANK:
+  elif move_type == 4:  # REVEAL_RANK
     target = move.target_offset()
     rank = move.rank() + 1  # HLE is 0-indexed, OpenSpiel shows 1-indexed
     return f'(Reveal player +{target} rank {rank})'
@@ -458,25 +527,29 @@ def _format_card_knowledge(
   """Format card knowledge to match OpenSpiel's format.
 
   OpenSpiel format: "XX|RYGWB12345" where known info is narrowed.
+
+  Note: HLE's ``color()``/``rank()`` return -1 when unknown (not None).
   """
   # Color knowledge.
-  if knowledge.color() is not None:
-    color_str = _color_char(knowledge.color())
+  color_val = knowledge.color()
+  if color_val is not None and color_val >= 0:
+    color_str = _color_char(color_val)
   else:
     color_str = ''.join(
-        _color_char(c) for c in range(num_colors)
+        _color_char(c)
+        for c in range(num_colors)
         if knowledge.color_plausible(c)
     )
     if not color_str:
       color_str = 'X'
 
   # Rank knowledge.
-  if knowledge.rank() is not None:
-    rank_str = str(knowledge.rank() + 1)
+  rank_val = knowledge.rank()
+  if rank_val is not None and rank_val >= 0:
+    rank_str = str(rank_val + 1)
   else:
     rank_str = ''.join(
-        str(r + 1) for r in range(num_ranks)
-        if knowledge.rank_plausible(r)
+        str(r + 1) for r in range(num_ranks) if knowledge.rank_plausible(r)
     )
     if not rank_str:
       rank_str = 'X'
