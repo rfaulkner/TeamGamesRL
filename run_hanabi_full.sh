@@ -4,7 +4,7 @@
 #SBATCH --output=slurm/output/%j_%x.out
 #SBATCH --error=slurm/output/%j_%x.err
 
-#SBATCH --time=4:00:00
+#SBATCH --time=10:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --ntasks-per-node=1
@@ -78,8 +78,8 @@ done
 # Full mode:  ~4 hour comprehensive runs for real experiments.
 
 if [ "$PROFILE" = "quick" ]; then
-  GRPO_PASSES="${GRPO_PASSES:-15}"
-  COLLECT_EPISODES="${COLLECT_EPISODES:-10}"
+  GRPO_PASSES=15
+  COLLECT_EPISODES=10
   NUM_GENERATIONS=4
   NUM_EVAL_EPISODES=5
   echo "[PROFILE] Quick mode: ${GRPO_PASSES} passes, ${COLLECT_EPISODES} eps/pass, K=${NUM_GENERATIONS}"
