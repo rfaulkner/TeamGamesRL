@@ -39,7 +39,7 @@
 #   --grpo_passes=P     GRPO passes            (default: 50)
 #   --collect=N         Episodes per pass      (default: 20)
 #   --max_seq_len=L     Max sequence length    (default: 2048)
-#   --profile=MODE      quick|full             (default: full)
+#   --profile=MODE      express|quick|full     (default: full)
 # ============================================================================
 
 set -euo pipefail
@@ -66,7 +66,7 @@ for arg in "$@"; do
     --max_seq_len=*)  MAX_SEQ_LEN="${arg#*=}" ;;
     --profile=*)      PROFILE="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: sbatch run_hanabi_full.sh [--model=M] [--lora_rank=R] [--lr=L] [--grpo_passes=P] [--collect=N] [--max_seq_len=L] [--profile=quick|full] [--extra...]"
+      echo "Usage: sbatch run_hanabi_full.sh [--model=M] [--lora_rank=R] [--lr=L] [--grpo_passes=P] [--collect=N] [--max_seq_len=L] [--profile=express|quick|full] [--extra...]"
       exit 0 ;;
     --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
@@ -74,10 +74,17 @@ for arg in "$@"; do
 done
 
 # ── Profile presets ──────────────────────────────────────────────────────────
-# Quick mode: ~1 hour iteration runs for testing approach and debugging.
-# Full mode:  ~4 hour comprehensive runs for real experiments.
+# Express mode: ~1 hour — fast sanity check that the full pipeline works.
+# Quick mode:   ~2-3 hours — short iteration runs for testing approach.
+# Full mode:    ~25 hours — comprehensive runs for real experiments.
 
-if [ "$PROFILE" = "quick" ]; then
+if [ "$PROFILE" = "express" ]; then
+  GRPO_PASSES=5
+  COLLECT_EPISODES=5
+  NUM_GENERATIONS=2
+  NUM_EVAL_EPISODES=3
+  echo "[PROFILE] Express mode: ${GRPO_PASSES} passes, ${COLLECT_EPISODES} eps/pass, K=${NUM_GENERATIONS}"
+elif [ "$PROFILE" = "quick" ]; then
   GRPO_PASSES=15
   COLLECT_EPISODES=10
   NUM_GENERATIONS=4
