@@ -311,13 +311,15 @@ class RLTrainer:
 
       # Extract dealt cards (chance outcomes) from the terminal state.
       # In OpenSpiel, the first num_players history entries are chance actions
-      # (e.g. card deals).
+      # (e.g. card deals).  The HLE Hanabi adapter does not track chance
+      # actions, so guard with hasattr.
       state = self.env._state  # pylint: disable=protected-access
-      history = state.history()
       cards_str = ''
-      if len(history) >= num_players:
-        cards = [history[p] for p in range(num_players)]
-        cards_str = ' | cards=' + ','.join(str(c) for c in cards)
+      if hasattr(state, 'history') and callable(state.history):
+        history = state.history()
+        if len(history) >= num_players:
+          cards = [history[p] for p in range(num_players)]
+          cards_str = ' | cards=' + ','.join(str(c) for c in cards)
 
       mean_r = float(np.mean(rewards))
       logging.info(
