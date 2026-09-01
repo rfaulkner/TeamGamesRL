@@ -179,3 +179,23 @@ class GRPOConfig:
   ``None`` means simulate to the terminal state (original behaviour).
   """
 
+  reward_simulation_mode: str = 'rollout'
+  """How to play out remaining turns when computing rewards.
+
+  Options:
+    'rollout'   — Random playout for ``truncated_rollout_horizon``
+                  turns (default 6), then evaluate the resulting state
+                  with a game-specific heuristic (e.g. Hanabi score +
+                  discounted potential).  Fast (~1 ms) with decent
+                  signal.  Best default for multi-turn games.
+    'random'    — Random legal actions all the way to terminal state.
+                  Very fast (~1 ms) but noisier.  Works well with
+                  ``reward_num_simulations > 1`` to reduce variance.
+    'llm'       — Use the model (with frozen LoRA) for all remaining
+                  turns.  Most accurate but very slow (~18 sec per eval
+                  for 12B model).
+    'heuristic' — Use a rule-based player (Hanabi-only).  Moderate
+                  speed and accuracy.  Falls back to 'random' if no
+                  heuristic is available for the current game.
+  """
+

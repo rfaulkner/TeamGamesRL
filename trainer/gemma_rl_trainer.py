@@ -228,6 +228,15 @@ flags.DEFINE_integer(
     'If set, simulate only this many turns ahead when computing rewards '
     'for alternative actions. None means simulate to terminal state.',
 )
+flags.DEFINE_string(
+    'reward_simulation_mode',
+    'rollout',
+    'How to play out remaining turns when computing rewards. '
+    "'rollout' = random playout for k turns + heuristic eval (default, fast + good signal), "
+    "'random' = random legal actions to terminal (~1ms/eval), "
+    "'llm' = use model (accurate, ~18s/eval), "
+    "'heuristic' = rule-based player (Hanabi-only).",
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -325,6 +334,7 @@ def main(argv: list[str]) -> None:
         pivot_decisions_per_episode=FLAGS.grpo_pivot_decisions_per_episode,
         decision_priority_sampling=FLAGS.grpo_decision_priority_sampling,
         truncated_rollout_horizon=FLAGS.grpo_truncated_rollout_horizon,
+        reward_simulation_mode=FLAGS.reward_simulation_mode,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

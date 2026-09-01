@@ -246,6 +246,91 @@ def simulate_from_state(
   if not state.is_terminal():
     state.apply_action(chosen_action)
 
+  sim_mode = runner._config.reward_simulation_mode
+  horizon = runner._config.truncated_rollout_horizon
+
+  if sim_mode == 'llm':
+    # ── LLM-based playout (accurate but slow) ──
+    _simulate_with_llm(runner, state, horizon)
+  elif sim_mode == 'heuristic':
+    # ── Heuristic playout (Hanabi-only, moderate speed) ──
+    _simulate_with_heuristic(runner, state, horizon)
+  elif sim_mode == 'rollout':
+    # ── Random rollout + heuristic value (fast + decent signal) ──
+    # Roll out randomly for `horizon` turns (default 6), then use a
+    # game-specific heuristic to estimate the value of the resulting
+    # state rather than playing all the way to terminal.
+    rollout_depth = horizon if horizon is not None else 6
+    _simulate_with_random(state, rollout_depth)
+    if not state.is_terminal() and hasattr(state, 'state_value'):
+      val = state.state_value()
+      return val
+  else:
+    # ── Random playout (fast, ~1 ms per eval) ──
+    _simulate_with_random(state, horizon)
+
+  if state.is_terminal() and state.rewards() is not None:
+    return float(state.rewards()[target_player])
+  # For truncated rollouts, try to read intermediate score.
+  if hasattr(state, 'state_value'):
+    return state.state_value()
+  if hasattr(state, 'returns'):
+    try:
+      return float(state.returns()[target_player])
+    except (IndexError, TypeError):
+      pass
+  return 0.0
+
+
+def _simulate_with_random(state, horizon: int | None = None) -> None:
+  """Play out remaining turns with random legal actions.
+
+  ~1 ms per game — no model inference needed.
+  """
+  turns_played = 0
+  while not state.is_terminal():
+    if horizon is not None and turns_played >= horizon:
+      break
+    player = state.current_player()
+    legal = state.legal_actions(player)
+    if not legal:
+      break
+    state.apply_action(int(np.random.choice(legal)))
+    turns_played += 1
+
+
+def _simulate_with_heuristic(runner, state, horizon: int | None = None) -> None:
+  """Play out remaining turns with a rule-based heuristic player."""
+  try:
+    from env.hanabi.heuristic_player import HeuristicPlayer  # pylint: disable=g-import-not-at-top
+    heuristic = HeuristicPlayer(level=1)
+  except ImportError:
+    logging.warning('Heuristic player unavailable — falling back to random.')
+    _simulate_with_random(state, horizon)
+    return
+
+  turns_played = 0
+  while not state.is_terminal():
+    if horizon is not None and turns_played >= horizon:
+      break
+    player = state.current_player()
+    legal = state.legal_actions(player)
+    if not legal:
+      break
+    action = heuristic.select_action(state, player, legal)
+    if action is None:
+      action = int(np.random.choice(legal))
+    state.apply_action(action)
+    turns_played += 1
+
+
+def _simulate_with_llm(runner, state, horizon: int | None = None) -> None:
+  """Play out remaining turns using the LLM with frozen LoRA weights.
+
+  Most accurate reward estimation but very slow (~18 sec per eval
+  for a 12B model, since each remaining turn requires a full forward
+  pass).
+  """
   # ── Swap in frozen LoRA weights for partner simulation ──
   live_lora_state = None
   if runner._frozen_lora_state is not None:
@@ -259,7 +344,10 @@ def simulate_from_state(
         param.data.copy_(runner._frozen_lora_state[name])
 
   try:
+    turns_played = 0
     while not state.is_terminal():
+      if horizon is not None and turns_played >= horizon:
+        break
       current_player = state.current_player()
 
       state_text = runner._renderers[current_player].render_state(
@@ -290,15 +378,12 @@ def simulate_from_state(
             int(np.random.choice(legal_actions)) if legal_actions else 0
         )
       state.apply_action(partner_action)
+      turns_played += 1
   finally:
     if live_lora_state is not None:
       for name, param in runner._backend.model.named_parameters():
         if name in live_lora_state:
           param.data.copy_(live_lora_state[name].data)
-
-  if state.is_terminal() and state.rewards() is not None:
-    return float(state.rewards()[target_player])
-  return 0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -498,10 +583,13 @@ def run_sampled(runner) -> None:
   import trl  # pylint: disable=g-import-not-at-top
 
   logging.info(
-      'Starting GRPO training: %d passes, %d episodes/pass, K=%d',
+      'Starting GRPO training: %d passes, %d episodes/pass, K=%d, '
+      'reward_sim=%s, horizon=%s',
       runner._config.passes,
       runner._config.collect_episodes,
       runner._config.num_generations,
+      runner._config.reward_simulation_mode,
+      runner._config.truncated_rollout_horizon,
   )
 
   start_time = time.time()

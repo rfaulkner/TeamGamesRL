@@ -124,6 +124,63 @@ class HanabiState:
     """Alias for returns() in cooperative games."""
     return self.returns()
 
+  def score(self) -> int:
+    """Current firework score (0-25 for standard game)."""
+    return self._hle_state.score()
+
+  def life_tokens(self) -> int:
+    """Remaining life tokens (0-3 for standard game)."""
+    return self._hle_state.life_tokens()
+
+  def information_tokens(self) -> int:
+    """Remaining information tokens (0-8 for standard game)."""
+    return self._hle_state.information_tokens()
+
+  def deck_size(self) -> int:
+    """Cards remaining in the draw deck."""
+    return self._hle_state.deck_size()
+
+  def state_value(self) -> float:
+    """Heuristic evaluation of the current game state.
+
+    Returns a value in [0, 25] estimating the expected final score.
+    Used by the 'rollout' reward simulation mode to evaluate
+    non-terminal states after truncated random playouts.
+
+    The heuristic combines:
+      - Current score (fireworks already completed)
+      - Remaining potential discounted by:
+        - Life tokens (fewer lives = more fragile)
+        - Information tokens (fewer tokens = harder to coordinate)
+        - Deck exhaustion (fewer cards = less recovery opportunity)
+    """
+    if self.is_terminal():
+      return float(self.score())
+
+    s = self.score()
+    lives = self.life_tokens()
+    max_lives = self._game._params.get('max_life_tokens', 3)
+    max_info = self._game._params.get('max_information_tokens', 8)
+    num_colors = self._game._params.get('colors', 5)
+    num_ranks = self._game._params.get('ranks', 5)
+    max_score = num_colors * num_ranks  # 25 for standard
+
+    if lives == 0:
+      return float(s)
+
+    remaining = max_score - s
+    # Health factor: 0 lives = 0, full lives = 1.0
+    health = lives / max(max_lives, 1)
+    # Info factor: diminishing returns, 4+ tokens is fine
+    info = min(self.information_tokens() / max(max_info * 0.5, 1), 1.0)
+    # Deck factor: more deck = more room to recover from mistakes
+    deck = self.deck_size()
+    deck_factor = min(deck / 10.0, 1.0)  # 10+ cards remaining = 1.0
+
+    # Weighted combination: current score + discounted potential
+    estimated_remaining = remaining * health * 0.4 * (0.5 + 0.3 * info + 0.2 * deck_factor)
+    return float(s) + estimated_remaining
+
   # ── Actions ────────────────────────────────────────────────────────────
 
   def legal_actions(self, player: int | None = None) -> list[int]:
