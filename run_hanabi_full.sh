@@ -53,48 +53,57 @@ LR="2e-5"
 GRPO_PASSES=50
 COLLECT_EPISODES=20
 MAX_SEQ_LEN=2048
+# ── 1. Determine profile first ───────────────────────────────────────────────
+
 PROFILE="full"
 EXTRA_FLAGS=""
-
 for arg in "$@"; do
   case "$arg" in
-    --model=*)        MODEL_ID="${arg#*=}" ;;
-    --lora_rank=*)    LORA_RANK="${arg#*=}" ;;
-    --lr=*)           LR="${arg#*=}" ;;
-    --grpo_passes=*)  GRPO_PASSES="${arg#*=}" ;;
-    --collect=*)      COLLECT_EPISODES="${arg#*=}" ;;
-    --max_seq_len=*)  MAX_SEQ_LEN="${arg#*=}" ;;
-    --profile=*)      PROFILE="${arg#*=}" ;;
-    --help|-h)
-      echo "Usage: sbatch run_hanabi_full.sh [--model=M] [--lora_rank=R] [--lr=L] [--grpo_passes=P] [--collect=N] [--max_seq_len=L] [--profile=express|quick|full] [--extra...]"
-      exit 0 ;;
-    --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
-    *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
+    --profile=*) PROFILE="${arg#*=}" ;;
   esac
 done
 
-# ── Profile presets ──────────────────────────────────────────────────────────
-# Express mode: ~1 hour — fast sanity check that the full pipeline works.
-# Quick mode:   ~2-3 hours — short iteration runs for testing approach.
-# Full mode:    ~25 hours — comprehensive runs for real experiments.
+# ── 2. Profile preset defaults ───────────────────────────────────────────────
 
 if [ "$PROFILE" = "express" ]; then
   GRPO_PASSES=5
   COLLECT_EPISODES=5
   NUM_GENERATIONS=2
   NUM_EVAL_EPISODES=3
-  echo "[PROFILE] Express mode: ${GRPO_PASSES} passes, ${COLLECT_EPISODES} eps/pass, K=${NUM_GENERATIONS}"
 elif [ "$PROFILE" = "quick" ]; then
   GRPO_PASSES=15
   COLLECT_EPISODES=10
   NUM_GENERATIONS=4
   NUM_EVAL_EPISODES=5
-  echo "[PROFILE] Quick mode: ${GRPO_PASSES} passes, ${COLLECT_EPISODES} eps/pass, K=${NUM_GENERATIONS}"
 else
+  GRPO_PASSES=50
+  COLLECT_EPISODES=20
   NUM_GENERATIONS=4
   NUM_EVAL_EPISODES=10
-  echo "[PROFILE] Full mode: ${GRPO_PASSES} passes, ${COLLECT_EPISODES} eps/pass, K=${NUM_GENERATIONS}"
 fi
+
+# ── 3. Parse explicit CLI arguments (overriding profile defaults) ─────────────
+
+for arg in "$@"; do
+  case "$arg" in
+    --profile=*)      ;; # handled above
+    --model=*)        MODEL_ID="${arg#*=}" ;;
+    --lora_rank=*)    LORA_RANK="${arg#*=}" ;;
+    --lr=*)           LR="${arg#*=}" ;;
+    --grpo_passes=*)  GRPO_PASSES="${arg#*=}" ;;
+    --collect=*)      COLLECT_EPISODES="${arg#*=}" ;;
+    --max_seq_len=*)  MAX_SEQ_LEN="${arg#*=}" ;;
+    --k=*|--num_generations=*) NUM_GENERATIONS="${arg#*=}" ;;
+    --eval_episodes=*|--num_eval_episodes=*) NUM_EVAL_EPISODES="${arg#*=}" ;;
+    --help|-h)
+      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--reward_simulation_mode=heuristic] [--extra...]"
+      exit 0 ;;
+    --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
+    *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
+  esac
+done
+
+echo "[CONFIG] Profile: ${PROFILE} | Passes: ${GRPO_PASSES} | Episodes/Pass: ${COLLECT_EPISODES} | K: ${NUM_GENERATIONS} | Eval Eps: ${NUM_EVAL_EPISODES}"
 
 # ── Derived settings ─────────────────────────────────────────────────────────
 
