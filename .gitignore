@@ -41,5 +41,8 @@ run_rl.sh
 *.log
 slurm/
 
+# Reports (generated LaTeX)
+reports/
+
 # Misc
 .DS_Store

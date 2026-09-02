@@ -735,6 +735,7 @@ class HanabiRenderer(BaseStateRenderer):
     - Game status (life tokens, information tokens, fireworks progress).
     - Other players' visible hands.
     - The current player's known card information from hints.
+    - Move history (configurable number of recent moves).
     - Available actions (play, discard, hint about color/rank).
 
   OpenSpiel Hanabi action format:
@@ -744,7 +745,23 @@ class HanabiRenderer(BaseStateRenderer):
       "(Play N)"          - Play card at position N from hand.
       "(Reveal player +X color C)" - Hint to player +X about color C.
       "(Reveal player +X rank R)"  - Hint to player +X about rank R.
+
+  Attributes:
+    _max_history_turns: Maximum number of recent moves to include in the
+      prompt. None means show all moves. Older moves are truncated with
+      an indicator.
   """
+
+  def __init__(self, max_history_turns: int | None = 20):
+    """Initializes the HanabiRenderer.
+
+    Args:
+      max_history_turns: Maximum number of recent moves to show in the
+        move history section of the prompt. ``None`` or ``0`` means show
+        all moves (no truncation). Defaults to 20, which covers the last
+        ~10 turns per player in a 2-player game.
+    """
+    self._max_history_turns = max_history_turns
 
   def _parse_hanabi_observation(
       self, obs_str: str
@@ -968,6 +985,118 @@ class HanabiRenderer(BaseStateRenderer):
 
     return '; '.join(desc_parts)
 
+  def _render_move_history(
+      self,
+      state,
+      player_id: int,
+      game,
+  ) -> list[str]:
+    """Renders the history of moves taken so far in this episode.
+
+    Extracts the action history from the state and converts each action
+    into a human-readable description showing who did what. This is
+    critical for learning Hanabi conventions — the agent needs to see
+    the sequence of hints, plays, and discards to develop strategies
+    like "hint-then-play" or "finesse".
+
+    Args:
+      state: The current game state (HanabiState or OpenSpiel State).
+      player_id: The ID of the player to render for (for "You" vs
+        "Player N" labeling).
+      game: The game object.
+
+    Returns:
+      A list of formatted strings, one per historical move.
+    """
+    # Get action history from our HanabiState adapter.
+    action_history = getattr(state, '_action_history', None)
+    if not action_history:
+      return []
+
+    num_players = game.num_players()
+    history_lines = []
+
+    # Apply history truncation if configured.
+    max_turns = self._max_history_turns
+    total_moves = len(action_history)
+    if max_turns and max_turns > 0 and total_moves > max_turns:
+      start_idx = total_moves - max_turns
+      history_lines.append(
+          f'  ... ({start_idx} earlier moves not shown)')
+    else:
+      start_idx = 0
+
+    for turn_idx in range(start_idx, total_moves):
+      action_id = action_history[turn_idx]
+      # Determine which player took this action.
+      # In 2-player Hanabi, turns alternate: P0, P1, P0, P1, ...
+      acting_player = turn_idx % num_players
+
+      # Convert action ID to human-readable string.
+      try:
+        action_str = state.action_to_string(acting_player, action_id)
+      except (AttributeError, IndexError):
+        action_str = f'action {action_id}'
+
+      # Parse the action string to make it more readable.
+      action_desc = self._format_history_action(
+          action_str, acting_player, player_id, num_players
+      )
+      actor = 'You' if acting_player == player_id else f'Player {acting_player}'
+      history_lines.append(f'  Turn {turn_idx + 1}: {actor} — {action_desc}')
+
+    return history_lines
+
+  def _format_history_action(
+      self,
+      action_str: str,
+      acting_player: int,
+      viewing_player: int,
+      num_players: int,
+  ) -> str:
+    """Formats an action string from history into a readable description.
+
+    Args:
+      action_str: Raw action string like "(Play 0)" or
+        "(Reveal player +1 color R)".
+      acting_player: The player who took the action.
+      viewing_player: The player viewing this history.
+      num_players: Total number of players.
+
+    Returns:
+      A human-readable action description.
+    """
+    discard_match = re.match(r'\(Discard (\d+)\)', action_str)
+    play_match = re.match(r'\(Play (\d+)\)', action_str)
+    reveal_color_match = re.match(
+        r'\(Reveal player \+(\d+) color (\w+)\)', action_str
+    )
+    reveal_rank_match = re.match(
+        r'\(Reveal player \+(\d+) rank (\d+)\)', action_str
+    )
+
+    if discard_match:
+      card_idx = discard_match.group(1)
+      return f'discarded card {card_idx}'
+    elif play_match:
+      card_idx = play_match.group(1)
+      return f'played card {card_idx}'
+    elif reveal_color_match:
+      offset = int(reveal_color_match.group(1))
+      color_code = reveal_color_match.group(2)
+      target_player = (acting_player + offset) % num_players
+      color_name = _HANABI_COLOR_NAMES.get(color_code, color_code)
+      target = 'you' if target_player == viewing_player else f'Player {target_player}'
+      return f'hinted {target} about {color_name} cards'
+    elif reveal_rank_match:
+      offset = int(reveal_rank_match.group(1))
+      rank = reveal_rank_match.group(2)
+      target_player = (acting_player + offset) % num_players
+      target = 'you' if target_player == viewing_player else f'Player {target_player}'
+      return f'hinted {target} about rank {rank} cards'
+    else:
+      return action_str
+
   def render_state(
       self,
       state: pyspiel.State,
@@ -1002,6 +1131,20 @@ class HanabiRenderer(BaseStateRenderer):
       lines.append(f'Discarded cards: {parsed["discards"]}')
     else:
       lines.append('No cards discarded yet.')
+
+    # ── Move history ──
+    # Show the full sequence of actions taken so far in this episode.
+    # This is critical for developing conventions in Hanabi — the agent
+    # needs to know what hints were given, what was played/discarded,
+    # and in what order to infer intent and coordinate.
+    history_lines = self._render_move_history(state, player_id, game)
+    if history_lines:
+      lines.append('')
+      lines.append('Move history this game:')
+      lines.extend(history_lines)
+    else:
+      lines.append('')
+      lines.append('No moves have been made yet (start of game).')
 
     # Render each player's hand.
     # The observation orders hands relative to the current player.
@@ -1244,21 +1387,28 @@ class GenericRenderer(BaseStateRenderer):
     return _fuzzy_match_action(text, legal_actions)
 
 
-def get_renderer(game_name: str) -> BaseStateRenderer:
+def get_renderer(
+    game_name: str,
+    max_history_turns: int | None = 20,
+) -> BaseStateRenderer:
   """Factory function to get the appropriate renderer for a game.
 
   Args:
     game_name: The short name of the OpenSpiel game (e.g., 'negotiation',
       'hanabi').
+    max_history_turns: For Hanabi, the maximum number of recent moves to
+      include in the prompt. ``None`` or ``0`` shows all moves. Ignored
+      for non-Hanabi games.
 
   Returns:
     An instance of the appropriate BaseStateRenderer subclass.
   """
+  if game_name == 'hanabi':
+    return HanabiRenderer(max_history_turns=max_history_turns)
+
   renderers = {
       'negotiation': NegotiationRenderer,
-      'hanabi': HanabiRenderer,
       'tiny_hanabi': TinyHanabiRenderer,
   }
-
   renderer_class = renderers.get(game_name, GenericRenderer)
   return renderer_class()

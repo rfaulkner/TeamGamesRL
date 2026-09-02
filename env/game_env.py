@@ -58,6 +58,7 @@ def create_env(game_config: GameConfig):
 
 def create_renderer(
     game_config: GameConfig,
+    max_history_turns: int | None = 20,
 ) -> state_renderers.BaseStateRenderer:
   """Create a state renderer appropriate for the given game.
 
@@ -66,8 +67,13 @@ def create_renderer(
 
   Args:
     game_config: A ``GameConfig`` specifying which game is being played.
+    max_history_turns: For Hanabi, the maximum number of recent moves
+      to include in the prompt. ``None`` or ``0`` shows all moves.
 
   Returns:
     A ``BaseStateRenderer`` instance suitable for *game_config*.
   """
-  return state_renderers.get_renderer(game_config.game_name)
+  return state_renderers.get_renderer(
+      game_config.game_name,
+      max_history_turns=max_history_turns,
+  )

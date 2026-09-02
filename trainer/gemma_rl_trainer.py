@@ -237,6 +237,13 @@ flags.DEFINE_string(
     "'llm' = use model (accurate, ~18s/eval), "
     "'heuristic' = rule-based player (Hanabi-only).",
 )
+flags.DEFINE_integer(
+    'max_history_turns',
+    20,
+    'Maximum number of recent moves to include in the Hanabi prompt. '
+    'Set to 0 to show all moves (no truncation). '
+    'Default 20 covers the last ~10 turns per player in 2-player Hanabi.',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -303,6 +310,7 @@ def main(argv: list[str]) -> None:
           'temperature': FLAGS.temperature,
           'num_episodes': FLAGS.num_episodes,
       },
+      max_history_turns=FLAGS.max_history_turns or None,
   )
 
   # ── Train ──

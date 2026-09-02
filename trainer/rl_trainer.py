@@ -85,6 +85,7 @@ class RLTrainer:
       use_wandb: bool = False,
       wandb_project: str = 'TeamGamesRL',
       wandb_config: dict | None = None,
+      max_history_turns: int | None = 20,
   ):
     """Initializes the RLTrainer.
 
@@ -105,6 +106,8 @@ class RLTrainer:
       use_wandb: Enable Weights & Biases logging.
       wandb_project: Wandb project name.
       wandb_config: Optional dict of config values to log to wandb.
+      max_history_turns: For Hanabi, the maximum number of recent moves
+          to show in the prompt. None or 0 shows all moves.
 
     Raises:
       ValueError: If game_name is not recognized.
@@ -132,7 +135,10 @@ class RLTrainer:
     self.renderers = []
     self.agents = []
     for pid in range(self.game_config.num_players):
-      renderer = game_env.create_renderer(self.game_config)
+      renderer = game_env.create_renderer(
+          self.game_config,
+          max_history_turns=max_history_turns,
+      )
       self.renderers.append(renderer)
       agent = llm_agent.LLMAgent(
           player_id=pid,
