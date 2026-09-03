@@ -45,31 +45,60 @@ _COLOR_LETTERS = ('R', 'Y', 'G', 'B', 'W')
 _FIREWORKS_RE = re.compile(r'Fireworks:\s*((?:[RYGBW]\d\s*)+)')
 _LIFE_TOKENS_RE = re.compile(r'Life tokens:\s*(\d+)')
 _INFO_TOKENS_RE = re.compile(r'Info tokens:\s*(\d+)')
-# Matches a single card-knowledge entry, e.g. "XX || RG|12".
+# Matches a single card-knowledge entry, e.g. "XX || RG|12" or "XX || RYGWB12345".
 _CARD_KNOWLEDGE_RE = re.compile(
-    r'XX\s*\|\|\s*([RYGBW]+)\|([1-5]+)'
+    r'XX\s*\|\|\s*(?:[A-Z0-9]+[|])?([RYGBW]+)[|]?([1-5]+)'
 )
+
+
+def create_heuristic_player(
+    level: int = 1, seed: Optional[int] = None
+) -> HeuristicPlayer:
+  """Creates a heuristic player for the requested skill level.
+
+  Args:
+    level: 0 for RandomPlayer, 1 for SafePlayPlayer.
+    seed: Optional RNG seed.
+
+  Returns:
+    A HeuristicPlayer instance.
+  """
+  if level == 0:
+    return RandomPlayer(seed=seed)
+  elif level == 1:
+    return SafePlayPlayer(seed=seed)
+  raise ValueError(f'Unknown heuristic level: {level}')
 
 
 class HeuristicPlayer(abc.ABC):
   """Abstract base class for rule-based Hanabi players.
 
+  Can also be instantiated directly via ``HeuristicPlayer(level=N)``
+  which acts as a factory returning the corresponding subclass.
+
   Subclasses must implement ``select_action`` and the ``name`` property.
   """
+
+  def __new__(cls, *args, **kwargs):
+    if cls is HeuristicPlayer:
+      level = kwargs.get('level', args[0] if args else 1)
+      seed = kwargs.get('seed', args[1] if len(args) > 1 else None)
+      return create_heuristic_player(level=level, seed=seed)
+    return super().__new__(cls)
 
   @abc.abstractmethod
   def select_action(
       self,
       state: 'pyspiel.State',
       player_id: int,
-      game: 'pyspiel.Game',
+      game: Optional['pyspiel.Game'] = None,
   ) -> int:
     """Chooses an action for the given player.
 
     Args:
       state: The current OpenSpiel game state.
       player_id: Index of the acting player.
-      game: The OpenSpiel game object (used for action metadata).
+      game: Optional OpenSpiel game object (used for action metadata).
 
     Returns:
       A legal action integer.
@@ -88,19 +117,21 @@ class RandomPlayer(HeuristicPlayer):
     _rng: NumPy random generator used for reproducibility.
   """
 
-  def __init__(self, seed: Optional[int] = None) -> None:
+  def __init__(self, seed: Optional[int] = None, **kwargs) -> None:
     """Initialises a RandomPlayer.
 
     Args:
       seed: Optional RNG seed for reproducible action selection.
+      **kwargs: Ignored keyword arguments for factory compatibility.
     """
+    del kwargs
     self._rng = np.random.RandomState(seed)
 
   def select_action(
       self,
       state: 'pyspiel.State',
       player_id: int,
-      game: 'pyspiel.Game',
+      game: Optional['pyspiel.Game'] = None,
   ) -> int:
     """Selects a uniformly random legal action.
 
@@ -138,12 +169,14 @@ class SafePlayPlayer(HeuristicPlayer):
   the next needed card for the corresponding firework.
   """
 
-  def __init__(self, seed: Optional[int] = None) -> None:
+  def __init__(self, seed: Optional[int] = None, **kwargs) -> None:
     """Initialises a SafePlayPlayer.
 
     Args:
       seed: Optional RNG seed for tie-breaking and hint selection.
+      **kwargs: Ignored keyword arguments for factory compatibility.
     """
+    del kwargs
     self._rng = np.random.RandomState(seed)
 
   # ---------------------------------------------------------------------------
@@ -154,7 +187,7 @@ class SafePlayPlayer(HeuristicPlayer):
       self,
       state: 'pyspiel.State',
       player_id: int,
-      game: 'pyspiel.Game',
+      game: Optional['pyspiel.Game'] = None,
   ) -> int:
     """Selects an action using the safe-play heuristic.
 

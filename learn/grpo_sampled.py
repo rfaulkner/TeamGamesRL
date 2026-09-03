@@ -302,13 +302,14 @@ def _simulate_with_random(state, horizon: int | None = None) -> None:
 def _simulate_with_heuristic(runner, state, horizon: int | None = None) -> None:
   """Play out remaining turns with a rule-based heuristic player."""
   try:
-    from env.hanabi.heuristic_player import HeuristicPlayer  # pylint: disable=g-import-not-at-top
-    heuristic = HeuristicPlayer(level=1)
+    from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+    heuristic = SafePlayPlayer()
   except ImportError:
     logging.warning('Heuristic player unavailable — falling back to random.')
     _simulate_with_random(state, horizon)
     return
 
+  game = getattr(runner._env, 'game', None)
   turns_played = 0
   while not state.is_terminal():
     if horizon is not None and turns_played >= horizon:
@@ -317,7 +318,7 @@ def _simulate_with_heuristic(runner, state, horizon: int | None = None) -> None:
     legal = state.legal_actions(player)
     if not legal:
       break
-    action = heuristic.select_action(state, player, legal)
+    action = heuristic.select_action(state, player, game)
     if action is None:
       action = int(np.random.choice(legal))
     state.apply_action(action)
