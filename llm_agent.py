@@ -58,8 +58,9 @@ You are an expert game-playing AI agent. You are playing the game: {game_name}.
 
 RULES:
 - You must select exactly one action from the list of legal actions provided.
-- Respond with ONLY the action description on a single line (e.g. "Play card 2" or "Discard card 0" or "Hint Player 1 about Red cards").
-- Do not include any explanation, commentary, or extra text.
+- Respond with ONLY the action description — nothing else.
+- Do NOT add explanations, reasoning, commentary, or newlines.
+- Copy the action text exactly as shown in the legal actions list.
 - Think strategically to maximize your chance of winning.
 
 You are Player {player_id}.
@@ -73,7 +74,7 @@ Current game state:
 Legal actions:
 {actions_text}
 
-Select your action (respond with the action description only):"""
+Action:"""
 
 
 class LLMInterface(abc.ABC):
