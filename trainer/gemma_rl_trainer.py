@@ -231,11 +231,13 @@ flags.DEFINE_integer(
 flags.DEFINE_string(
     'reward_simulation_mode',
     'rollout',
-    'How to play out remaining turns when computing rewards. '
+    'How to compute rewards for GRPO training. '
     "'rollout' = random playout for k turns + heuristic eval (default, fast + good signal), "
     "'random' = random legal actions to terminal (~1ms/eval), "
     "'llm' = use model (accurate, ~18s/eval), "
-    "'heuristic' = rule-based player (Hanabi-only).",
+    "'heuristic' = rule-based player (Hanabi-only), "
+    "'dense' = per-action reward shaping (no simulation, ~100x faster), "
+    "'dense_chain' = dense rewards over a short heuristic continuation.",
 )
 flags.DEFINE_integer(
     'max_history_turns',
@@ -243,6 +245,13 @@ flags.DEFINE_integer(
     'Maximum number of recent moves to include in the Hanabi prompt. '
     'Set to 0 to show all moves (no truncation). '
     'Default 20 covers the last ~10 turns per player in 2-player Hanabi.',
+)
+flags.DEFINE_float(
+    'dense_chain_discount',
+    0.9,
+    'Discount factor for chained dense reward evaluation. '
+    'Only used with --reward_simulation_mode=dense_chain. '
+    'Higher values (closer to 1.0) weight future actions more equally.',
 )
 # ============================================================================
 # Entry point
@@ -333,6 +342,7 @@ def main(argv: list[str]) -> None:
       ),
       'grpo_truncated_rollout_horizon': FLAGS.grpo_truncated_rollout_horizon,
       'reward_simulation_mode': FLAGS.reward_simulation_mode,
+      'dense_chain_discount': FLAGS.dense_chain_discount,
       # REINFORCE-specific configuration.
       'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
       'baseline_window_size': FLAGS.baseline_window_size,
@@ -394,6 +404,7 @@ def main(argv: list[str]) -> None:
         decision_priority_sampling=FLAGS.grpo_decision_priority_sampling,
         truncated_rollout_horizon=FLAGS.grpo_truncated_rollout_horizon,
         reward_simulation_mode=FLAGS.reward_simulation_mode,
+        dense_chain_discount=FLAGS.dense_chain_discount,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

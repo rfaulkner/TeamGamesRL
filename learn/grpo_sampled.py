@@ -451,7 +451,47 @@ def _train_grpo_on_prompts(
         parsed = False
         action_id = int(np.random.choice(legal_actions)) if legal_actions else 0
 
-      if (
+      sim_mode = runner._config.reward_simulation_mode
+
+      if sim_mode == 'dense':
+        # Dense per-action reward: evaluate the immediate quality of
+        # the chosen action without any forward simulation.
+        from learn.action_reward import evaluate_action_quality  # pylint: disable=g-import-not-at-top
+        if not parsed:
+          reward = -0.3  # Parse failure penalty.
+        else:
+          # Restore the state to evaluate the action.
+          if ser_state is not None:
+            _, eval_state = _deserialize_game_and_state(ser_state)
+          else:
+            runner._env.reset()
+            eval_state = runner._env._state
+            for a in action_history:
+              if eval_state.is_terminal():
+                break
+              eval_state.apply_action(a)
+          reward = evaluate_action_quality(
+              eval_state, action_id, p_id
+          )
+
+      elif sim_mode == 'dense_chain':
+        # Dense rewards over a short heuristic continuation.
+        from learn.action_reward import evaluate_dense_chain  # pylint: disable=g-import-not-at-top
+        if not parsed:
+          reward = -0.3  # Parse failure penalty.
+        else:
+          horizon = runner._config.truncated_rollout_horizon or 4
+          discount = getattr(
+              runner._config, 'dense_chain_discount', 0.9
+          )
+          reward = evaluate_dense_chain(
+              runner, action_history, action_id, p_id,
+              serialized_state=ser_state,
+              horizon=horizon,
+              discount=discount,
+          )
+
+      elif (
           runner._config.reward_num_simulations > 1
           and runner._config.reward_variance_penalty > 0
       ):

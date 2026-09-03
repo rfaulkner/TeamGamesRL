@@ -180,22 +180,43 @@ class GRPOConfig:
   """
 
   reward_simulation_mode: str = 'rollout'
-  """How to play out remaining turns when computing rewards.
+  """How to compute rewards for GRPO training.
 
   Options:
-    'rollout'   — Random playout for ``truncated_rollout_horizon``
-                  turns (default 6), then evaluate the resulting state
-                  with a game-specific heuristic (e.g. Hanabi score +
-                  discounted potential).  Fast (~1 ms) with decent
-                  signal.  Best default for multi-turn games.
-    'random'    — Random legal actions all the way to terminal state.
-                  Very fast (~1 ms) but noisier.  Works well with
-                  ``reward_num_simulations > 1`` to reduce variance.
-    'llm'       — Use the model (with frozen LoRA) for all remaining
-                  turns.  Most accurate but very slow (~18 sec per eval
-                  for 12B model).
-    'heuristic' — Use a rule-based player (Hanabi-only).  Moderate
-                  speed and accuracy.  Falls back to 'random' if no
-                  heuristic is available for the current game.
+    'rollout'     -- Random playout for ``truncated_rollout_horizon``
+                    turns (default 6), then evaluate the resulting state
+                    with a game-specific heuristic (e.g. Hanabi score +
+                    discounted potential).  Fast (~1 ms) with decent
+                    signal.  Best default for multi-turn games.
+    'random'      -- Random legal actions all the way to terminal state.
+                    Very fast (~1 ms) but noisier.  Works well with
+                    ``reward_num_simulations > 1`` to reduce variance.
+    'llm'         -- Use the model (with frozen LoRA) for all remaining
+                    turns.  Most accurate but very slow (~18 sec per eval
+                    for 12B model).
+    'heuristic'   -- Use a rule-based player (Hanabi-only).  Moderate
+                    speed and accuracy.  Falls back to 'random' if no
+                    heuristic is available for the current game.
+    'dense'       -- Dense per-action reward shaping (Hanabi-only).  No
+                    simulation at all: evaluates the immediate quality
+                    of the chosen action (play success, discard safety,
+                    hint informativeness).  Zero variance, ~100x faster
+                    than rollout.  Best for initial training phases.
+    'dense_chain' -- Dense rewards over a short heuristic continuation
+                    (controlled by ``truncated_rollout_horizon``,
+                    default 4 turns).  Addresses myopic play concerns
+                    by including discounted rewards for subsequent
+                    heuristic actions.  Good balance of density and
+                    strategic context.
+  """
+
+  dense_chain_discount: float = 0.9
+  """Discount factor for chained dense reward evaluation.
+
+  When ``reward_simulation_mode='dense_chain'``, future action
+  rewards are discounted by this factor per turn:
+  ``r_0 + gamma*r_1 + gamma^2*r_2 + ...``  Higher values (closer to 1.0)
+  weight future actions more equally; lower values focus on the
+  immediate action.
   """
 
