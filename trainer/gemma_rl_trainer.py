@@ -284,6 +284,63 @@ def main(argv: list[str]) -> None:
       max_seq_len=FLAGS.max_seq_len,
   )
 
+  # ── Build full experiment config for reproducibility ──
+  experiment_config = {
+      # Model configuration.
+      'model_name': FLAGS.model_name,
+      'use_4bit': FLAGS.use_4bit,
+      'max_seq_len': FLAGS.max_seq_len,
+      'lora_rank': FLAGS.lora_rank,
+      'lora_alpha': FLAGS.lora_alpha,
+      'lora_dropout': FLAGS.lora_dropout,
+      # Training configuration.
+      'rl_algorithm': FLAGS.rl_algorithm,
+      'game': FLAGS.game,
+      'num_episodes': FLAGS.num_episodes,
+      'lr': FLAGS.lr,
+      'temperature': FLAGS.temperature,
+      'max_grad_norm': FLAGS.max_grad_norm,
+      'kl_coeff': FLAGS.kl_coeff,
+      'seed': FLAGS.seed,
+      # Evaluation & logging.
+      'eval_every': FLAGS.eval_every,
+      'num_eval_episodes': FLAGS.num_eval_episodes,
+      'log_every': FLAGS.log_every,
+      'checkpoint_every': FLAGS.checkpoint_every,
+      'log_episodes_every': FLAGS.log_episodes_every,
+      'max_history_turns': FLAGS.max_history_turns,
+      # GRPO-specific configuration.
+      'grpo_passes': FLAGS.grpo_passes,
+      'grpo_collect_episodes': FLAGS.grpo_collect_episodes,
+      'grpo_num_generations': FLAGS.grpo_num_generations,
+      'grpo_train_epochs': FLAGS.grpo_train_epochs,
+      'grpo_max_completion_length': FLAGS.grpo_max_completion_length,
+      'grpo_exhaustive_groups': FLAGS.grpo_exhaustive_groups,
+      'grpo_optimistic_alpha': FLAGS.grpo_optimistic_alpha,
+      'grpo_optimistic_alpha_min': FLAGS.grpo_optimistic_alpha_min,
+      'grpo_signal_entropy_coeff': FLAGS.grpo_signal_entropy_coeff,
+      'grpo_phased_training': FLAGS.grpo_phased_training,
+      'grpo_phase1_passes': FLAGS.grpo_phase1_passes,
+      'grpo_phase2_passes': FLAGS.grpo_phase2_passes,
+      'grpo_phase3_passes': FLAGS.grpo_phase3_passes,
+      'grpo_convergence_patience': FLAGS.grpo_convergence_patience,
+      'grpo_convergence_min_delta': FLAGS.grpo_convergence_min_delta,
+      'grpo_pivot_decisions_per_episode': (
+          FLAGS.grpo_pivot_decisions_per_episode
+      ),
+      'grpo_decision_priority_sampling': (
+          FLAGS.grpo_decision_priority_sampling
+      ),
+      'grpo_truncated_rollout_horizon': FLAGS.grpo_truncated_rollout_horizon,
+      'reward_simulation_mode': FLAGS.reward_simulation_mode,
+      # REINFORCE-specific configuration.
+      'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
+      'baseline_window_size': FLAGS.baseline_window_size,
+      # Infrastructure.
+      'output_dir': FLAGS.output_dir,
+      'use_wandb': FLAGS.use_wandb,
+  }
+
   # ── Build trainer ──
   from trainer.rl_trainer import RLTrainer  # pylint: disable=g-import-not-at-top
 
@@ -302,15 +359,9 @@ def main(argv: list[str]) -> None:
       log_episodes_every=FLAGS.log_episodes_every,
       use_wandb=FLAGS.use_wandb,
       wandb_project=FLAGS.wandb_project,
-      wandb_config={
-          'game': FLAGS.game,
-          'model': FLAGS.model_name,
-          'lora_rank': FLAGS.lora_rank,
-          'lr': FLAGS.lr,
-          'temperature': FLAGS.temperature,
-          'num_episodes': FLAGS.num_episodes,
-      },
+      wandb_config=experiment_config,
       max_history_turns=FLAGS.max_history_turns or None,
+      experiment_config=experiment_config,
   )
 
   # ── Train ──

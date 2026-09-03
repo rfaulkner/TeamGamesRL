@@ -86,6 +86,7 @@ class RLTrainer:
       wandb_project: str = 'TeamGamesRL',
       wandb_config: dict | None = None,
       max_history_turns: int | None = 20,
+      experiment_config: dict | None = None,
   ):
     """Initializes the RLTrainer.
 
@@ -108,6 +109,10 @@ class RLTrainer:
       wandb_config: Optional dict of config values to log to wandb.
       max_history_turns: For Hanabi, the maximum number of recent moves
           to show in the prompt. None or 0 shows all moves.
+      experiment_config: Optional dict of all experiment hyperparameters
+          (model, LoRA, training, GRPO, etc.) to persist in the results
+          directory as ``config.json``.  When provided, this config is
+          also embedded in the final ``summary.json``.
 
     Raises:
       ValueError: If game_name is not recognized.
@@ -167,6 +172,14 @@ class RLTrainer:
     # ── Results directory for persistent metrics ──
     self.results_dir = os.path.join(output_dir, 'results')
     os.makedirs(self.results_dir, exist_ok=True)
+
+    # ── Persist experiment configuration ──
+    self._experiment_config = experiment_config or {}
+    if self._experiment_config:
+      config_path = os.path.join(self.results_dir, 'config.json')
+      with open(config_path, 'w') as f:
+        json.dump(self._experiment_config, f, indent=2)
+      logging.info('Experiment config written to %s', config_path)
 
     # Initialize training metrics CSV.
     self._train_csv_path = os.path.join(
@@ -624,6 +637,9 @@ class RLTrainer:
             else 0.0
         ),
     }
+    # Embed full experiment configuration for reproducibility.
+    if self._experiment_config:
+      summary['config'] = self._experiment_config
     summary_path = os.path.join(self.results_dir, 'summary.json')
     with open(summary_path, 'w') as f:
       json.dump(summary, f, indent=2)
@@ -733,6 +749,19 @@ class RLTrainer:
           project=self.wandb_project,
           config=self.wandb_config,
       )
+
+    # Update experiment config with the final GRPO config (may include
+    # game-specific overrides, e.g. tiny_hanabi tuning).
+    if self._experiment_config:
+      import dataclasses as _dc  # pylint: disable=g-import-not-at-top
+      grpo_fields = {
+          f'grpo_{k}' if not k.startswith('grpo_') else k: v
+          for k, v in _dc.asdict(grpo_config).items()
+      }
+      self._experiment_config.update(grpo_fields)
+      config_path = os.path.join(self.results_dir, 'config.json')
+      with open(config_path, 'w') as f:
+        json.dump(self._experiment_config, f, indent=2)
 
     runner = GRPORunner(
         env=self.env,
