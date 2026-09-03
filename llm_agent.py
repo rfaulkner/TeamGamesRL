@@ -58,7 +58,7 @@ You are an expert game-playing AI agent. You are playing the game: {game_name}.
 
 RULES:
 - You must select exactly one action from the list of legal actions provided.
-- Respond with ONLY the action number (integer) on a single line.
+- Respond with ONLY the action description on a single line (e.g. "Play card 2" or "Discard card 0" or "Hint Player 1 about Red cards").
 - Do not include any explanation, commentary, or extra text.
 - Think strategically to maximize your chance of winning.
 
@@ -73,7 +73,7 @@ Current game state:
 Legal actions:
 {actions_text}
 
-Select your action (respond with the action number only):"""
+Select your action (respond with the action description only):"""
 
 
 class LLMInterface(abc.ABC):
@@ -450,8 +450,8 @@ class LLMAgent:
       The complete prompt string to send to the LLM.
     """
     actions_lines = []
-    for action_id, desc in zip(legal_actions, action_descriptions):
-      actions_lines.append(f'  Action {action_id}: {desc}')
+    for _, desc in zip(legal_actions, action_descriptions):
+      actions_lines.append(f'  - {desc}')
     actions_text = '\n'.join(actions_lines)
 
     user_prompt = _USER_PROMPT_TEMPLATE.format(

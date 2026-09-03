@@ -48,8 +48,9 @@ class GRPOConfig:
       information (e.g. Tiny Hanabi). Only used when ``exhaustive_groups`` is
       False.
     temperature_anneal_end: If set, linearly anneal the sampling temperature
-      from ``temperature`` to this value over the course of training. None means
-      no annealing (constant temperature).
+      from ``temperature`` to this value over the course of training. Defaults
+      to 0.7 (annealing from 1.2 to 0.7) for high early exploration with
+      gradual convergence. Set to ``None`` for constant temperature.
     reward_variance_penalty: Coefficient for penalizing high-variance reward
       outcomes. The effective reward becomes ``mean_reward - penalty *
       std_reward`` when ``reward_num_simulations > 1``. Encourages convergence
@@ -91,10 +92,10 @@ class GRPOConfig:
   kl_coeff: float = 0.05
   max_grad_norm: float = 1.0
   gradient_accumulation_steps: int = 1
-  temperature: float = 0.8
+  temperature: float = 1.2
   num_eval_episodes: int = 10
   per_player_updates: bool = True
-  temperature_anneal_end: float | None = None
+  temperature_anneal_end: float | None = 0.7
   reward_variance_penalty: float = 0.0
   reward_num_simulations: int = 5
   exhaustive_groups: bool = False

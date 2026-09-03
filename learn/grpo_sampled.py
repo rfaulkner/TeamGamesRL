@@ -423,6 +423,8 @@ def _train_grpo_on_prompts(
   def reward_fn(completions, prompts=None, **kwargs):
     del kwargs
     rewards = []
+    reward_cache = {}  # (prompt_text, action_id) -> reward tensor
+    cache_hits = 0
     for i, completion in enumerate(completions):
       prompt_text = (
           prompts[i] if prompts is not None and i < len(prompts) else ''
@@ -450,6 +452,14 @@ def _train_grpo_on_prompts(
       if action_id is None:
         parsed = False
         action_id = int(np.random.choice(legal_actions)) if legal_actions else 0
+
+      # Check reward cache for duplicate (prompt, action) pairs.
+      cache_key = (prompt_text, action_id)
+      if cache_key in reward_cache:
+        rewards.append(reward_cache[cache_key])
+        cache_hits += 1
+        eval_counter[0] += 1
+        continue
 
       sim_mode = runner._config.reward_simulation_mode
 
@@ -508,7 +518,10 @@ def _train_grpo_on_prompts(
         reward = simulate_from_state(
             runner, action_history, action_id, p_id, ser_state
         )
-      rewards.append(torch.tensor(float(reward)))
+
+      reward_tensor = torch.tensor(float(reward))
+      rewards.append(reward_tensor)
+      reward_cache[cache_key] = reward_tensor
 
       eval_counter[0] += 1
       if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
@@ -524,6 +537,13 @@ def _train_grpo_on_prompts(
             reward,
         )
 
+    if cache_hits > 0:
+      logging.info(
+          'Reward cache: %d/%d hits (%.0f%% duplicates avoided)',
+          cache_hits,
+          len(rewards),
+          100.0 * cache_hits / len(rewards),
+      )
     return rewards
 
   # Build output directory.
