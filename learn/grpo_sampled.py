@@ -130,6 +130,16 @@ def collect_game_prompts(
       if action_id is None:
         action_id = int(np.random.choice(legal_actions))
 
+      # Epsilon-greedy exploration: with probability epsilon, override the
+      # model's action with a uniformly random legal action.  This prevents
+      # game-ending action collapse (e.g. always playing cards in Hanabi)
+      # and ensures longer, more diverse collection episodes.
+      epsilon_explored = False
+      if (runner._current_epsilon > 0
+          and np.random.random() < runner._current_epsilon):
+        action_id = int(np.random.choice(legal_actions))
+        epsilon_explored = True
+
       action_text = state.action_to_string(current_player, action_id)
 
       prompt_entry = {
@@ -459,6 +469,18 @@ def _train_grpo_on_prompts(
         rewards.append(reward_cache[cache_key])
         cache_hits += 1
         eval_counter[0] += 1
+        if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
+          status = 'parsed' if parsed else 'random_fallback'
+          logging.info(
+              '[GRPO eval #%d] P%d | completion=%r '
+              '-> action=%s (%s) | reward=%.1f (cached)',
+              eval_counter[0],
+              p_id,
+              comp_text.strip()[:60],
+              action_id,
+              status,
+              float(reward_cache[cache_key]),
+          )
         continue
 
       sim_mode = runner._config.reward_simulation_mode
@@ -679,6 +701,19 @@ def run_sampled(runner) -> None:
           pass_idx,
           runner._config.passes,
       )
+
+    # ── Epsilon annealing ──
+    if runner._config.epsilon_anneal_end is not None:
+      progress = (pass_idx - 1) / max(runner._config.passes - 1, 1)
+      runner._current_epsilon = runner._config.epsilon + progress * (
+          runner._config.epsilon_anneal_end - runner._config.epsilon
+      )
+    logging.info(
+        'Epsilon-greedy: %.3f (pass %d/%d)',
+        runner._current_epsilon,
+        pass_idx,
+        runner._config.passes,
+    )
 
     # ── Snapshot LoRA weights for stable partner simulation ──
     runner._frozen_lora_state = {

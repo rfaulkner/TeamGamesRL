@@ -138,6 +138,7 @@ class GRPORunner:
     # Mutable runtime state.
     self._prompt_metadata: dict[str, dict] = {}
     self._current_temperature: float = config.temperature
+    self._current_epsilon: float = config.epsilon
     self._frozen_lora_state: dict | None = None
 
   def run(self) -> None:

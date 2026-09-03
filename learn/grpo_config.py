@@ -221,3 +221,23 @@ class GRPOConfig:
   immediate action.
   """
 
+  epsilon: float = 0.3
+  """Epsilon-greedy exploration rate during game collection.
+
+  During ``collect_game_prompts``, with probability ``epsilon`` the
+  agent selects a uniformly random legal action instead of the LLM's
+  chosen action.  This prevents the model from collapsing onto a single
+  dominant action type (e.g. always playing cards in Hanabi, which leads
+  to rapid game-overs and very short training episodes).
+
+  The prompt and state are still recorded for GRPO training regardless
+  of whether the action was model-chosen or random.  Set to 0.0 to
+  disable exploration.
+  """
+
+  epsilon_anneal_end: float | None = 0.0
+  """If set, linearly anneal epsilon from ``epsilon`` to this value over
+  the course of training passes.  Defaults to 0.0 (full exploration early,
+  pure policy at the end).  Set to ``None`` for constant epsilon.
+  """
+

@@ -66,6 +66,24 @@ flags.DEFINE_integer(
 flags.DEFINE_float(
     'temperature', 0.8, 'Sampling temperature for LLM action selection.'
 )
+flags.DEFINE_float(
+    'temperature_anneal_end',
+    None,
+    'If set, linearly anneal temperature to this value over training. '
+    'E.g. --temperature=1.2 --temperature_anneal_end=0.7 anneals from 1.2 '
+    'to 0.7 over the course of GRPO passes.',
+)
+flags.DEFINE_float(
+    'epsilon',
+    0.3,
+    'Epsilon-greedy exploration rate during game collection. With this '
+    'probability, the model action is replaced with a random legal action.',
+)
+flags.DEFINE_float(
+    'epsilon_anneal_end',
+    0.0,
+    'Anneal epsilon to this value over training. Set to None to disable.',
+)
 flags.DEFINE_float('lr', 3e-5, 'Learning rate for the LoRA adapter.')
 flags.DEFINE_integer('lora_rank', 16, 'LoRA adapter rank.')
 flags.DEFINE_integer('lora_alpha', 32, 'LoRA scaling alpha.')
@@ -405,6 +423,9 @@ def main(argv: list[str]) -> None:
         truncated_rollout_horizon=FLAGS.grpo_truncated_rollout_horizon,
         reward_simulation_mode=FLAGS.reward_simulation_mode,
         dense_chain_discount=FLAGS.dense_chain_discount,
+        temperature_anneal_end=FLAGS.temperature_anneal_end,
+        epsilon=FLAGS.epsilon,
+        epsilon_anneal_end=FLAGS.epsilon_anneal_end,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

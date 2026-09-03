@@ -53,6 +53,11 @@ LR="2e-5"
 GRPO_PASSES=50
 COLLECT_EPISODES=20
 MAX_SEQ_LEN=2048
+TEMPERATURE="1.2"
+TEMPERATURE_ANNEAL_END="0.7"
+MAX_COMPLETION_LENGTH=64
+EPSILON="0.3"
+EPSILON_ANNEAL_END="0.0"
 # ── 1. Determine profile first ───────────────────────────────────────────────
 
 PROFILE="full"
@@ -95,8 +100,13 @@ for arg in "$@"; do
     --max_seq_len=*)  MAX_SEQ_LEN="${arg#*=}" ;;
     --k=*|--num_generations=*) NUM_GENERATIONS="${arg#*=}" ;;
     --eval_episodes=*|--num_eval_episodes=*) NUM_EVAL_EPISODES="${arg#*=}" ;;
+    --temperature=*)  TEMPERATURE="${arg#*=}" ;;
+    --temperature_anneal_end=*) TEMPERATURE_ANNEAL_END="${arg#*=}" ;;
+    --max_completion_length=*) MAX_COMPLETION_LENGTH="${arg#*=}" ;;
+    --epsilon=*)      EPSILON="${arg#*=}" ;;
+    --epsilon_anneal_end=*) EPSILON_ANNEAL_END="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--reward_simulation_mode=heuristic] [--extra...]"
+      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=heuristic] [--extra...]"
       exit 0 ;;
     --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
@@ -145,6 +155,7 @@ echo "  GRPO Passes:  ${GRPO_PASSES}"
 echo "  Collect eps:  ${COLLECT_EPISODES}"
 echo "  Generations:  ${NUM_GENERATIONS}"
 echo "  Max Seq Len:  ${MAX_SEQ_LEN}"
+echo "  Temperature:  ${TEMPERATURE} -> ${TEMPERATURE_ANNEAL_END}"
 echo "  Profile:      ${PROFILE}"
 echo "  Output dir:   ${output_dir}"
 echo "  Node:         $(hostname)"
@@ -168,6 +179,13 @@ fi
 mkdir -p "${output_dir}"
 mkdir -p slurm/output
 
+# ── Build temperature annealing flags ────────────────────────────────────────
+
+ANNEAL_FLAGS=""
+if [ -n "${TEMPERATURE_ANNEAL_END}" ] && [ "${TEMPERATURE_ANNEAL_END}" != "none" ]; then
+  ANNEAL_FLAGS="--temperature_anneal_end=${TEMPERATURE_ANNEAL_END}"
+fi
+
 # ── Run training ─────────────────────────────────────────────────────────────
 
 python3 trainer/gemma_rl_trainer.py \
@@ -180,11 +198,14 @@ python3 trainer/gemma_rl_trainer.py \
   --grpo_passes="${GRPO_PASSES}" \
   --grpo_collect_episodes="${COLLECT_EPISODES}" \
   --grpo_num_generations="${NUM_GENERATIONS}" \
-  --grpo_max_completion_length=32 \
+  --grpo_max_completion_length="${MAX_COMPLETION_LENGTH}" \
   --eval_every=50 \
   --num_eval_episodes="${NUM_EVAL_EPISODES}" \
   --checkpoint_every=25 \
-  --temperature=0.7 \
+  --temperature="${TEMPERATURE}" \
+  ${ANNEAL_FLAGS} \
+  --epsilon="${EPSILON}" \
+  --epsilon_anneal_end="${EPSILON_ANNEAL_END}" \
   --max_seq_len="${MAX_SEQ_LEN}" \
   --use_4bit \
   --output_dir="${output_dir}" \
