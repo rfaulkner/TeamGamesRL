@@ -1257,7 +1257,24 @@ class HanabiRenderer(BaseStateRenderer):
     """
     normalized = text.strip().lower()
 
-    # Try keyword-based matching first for common action patterns.
+    # Try to extract a bare integer (the prompt asks for "action number only").
+    try:
+      raw_id = int(normalized)
+      for action_id, _ in legal_actions:
+        if action_id == raw_id:
+          return raw_id
+    except ValueError:
+      pass
+
+    # Try "action N" pattern.
+    action_match = re.search(r'\baction\s*(\d+)', normalized)
+    if action_match:
+      parsed_id = int(action_match.group(1))
+      for action_id, _ in legal_actions:
+        if action_id == parsed_id:
+          return parsed_id
+
+    # Try keyword-based matching for common action patterns.
     # "play card 2" or "play 2"
     play_match = re.search(r'\bplay\b.*?(\d+)', normalized)
     if play_match:
