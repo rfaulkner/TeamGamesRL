@@ -58,6 +58,7 @@ TEMPERATURE_ANNEAL_END="0.7"
 MAX_COMPLETION_LENGTH=20
 EPSILON="0.3"
 EPSILON_ANNEAL_END="0.0"
+REWARD_MODE="dense_chain"
 # ── 1. Determine profile first ───────────────────────────────────────────────
 
 PROFILE="full"
@@ -105,6 +106,7 @@ for arg in "$@"; do
     --max_completion_length=*) MAX_COMPLETION_LENGTH="${arg#*=}" ;;
     --epsilon=*)      EPSILON="${arg#*=}" ;;
     --epsilon_anneal_end=*) EPSILON_ANNEAL_END="${arg#*=}" ;;
+    --reward_mode=*|--reward_simulation_mode=*) REWARD_MODE="${arg#*=}" ;;
     --help|-h)
       echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=heuristic] [--extra...]"
       exit 0 ;;
@@ -156,6 +158,7 @@ echo "  Collect eps:  ${COLLECT_EPISODES}"
 echo "  Generations:  ${NUM_GENERATIONS}"
 echo "  Max Seq Len:  ${MAX_SEQ_LEN}"
 echo "  Temperature:  ${TEMPERATURE} -> ${TEMPERATURE_ANNEAL_END}"
+echo "  Reward mode:  ${REWARD_MODE}"
 echo "  Profile:      ${PROFILE}"
 echo "  Output dir:   ${output_dir}"
 echo "  Node:         $(hostname)"
@@ -206,6 +209,7 @@ python3 trainer/gemma_rl_trainer.py \
   ${ANNEAL_FLAGS} \
   --epsilon="${EPSILON}" \
   --epsilon_anneal_end="${EPSILON_ANNEAL_END}" \
+  --reward_simulation_mode="${REWARD_MODE}" \
   --max_seq_len="${MAX_SEQ_LEN}" \
   --use_4bit \
   --output_dir="${output_dir}" \
