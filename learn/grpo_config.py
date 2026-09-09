@@ -241,3 +241,49 @@ class GRPOConfig:
   pure policy at the end).  Set to ``None`` for constant epsilon.
   """
 
+  reward_blend_weight: float = 0.0
+  """Weight for blending game-outcome reward with the primary reward signal.
+
+  When > 0, the effective reward becomes::
+
+    r = (1 - w) * primary_reward + w * game_score / max_score
+
+  where ``primary_reward`` is determined by ``reward_simulation_mode`` (e.g.
+  dense_chain), ``game_score`` is the terminal Hanabi score from a heuristic
+  rollout to game end, and ``max_score`` is 25 for standard Hanabi.
+
+  This anchors the training signal to actual game outcomes, preventing
+  proxy reward hacking where the model maximizes the dense signal without
+  improving real play.  Set to 0.0 to disable (pure primary reward).
+  Recommended range: 0.2--0.5.
+  """
+
+  constrained_action_types: bool = False
+  """Force action-type diversity in GRPO completion groups.
+
+  When True, a fraction of the K completions per GRPO group are generated
+  with constrained decoding: the first token is forced to be one of
+  'Play', 'Discard', or 'Hint' to ensure all action types are represented.
+  The remaining completions are generated freely from the model's policy.
+
+  This prevents GRPO group collapse where all K completions map to the
+  same action type (e.g. all hints), which produces near-zero reward
+  variance and eliminates gradient signal.  Only affects Hanabi-like
+  games with distinct action types.  Set to False to disable.
+  """
+
+  llm_partner_response: bool = False
+  """Sample one LLM response as the partner before heuristic rollout.
+
+  When True and ``reward_simulation_mode`` is 'dense_chain', after
+  applying the current player's chosen action, the reward computation
+  samples ONE action from the frozen LLM policy for the partner's next
+  move before continuing with the heuristic rollout.  This closes the
+  train-eval gap caused by using ``SafePlayPlayer`` as the continuation
+  partner during training while evaluating with the LLM as both players.
+
+  Adds ~10-15% overhead per pass (one LLM forward pass per completion).
+  Uses frozen LoRA weights for the partner response.
+  Set to False to disable (pure heuristic continuation).
+  """
+

@@ -455,6 +455,7 @@ def evaluate_dense_chain(
     serialized_state: Optional[str] = None,
     horizon: int = 4,
     discount: float = 0.9,
+    llm_partner_response: bool = False,
 ) -> float:
   """Evaluate a chosen action plus a short heuristic continuation.
 
@@ -473,6 +474,11 @@ def evaluate_dense_chain(
   where r_0 is the dense reward for ``chosen_action`` and r_1..r_h
   are the dense rewards for the heuristic player's subsequent moves.
 
+  When ``llm_partner_response`` is True, the first continuation
+  turn (the partner's response to the chosen action) uses the
+  frozen LLM policy instead of SafePlayPlayer.  This captures
+  whether the partner can actually exploit hints or play setups.
+
   Args:
     runner: The ``GRPORunner`` instance (for environment and config).
     action_history: Action history leading to the current state.
@@ -482,6 +488,8 @@ def evaluate_dense_chain(
     horizon: Number of additional turns to simulate after the chosen
         action. Each turn's reward is discounted by ``discount``.
     discount: Discount factor gamma for future action rewards.
+    llm_partner_response: If True, use frozen LLM policy for the first
+        continuation turn (the partner's immediate response).
 
   Returns:
     The total discounted dense reward.
@@ -523,6 +531,7 @@ def evaluate_dense_chain(
 
   game = getattr(runner._env, 'game', None)
   gamma = discount
+  first_continuation = True
   for _ in range(horizon):
     if state.is_terminal():
       break
@@ -531,10 +540,20 @@ def evaluate_dense_chain(
     if not legal:
       break
 
-    # Heuristic selects the next action.
-    h_action = heuristic.select_action(state, current_player, game)
-    if h_action is None:
-      h_action = int(np.random.choice(legal))
+    # For the first continuation turn, optionally use the LLM
+    # (the partner's response to our action).
+    if first_continuation and llm_partner_response:
+      first_continuation = False
+      from learn.grpo_sampled import _sample_llm_partner_action  # pylint: disable=g-import-not-at-top
+      h_action = _sample_llm_partner_action(runner, state)
+      if h_action is None:
+        h_action = int(np.random.choice(legal))
+    else:
+      first_continuation = False
+      # Heuristic selects the next action.
+      h_action = heuristic.select_action(state, current_player, game)
+      if h_action is None:
+        h_action = int(np.random.choice(legal))
 
     # Compute dense reward for this continuation action.
     step_reward = evaluate_action_quality(

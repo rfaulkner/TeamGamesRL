@@ -271,6 +271,29 @@ flags.DEFINE_float(
     'Only used with --reward_simulation_mode=dense_chain. '
     'Higher values (closer to 1.0) weight future actions more equally.',
 )
+flags.DEFINE_float(
+    'reward_blend_weight',
+    0.0,
+    'Weight for blending game-outcome reward with primary reward signal. '
+    'Effective reward = (1-w)*primary + w*game_score/25. '
+    'Set > 0 to anchor training to actual game outcomes and prevent '
+    'proxy reward hacking. Recommended: 0.2-0.5. Default 0.0 (disabled).',
+)
+flags.DEFINE_bool(
+    'constrained_action_types',
+    False,
+    'Force action-type diversity in GRPO groups via constrained decoding. '
+    'A fraction of K completions will have their first token forced to '
+    'Play/Discard/Hint to ensure all action types are represented. '
+    'Prevents group collapse to a single action type.',
+)
+flags.DEFINE_bool(
+    'llm_partner_response',
+    False,
+    'Sample one LLM partner response (frozen weights) before heuristic '
+    'rollout in dense_chain reward computation. Closes the train-eval gap '
+    'from using SafePlayPlayer vs LLM as partner. Adds ~10-15%% overhead.',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -361,6 +384,9 @@ def main(argv: list[str]) -> None:
       'grpo_truncated_rollout_horizon': FLAGS.grpo_truncated_rollout_horizon,
       'reward_simulation_mode': FLAGS.reward_simulation_mode,
       'dense_chain_discount': FLAGS.dense_chain_discount,
+      'reward_blend_weight': FLAGS.reward_blend_weight,
+      'constrained_action_types': FLAGS.constrained_action_types,
+      'llm_partner_response': FLAGS.llm_partner_response,
       # REINFORCE-specific configuration.
       'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
       'baseline_window_size': FLAGS.baseline_window_size,
@@ -426,6 +452,9 @@ def main(argv: list[str]) -> None:
         temperature_anneal_end=FLAGS.temperature_anneal_end,
         epsilon=FLAGS.epsilon,
         epsilon_anneal_end=FLAGS.epsilon_anneal_end,
+        reward_blend_weight=FLAGS.reward_blend_weight,
+        constrained_action_types=FLAGS.constrained_action_types,
+        llm_partner_response=FLAGS.llm_partner_response,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

@@ -135,8 +135,10 @@ def collect_game_prompts(
       # game-ending action collapse (e.g. always playing cards in Hanabi)
       # and ensures longer, more diverse collection episodes.
       epsilon_explored = False
-      if (runner._current_epsilon > 0
-          and np.random.random() < runner._current_epsilon):
+      if (
+          runner._current_epsilon > 0
+          and np.random.random() < runner._current_epsilon
+      ):
         action_id = int(np.random.choice(legal_actions))
         epsilon_explored = True
 
@@ -313,6 +315,7 @@ def _simulate_with_heuristic(runner, state, horizon: int | None = None) -> None:
   """Play out remaining turns with a rule-based heuristic player."""
   try:
     from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+
     heuristic = SafePlayPlayer()
   except ImportError:
     logging.warning('Heuristic player unavailable — falling back to random.')
@@ -398,6 +401,249 @@ def _simulate_with_llm(runner, state, horizon: int | None = None) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Blended reward helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _classify_hanabi_action_type(state, action_id: int, player_id: int) -> str:
+  """Classify a Hanabi action as 'play', 'discard', or 'hint'.
+
+  Args:
+    state: The current game state.
+    action_id: The action to classify.
+    player_id: The acting player.
+
+  Returns:
+    One of 'play', 'discard', or 'hint'.
+  """
+  import re  # pylint: disable=g-import-not-at-top
+
+  action_str = state.action_to_string(player_id, action_id)
+  if re.match(r'\(Play \d+\)', action_str):
+    return 'play'
+  elif re.match(r'\(Discard \d+\)', action_str):
+    return 'discard'
+  else:
+    return 'hint'
+
+
+def _sample_llm_partner_action(runner, state) -> int | None:
+  """Sample one action from the frozen LLM policy for the current player.
+
+  Swaps in the frozen LoRA weights, generates a single response, parses
+  it to an action ID, then restores the live weights.  Returns None if
+  the state is terminal or no legal actions exist.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    state: The current game state (will NOT be modified).
+
+  Returns:
+    The selected action ID, or None if not applicable.
+  """
+  if state.is_terminal():
+    return None
+  current_player = state.current_player()
+  legal = state.legal_actions(current_player)
+  if not legal:
+    return None
+
+  # Render the state and legal actions for the partner.
+  state_text = runner._renderers[current_player].render_state(
+      state, current_player, runner._env.game
+  )
+  legal_actions_with_desc = runner._renderers[
+      current_player
+  ].render_legal_actions(state, current_player, runner._env.game)
+  legal_actions = [a for a, _ in legal_actions_with_desc]
+  action_descriptions = [d for _, d in legal_actions_with_desc]
+
+  prompt = runner._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+      state_text, legal_actions, action_descriptions
+  )
+
+  # Swap in frozen LoRA weights for partner inference.
+  live_lora_state = None
+  if runner._frozen_lora_state is not None:
+    live_lora_state = copy.deepcopy({
+        k: v
+        for k, v in runner._backend.model.named_parameters()
+        if v.requires_grad
+    })
+    for name, param in runner._backend.model.named_parameters():
+      if name in runner._frozen_lora_state:
+        param.data.copy_(runner._frozen_lora_state[name])
+
+  try:
+    with torch.no_grad():
+      response, _ = runner._backend.generate_with_logprobs(
+          prompt,
+          temperature=runner._current_temperature,
+          max_tokens=runner._config.max_completion_length,
+      )
+
+    partner_action = runner._renderers[current_player].parse_action(
+        response, legal_actions_with_desc
+    )
+    if partner_action is None:
+      partner_action = (
+          int(np.random.choice(legal_actions)) if legal_actions else 0
+      )
+  finally:
+    # Restore live LoRA weights.
+    if live_lora_state is not None:
+      for name, param in runner._backend.model.named_parameters():
+        if name in live_lora_state:
+          param.data.copy_(live_lora_state[name].data)
+
+  return partner_action
+
+
+def _heuristic_rollout_score(
+    runner, state, target_player: int, max_score: float = 25.0
+) -> float:
+  """Roll out the game to terminal with heuristic play, return game score.
+
+  Uses SafePlayPlayer if available, otherwise random legal actions.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    state: The current game state (will be modified in place).
+    target_player: The player whose score to return.
+    max_score: Maximum possible game score (25 for standard Hanabi).
+
+  Returns:
+    Normalized game score in [0, 1].
+  """
+  try:
+    from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+
+    heuristic = SafePlayPlayer()
+  except ImportError:
+    heuristic = None
+
+  game = getattr(runner._env, 'game', None)
+
+  while not state.is_terminal():
+    player = state.current_player()
+    legal = state.legal_actions(player)
+    if not legal:
+      break
+    if heuristic is not None:
+      action = heuristic.select_action(state, player, game)
+      if action is None:
+        action = int(np.random.choice(legal))
+    else:
+      action = int(np.random.choice(legal))
+    state.apply_action(action)
+
+  # Extract terminal score.
+  if state.is_terminal() and state.rewards() is not None:
+    score = float(state.rewards()[target_player])
+  elif hasattr(state, 'returns'):
+    try:
+      score = float(state.returns()[target_player])
+    except (IndexError, TypeError):
+      score = 0.0
+  else:
+    score = 0.0
+
+  return score / max_score
+
+
+def _get_target_token_ids(tokenizer, words: list[str]) -> list[int]:
+  """Extract initial token IDs for a list of words from a tokenizer."""
+  token_ids = set()
+  for word in words:
+    for variant in (
+        word,
+        ' ' + word,
+        '\n' + word,
+        word.lower(),
+        ' ' + word.lower(),
+    ):
+      ids = tokenizer.encode(variant, add_special_tokens=False)
+      if ids:
+        token_ids.add(ids[0])
+  return sorted(token_ids)
+
+
+class ActionTypeLogitsProcessor:
+  """Forces action-type diversity at the first generation token in GRPO groups.
+
+  For a group of K completions generated for each prompt, a subset of
+  completions have their first token restricted to specific action types
+  (Play, Discard, Hint), while the remaining completions are generated
+  freely from the model's unconstrained policy.
+
+  This operates directly on token logits during generation, so the
+  generated text and the evaluated action are 100% aligned.
+  """
+
+  def __init__(
+      self,
+      tokenizer,
+      num_generations: int,
+      forced_per_type: int = 2,
+  ):
+    self._tokenizer = tokenizer
+    self._k = num_generations
+    self._forced_per_type = forced_per_type
+
+    # Cache token IDs for each action type's opening token.
+    self._play_token_ids = _get_target_token_ids(tokenizer, ['Play'])
+    self._discard_token_ids = _get_target_token_ids(tokenizer, ['Discard'])
+    self._hint_token_ids = _get_target_token_ids(tokenizer, ['Hint'])
+
+    # Track prompt length to identify token 1.
+    self._prompt_len = None
+
+  def __call__(
+      self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+  ) -> torch.FloatTensor:
+    cur_len = input_ids.shape[1]
+
+    # Initialize or reset prompt length when a new generation batch starts.
+    if self._prompt_len is None or cur_len < self._prompt_len:
+      self._prompt_len = cur_len
+
+    # Only modify logits at the very first generated token (t = 1).
+    if cur_len != self._prompt_len:
+      return scores
+
+    batch_size = scores.shape[0]
+    n_forced = self._forced_per_type
+
+    # Slots within each group of K:
+    # [0 .. K - 3*n_forced - 1]: free policy
+    # [K - 3*n_forced .. K - 2*n_forced - 1]: forced Play
+    # [K - 2*n_forced .. K - n_forced - 1]: forced Discard
+    # [K - n_forced .. K - 1]: forced Hint
+    play_start = max(0, self._k - 3 * n_forced)
+    discard_start = max(0, self._k - 2 * n_forced)
+    hint_start = max(0, self._k - n_forced)
+
+    neg_inf = -float('inf')
+    for b in range(batch_size):
+      group_idx = b % self._k
+      target_ids = None
+      if play_start <= group_idx < discard_start and self._play_token_ids:
+        target_ids = self._play_token_ids
+      elif discard_start <= group_idx < hint_start and self._discard_token_ids:
+        target_ids = self._discard_token_ids
+      elif hint_start <= group_idx < self._k and self._hint_token_ids:
+        target_ids = self._hint_token_ids
+
+      if target_ids is not None:
+        mask = torch.full_like(scores[b], neg_inf)
+        for tid in target_ids:
+          mask[tid] = scores[b, tid]
+        scores[b] = mask
+
+    return scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # TRL-based GRPO training step
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -434,6 +680,7 @@ def _train_grpo_on_prompts(
     del kwargs
     rewards = []
     reward_cache = {}  # (prompt_text, action_id) -> reward tensor
+    _action_type_tracker = {}  # prompt_text -> {play, discard, hint, total}
     cache_hits = 0
     for i, completion in enumerate(completions):
       prompt_text = (
@@ -483,12 +730,53 @@ def _train_grpo_on_prompts(
           )
         continue
 
+      # ── Constrained action type diversity (diagnostic) ──
+      # Track action types per prompt group.  When enabled, log group
+      # diversity stats so we can measure collapse.  Actual constrained
+      # generation (prefix-forcing) must happen at the TRL generation
+      # level, NOT by substituting action_ids in the reward function,
+      # because substitution creates a mismatch between the generated
+      # text (which TRL backprops through) and the scored action.
+      if (
+          runner._config.constrained_action_types
+          and ser_state is not None
+          and legal_actions
+      ):
+        if prompt_text not in _action_type_tracker:
+          _action_type_tracker[prompt_text] = {
+              'play': 0,
+              'discard': 0,
+              'hint': 0,
+              'total': 0,
+          }
+        tracker = _action_type_tracker[prompt_text]
+        tracker['total'] += 1
+
+        _, cls_state = _deserialize_game_and_state(ser_state)
+        runner._env.set_state(cls_state)
+        action_type = _classify_hanabi_action_type(cls_state, action_id, p_id)
+        tracker[action_type] += 1
+
+        k = runner._config.num_generations
+        if tracker['total'] == k:
+          # Log group diversity at the end of each prompt group.
+          logging.info(
+              '[action_diversity] P%d group complete: '
+              'play=%d discard=%d hint=%d / K=%d',
+              p_id,
+              tracker['play'],
+              tracker['discard'],
+              tracker['hint'],
+              k,
+          )
+
       sim_mode = runner._config.reward_simulation_mode
 
       if sim_mode == 'dense':
         # Dense per-action reward: evaluate the immediate quality of
         # the chosen action without any forward simulation.
         from learn.action_reward import evaluate_action_quality  # pylint: disable=g-import-not-at-top
+
         if not parsed:
           reward = -0.3  # Parse failure penalty.
         else:
@@ -502,26 +790,65 @@ def _train_grpo_on_prompts(
               if eval_state.is_terminal():
                 break
               eval_state.apply_action(a)
-          reward = evaluate_action_quality(
-              eval_state, action_id, p_id
-          )
+          reward = evaluate_action_quality(eval_state, action_id, p_id)
 
       elif sim_mode == 'dense_chain':
-        # Dense rewards over a short heuristic continuation.
+        # Dense rewards over a short heuristic continuation,
+        # optionally blended with a heuristic rollout game score
+        # and/or using an LLM partner response.
         from learn.action_reward import evaluate_dense_chain  # pylint: disable=g-import-not-at-top
+
         if not parsed:
           reward = -0.3  # Parse failure penalty.
         else:
           horizon = runner._config.truncated_rollout_horizon or 4
-          discount = getattr(
-              runner._config, 'dense_chain_discount', 0.9
-          )
-          reward = evaluate_dense_chain(
-              runner, action_history, action_id, p_id,
+          discount = getattr(runner._config, 'dense_chain_discount', 0.9)
+          primary_reward = evaluate_dense_chain(
+              runner,
+              action_history,
+              action_id,
+              p_id,
               serialized_state=ser_state,
               horizon=horizon,
               discount=discount,
+              llm_partner_response=(runner._config.llm_partner_response),
           )
+
+          # ── Blend with heuristic rollout game score ──
+          blend_w = runner._config.reward_blend_weight
+          if blend_w > 0:
+            # Restore state, apply action, optionally get LLM partner
+            # response, then heuristic rollout to terminal.
+            if ser_state is not None:
+              _, blend_state = _deserialize_game_and_state(ser_state)
+              runner._env.set_state(blend_state)
+            else:
+              runner._env.reset()
+              blend_state = runner._env._state
+              for a in action_history:
+                if blend_state.is_terminal():
+                  break
+                blend_state.apply_action(a)
+              blend_state = runner._env._state
+
+            if not blend_state.is_terminal():
+              blend_state.apply_action(action_id)
+
+            # Optionally sample one LLM partner response.
+            if (
+                runner._config.llm_partner_response
+                and not blend_state.is_terminal()
+            ):
+              partner_action = _sample_llm_partner_action(runner, blend_state)
+              if partner_action is not None:
+                blend_state.apply_action(partner_action)
+
+            game_score_norm = _heuristic_rollout_score(
+                runner, blend_state, p_id
+            )
+            reward = (1 - blend_w) * primary_reward + blend_w * game_score_norm
+          else:
+            reward = primary_reward
 
       elif (
           runner._config.reward_num_simulations > 1
@@ -611,7 +938,44 @@ def _train_grpo_on_prompts(
       processing_class=runner._backend.tokenizer,
       train_dataset=_build_prompt_dataset(unique_prompts),
   )
-  trainer.train()
+  # ── Constrained action type generation ──
+  # When enabled, wrap model.generate to force action-type diversity
+  # (Play, Discard, Hint) on a subset of the K completions per group.
+  original_generate = runner._backend.model.generate
+  if runner._config.constrained_action_types:
+    forced = max(1, runner._config.num_generations // 8)
+    logging.info(
+        'Enabling constrained action generation: %d forced per type '
+        '(Play/Discard/Hint), %d free completions (K=%d)',
+        forced,
+        runner._config.num_generations - 3 * forced,
+        runner._config.num_generations,
+    )
+
+    def wrapped_generate(*args, **kwargs):
+      from transformers.generation.logits_process import LogitsProcessorList  # pylint: disable=g-import-not-at-top
+
+      processor = ActionTypeLogitsProcessor(
+          tokenizer=runner._backend.tokenizer,
+          num_generations=runner._config.num_generations,
+          forced_per_type=forced,
+      )
+      lp_list = kwargs.get('logits_processor', None)
+      if lp_list is None:
+        kwargs['logits_processor'] = LogitsProcessorList([processor])
+      else:
+        kwargs['logits_processor'] = LogitsProcessorList(
+            list(lp_list) + [processor]
+        )
+      return original_generate(*args, **kwargs)
+
+    runner._backend.model.generate = wrapped_generate
+
+  try:
+    trainer.train()
+  finally:
+    if runner._config.constrained_action_types:
+      runner._backend.model.generate = original_generate
 
   # Extract training metrics.
   pass_loss = 0.0
@@ -667,12 +1031,16 @@ def run_sampled(runner) -> None:
 
   logging.info(
       'Starting GRPO training: %d passes, %d episodes/pass, K=%d, '
-      'reward_sim=%s, horizon=%s',
+      'reward_sim=%s, horizon=%s, blend_w=%.2f, '
+      'constrained_actions=%s, llm_partner=%s',
       runner._config.passes,
       runner._config.collect_episodes,
       runner._config.num_generations,
       runner._config.reward_simulation_mode,
       runner._config.truncated_rollout_horizon,
+      runner._config.reward_blend_weight,
+      runner._config.constrained_action_types,
+      runner._config.llm_partner_response,
   )
 
   start_time = time.time()
@@ -685,6 +1053,7 @@ def run_sampled(runner) -> None:
     # Clear Hanabi state cache from previous pass (no-op for other games).
     try:
       from env.hanabi import hanabi_env as _hanabi_env  # pylint: disable=g-import-not-at-top
+
       _hanabi_env.clear_state_cache()
     except ImportError:
       pass
