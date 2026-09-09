@@ -59,6 +59,9 @@ MAX_COMPLETION_LENGTH=20
 EPSILON="0.3"
 EPSILON_ANNEAL_END="0.0"
 REWARD_MODE="dense_chain"
+REWARD_BLEND_WEIGHT="0.0"
+CONSTRAINED_ACTION_TYPES="false"
+LLM_PARTNER_RESPONSE="false"
 # ── 1. Determine profile first ───────────────────────────────────────────────
 
 PROFILE="full"
@@ -107,8 +110,11 @@ for arg in "$@"; do
     --epsilon=*)      EPSILON="${arg#*=}" ;;
     --epsilon_anneal_end=*) EPSILON_ANNEAL_END="${arg#*=}" ;;
     --reward_mode=*|--reward_simulation_mode=*) REWARD_MODE="${arg#*=}" ;;
+    --reward_blend_weight=*) REWARD_BLEND_WEIGHT="${arg#*=}" ;;
+    --constrained_action_types) CONSTRAINED_ACTION_TYPES="true" ;;
+    --llm_partner_response) LLM_PARTNER_RESPONSE="true" ;;
     --help|-h)
-      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=heuristic] [--extra...]"
+      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=MODE] [--reward_blend_weight=W] [--constrained_action_types] [--llm_partner_response] [--extra...]"
       exit 0 ;;
     --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
@@ -210,6 +216,9 @@ python3 trainer/gemma_rl_trainer.py \
   --epsilon="${EPSILON}" \
   --epsilon_anneal_end="${EPSILON_ANNEAL_END}" \
   --reward_simulation_mode="${REWARD_MODE}" \
+  --reward_blend_weight="${REWARD_BLEND_WEIGHT}" \
+  --constrained_action_types="${CONSTRAINED_ACTION_TYPES}" \
+  --llm_partner_response="${LLM_PARTNER_RESPONSE}" \
   --max_seq_len="${MAX_SEQ_LEN}" \
   --use_4bit \
   --output_dir="${output_dir}" \
