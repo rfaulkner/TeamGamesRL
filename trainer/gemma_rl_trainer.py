@@ -288,6 +288,15 @@ flags.DEFINE_bool(
     'Prevents group collapse to a single action type.',
 )
 flags.DEFINE_bool(
+    'strategic_action_selection',
+    False,
+    'Use game-state-aware strategic action injection in GRPO groups. '
+    'Replaces naive first-token forcing with a strategic selector that '
+    'forces specific complete actions (safe plays, risky plays, smart '
+    'discards, diverse hints) based on the full game state. '
+    'Takes precedence over --constrained_action_types when both are True.',
+)
+flags.DEFINE_bool(
     'llm_partner_response',
     False,
     'Sample one LLM partner response (frozen weights) before heuristic '
@@ -386,6 +395,7 @@ def main(argv: list[str]) -> None:
       'dense_chain_discount': FLAGS.dense_chain_discount,
       'reward_blend_weight': FLAGS.reward_blend_weight,
       'constrained_action_types': FLAGS.constrained_action_types,
+      'strategic_action_selection': FLAGS.strategic_action_selection,
       'llm_partner_response': FLAGS.llm_partner_response,
       # REINFORCE-specific configuration.
       'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
@@ -454,6 +464,7 @@ def main(argv: list[str]) -> None:
         epsilon_anneal_end=FLAGS.epsilon_anneal_end,
         reward_blend_weight=FLAGS.reward_blend_weight,
         constrained_action_types=FLAGS.constrained_action_types,
+        strategic_action_selection=FLAGS.strategic_action_selection,
         llm_partner_response=FLAGS.llm_partner_response,
     )
     # ── Tiny Hanabi-specific tuning ──

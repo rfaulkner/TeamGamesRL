@@ -272,6 +272,26 @@ class GRPOConfig:
   games with distinct action types.  Set to False to disable.
   """
 
+  strategic_action_selection: bool = False
+  """Use game-state-aware strategic action injection in GRPO groups.
+
+  When True, replaces the naive ``constrained_action_types`` first-token
+  forcing with a strategic selector that uses the full game state to
+  force *specific complete actions* into GRPO completion groups:
+
+    - **Known-safe plays**: Cards fully hinted as playable (always included).
+    - **Risky plays**: Partially-hinted cards with playability potential.
+    - **Smart discards**: Dead or unhinted cards (safe to discard).
+    - **Diverse hints**: Different colour/rank hints targeting useful cards.
+
+  This addresses GRPO group collapse where all K completions map to the
+  same degenerate action (e.g., always 'Hint rank 1') by ensuring the
+  group contains high-quality actions the model can learn from.
+
+  Takes precedence over ``constrained_action_types`` when both are True.
+  Only affects Hanabi games with observable card knowledge.
+  """
+
   llm_partner_response: bool = False
   """Sample one LLM response as the partner before heuristic rollout.
 

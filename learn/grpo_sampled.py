@@ -643,6 +643,158 @@ class ActionTypeLogitsProcessor:
     return scores
 
 
+class StrategicActionLogitsProcessor:
+  """Forces strategic actions into GRPO completion groups during generation.
+
+  For each prompt in the batch (replicated K times), analyzes the game state
+  to select high-value strategic actions across priority tiers:
+    1. Known-safe plays (card fully hinted and playable)
+    2. Risky plays (partially hinted, good playability potential)
+    3. Smart discards (known dead or oldest unhinted)
+    4. Diverse hints (touching playable partner cards, diverse types)
+
+  For each selected action, forces the full token sequence token-by-token
+  into one completion slot within the group of K, followed by EOS.
+  The remaining slots are left for unconstrained policy generation.
+  """
+
+  def __init__(
+      self,
+      tokenizer,
+      runner,
+      num_generations: int,
+      max_forced_fraction: float = 0.5,
+  ):
+    self._tokenizer = tokenizer
+    self._runner = runner
+    self._k = num_generations
+    self._max_forced_fraction = max_forced_fraction
+
+    # Track prompt length to identify the start of generation (step 0).
+    self._prompt_len = None
+    # Map from batch_index (0 .. batch_size - 1) -> list of forced token IDs.
+    self._forced_tokens_by_batch: dict[int, list[int]] = {}
+    self._eos_token_id = tokenizer.eos_token_id
+    self._pad_token_id = (
+        getattr(tokenizer, 'pad_token_id', None) or self._eos_token_id
+    )
+
+  def _prepare_forced_tokens(
+      self, input_ids: torch.LongTensor
+  ) -> dict[int, list[int]]:
+    """Analyze game states for prompts in the batch and determine forced tokens."""
+    forced_map: dict[int, list[int]] = {}
+    batch_size = input_ids.shape[0]
+    num_groups = max(1, batch_size // self._k)
+
+    for g in range(num_groups):
+      group_start = g * self._k
+      if group_start >= batch_size:
+        break
+
+      # Decode prompt text to look up metadata.
+      prompt_tokens = input_ids[group_start, : self._prompt_len]
+      prompt_text = self._tokenizer.decode(
+          prompt_tokens, skip_special_tokens=True
+      ).strip()
+
+      metadata = self._runner._prompt_metadata.get(prompt_text, None)
+      if metadata is None:
+        # Fallback: search prompt_metadata by prefix or substring.
+        for k, v in self._runner._prompt_metadata.items():
+          if k.strip() == prompt_text or prompt_text in k or k in prompt_text:
+            metadata = v
+            break
+
+      if not metadata or 'serialized_state' not in metadata:
+        continue
+
+      ser_state = metadata['serialized_state']
+      p_id = metadata.get('player_id', 0)
+      legal_actions_desc = metadata.get('legal_actions_desc', [])
+      if not legal_actions_desc:
+        continue
+
+      try:
+        from env.hanabi.hanabi_env import deserialize_game_and_state  # pylint: disable=g-import-not-at-top
+        _, state = deserialize_game_and_state(ser_state)
+      except (ImportError, Exception):
+        _, state = _deserialize_game_and_state(ser_state)
+
+      try:
+        from learn.strategic_actions import analyze_strategic_actions  # pylint: disable=g-import-not-at-top
+        plan = analyze_strategic_actions(
+            state=state,
+            player_id=p_id,
+            legal_actions_desc=legal_actions_desc,
+            num_generations=self._k,
+            max_forced_fraction=self._max_forced_fraction,
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logging.warning('Failed to analyze strategic actions: %s', e)
+        continue
+
+      if not plan.forced_action_texts:
+        continue
+
+      # Assign forced actions to the last M slots of this prompt's group.
+      m_forced = len(plan.forced_action_texts)
+      for m_idx, action_text in enumerate(plan.forced_action_texts):
+        slot = self._k - m_forced + m_idx
+        b_idx = group_start + slot
+        if b_idx >= batch_size:
+          break
+
+        # Tokenize with leading space first (standard continuation after
+        # prompt colon).
+        tokens = self._tokenizer.encode(
+            ' ' + action_text, add_special_tokens=False
+        )
+        if not tokens:
+          tokens = self._tokenizer.encode(action_text, add_special_tokens=False)
+        if tokens:
+          forced_map[b_idx] = tokens
+
+    return forced_map
+
+  def __call__(
+      self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+  ) -> torch.FloatTensor:
+    cur_len = input_ids.shape[1]
+
+    # Initialize on the first generation token (or reset if batch restarted).
+    if self._prompt_len is None or cur_len < self._prompt_len:
+      self._prompt_len = cur_len
+      self._forced_tokens_by_batch = self._prepare_forced_tokens(input_ids)
+
+    step = cur_len - self._prompt_len
+    if step < 0 or not self._forced_tokens_by_batch:
+      return scores
+
+    neg_inf = -float('inf')
+    for b, target_token_ids in self._forced_tokens_by_batch.items():
+      if b >= scores.shape[0]:
+        continue
+
+      if step < len(target_token_ids):
+        # Force the next token in the sequence.
+        target_tid = target_token_ids[step]
+        scores[b, :] = neg_inf
+        scores[b, target_tid] = 0.0
+      else:
+        # Action string complete: force EOS (or PAD) to terminate generation.
+        term_id = (
+            self._eos_token_id
+            if self._eos_token_id is not None
+            else self._pad_token_id
+        )
+        if term_id is not None:
+          scores[b, :] = neg_inf
+          scores[b, term_id] = 0.0
+
+    return scores
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # TRL-based GRPO training step
 # ═══════════════════════════════════════════════════════════════════════
@@ -738,7 +890,10 @@ def _train_grpo_on_prompts(
       # because substitution creates a mismatch between the generated
       # text (which TRL backprops through) and the scored action.
       if (
-          runner._config.constrained_action_types
+          (
+              runner._config.constrained_action_types
+              or runner._config.strategic_action_selection
+          )
           and ser_state is not None
           and legal_actions
       ):
@@ -938,11 +1093,35 @@ def _train_grpo_on_prompts(
       processing_class=runner._backend.tokenizer,
       train_dataset=_build_prompt_dataset(unique_prompts),
   )
-  # ── Constrained action type generation ──
-  # When enabled, wrap model.generate to force action-type diversity
-  # (Play, Discard, Hint) on a subset of the K completions per group.
+  # ── Constrained / strategic action generation ──
+  # When enabled, wrap model.generate to force action diversity.
   original_generate = runner._backend.model.generate
-  if runner._config.constrained_action_types:
+  if runner._config.strategic_action_selection:
+    logging.info(
+        'Enabling strategic action selection: state-aware action injection '
+        '(safe plays, risky plays, smart discards, diverse hints) for K=%d',
+        runner._config.num_generations,
+    )
+
+    def wrapped_generate(*args, **kwargs):
+      from transformers.generation.logits_process import LogitsProcessorList  # pylint: disable=g-import-not-at-top
+
+      processor = StrategicActionLogitsProcessor(
+          tokenizer=runner._backend.tokenizer,
+          runner=runner,
+          num_generations=runner._config.num_generations,
+      )
+      lp_list = kwargs.get('logits_processor', None)
+      if lp_list is None:
+        kwargs['logits_processor'] = LogitsProcessorList([processor])
+      else:
+        kwargs['logits_processor'] = LogitsProcessorList(
+            list(lp_list) + [processor]
+        )
+      return original_generate(*args, **kwargs)
+
+    runner._backend.model.generate = wrapped_generate
+  elif runner._config.constrained_action_types:
     forced = max(1, runner._config.num_generations // 8)
     logging.info(
         'Enabling constrained action generation: %d forced per type '
@@ -974,7 +1153,10 @@ def _train_grpo_on_prompts(
   try:
     trainer.train()
   finally:
-    if runner._config.constrained_action_types:
+    if (
+        runner._config.strategic_action_selection
+        or runner._config.constrained_action_types
+    ):
       runner._backend.model.generate = original_generate
 
   # Extract training metrics.
@@ -1032,7 +1214,7 @@ def run_sampled(runner) -> None:
   logging.info(
       'Starting GRPO training: %d passes, %d episodes/pass, K=%d, '
       'reward_sim=%s, horizon=%s, blend_w=%.2f, '
-      'constrained_actions=%s, llm_partner=%s',
+      'constrained_actions=%s, strategic_actions=%s, llm_partner=%s',
       runner._config.passes,
       runner._config.collect_episodes,
       runner._config.num_generations,
@@ -1040,6 +1222,7 @@ def run_sampled(runner) -> None:
       runner._config.truncated_rollout_horizon,
       runner._config.reward_blend_weight,
       runner._config.constrained_action_types,
+      runner._config.strategic_action_selection,
       runner._config.llm_partner_response,
   )
 
