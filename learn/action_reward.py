@@ -21,7 +21,10 @@ as reward, this module evaluates the *immediate quality* of each action:
     invalid play (life token lost), +1.5 if the play completes a colour
     stack (rank 5, which also regains an info token).
   - **Discard**: Ranges from +0.3 (dead card = already played or duplicate)
-    to -0.7 (discarding a currently playable card).
+    to -1.0 (discarding a hinted card known to be playable).  Intermediate
+    penalties apply for discarding last copies of needed cards (-0.5 to
+    -0.8 depending on hint status) and partially-playable hinted cards
+    (-0.3).  Discarding unhinted non-critical cards gives +0.1.
   - **Hint**: Reward scales with the information gain delivered to the
     partner, with a bonus if the hint enables an immediate play.
   - **Parse failure**: -0.3 penalty when the LLM output cannot be parsed
@@ -187,6 +190,58 @@ def _evaluate_play(state, action_id: int) -> float:
 # =============================================================================
 
 
+def _card_playability_from_knowledge(
+    card_knowledge: list[tuple[str, str]],
+    card_pos: int,
+    fireworks: dict[str, int],
+) -> tuple[bool, float]:
+  """Check if a card could be playable based on the player's own knowledge.
+
+  Uses the player's card knowledge (from hints) to assess whether the
+  card at ``card_pos`` might be playable.  This is the player's
+  *subjective* view -- they can't see the card, only what hints have
+  told them.
+
+  Args:
+    card_knowledge: Per-card ``(possible_colors, possible_ranks)``
+        tuples from the player's observation.
+    card_pos: The card's position in hand (0-indexed).
+    fireworks: Current firework heights per colour.
+
+  Returns:
+    A tuple of ``(is_hinted, playable_fraction)``:
+      - ``is_hinted``: True if the card has received at least one hint
+        (i.e., knowledge is narrower than the full 5 colors × 5 ranks).
+      - ``playable_fraction``: Fraction of remaining (color, rank)
+        possibilities that would be immediately playable.  0.0 if
+        unhinted or no playable possibilities.
+  """
+  if card_pos >= len(card_knowledge):
+    return False, 0.0
+
+  colors, ranks = card_knowledge[card_pos]
+
+  # Unhinted = all 5 colors and all 5 ranks still possible.
+  is_hinted = not (len(colors) >= 5 and len(ranks) >= 5)
+
+  if not is_hinted:
+    return False, 0.0
+
+  # Count how many (color, rank) combos are playable.
+  total_combos = len(colors) * len(ranks)
+  if total_combos == 0:
+    return True, 0.0
+
+  playable_combos = 0
+  for c in colors:
+    needed_rank = fireworks.get(c, 0) + 1
+    for r in ranks:
+      if int(r) == needed_rank:
+        playable_combos += 1
+
+  return True, playable_combos / total_combos
+
+
 def _evaluate_discard(
     state,
     action_id: int,
@@ -199,7 +254,13 @@ def _evaluate_discard(
     - Is the card already played (dead)? -> safe discard.
     - Is it the last copy of a still-needed card? -> critical loss.
     - Is it currently playable? -> wasted opportunity.
+    - Was it hinted and potentially playable? -> penalise wasting hints.
     - Otherwise: routine discard.
+
+  The knowledge-aware penalties address the *hint-then-discard* degenerate
+  loop: if the team invested information tokens to hint a card and the
+  player discards it anyway, the penalty is much harsher than discarding
+  an unhinted card.
 
   Args:
     state: The pre-action state.
@@ -208,16 +269,24 @@ def _evaluate_discard(
     card_pos: The card's position in hand (0-indexed).
 
   Returns:
-    A reward in [-0.7, +0.3].
+    A reward in [-1.0, +0.3].
   """
   # We need to know the actual card being discarded.
   # The acting player can't see their own cards, but the *state* knows.
   # We clone and inspect the discard pile to identify the card.
-  score_before = state.score()
   fireworks = _parse_fireworks_from_state(state, player_id)
 
   sim = state.clone()
   sim.apply_action(action_id)
+
+  # ── Knowledge-aware penalty ──
+  # Check if the player had hints about this card and whether those
+  # hints indicate the card could be playable.
+  obs_str = state.observation_string(player_id)
+  card_knowledge = _CARD_KNOWLEDGE_RE.findall(obs_str)
+  is_hinted, playable_frac = _card_playability_from_knowledge(
+      card_knowledge, card_pos, fireworks
+  )
 
   # Identify the discarded card by diffing the observation.
   # After a discard, the card appears in the discard pile.
@@ -232,11 +301,14 @@ def _evaluate_discard(
   # Case 1: Card is already played (rank <= firework height).
   fw_height = fireworks.get(card_color, 0)
   if card_rank <= fw_height:
-    return 0.3  # Dead card -- excellent discard.
+    return 0.3  # Dead card -- excellent discard (even if hinted).
 
   # Case 2: Card is currently playable (rank == firework height + 1).
   if card_rank == fw_height + 1:
-    return -0.7  # Discarding a playable card.
+    if is_hinted and playable_frac >= 0.5:
+      # Player had strong hints suggesting playability -- severe penalty.
+      return -1.0
+    return -0.7  # Discarding a playable card without good hints.
 
   # Case 3: Card is the last copy of a still-needed card.
   remaining = _count_remaining_copies(
@@ -244,9 +316,20 @@ def _evaluate_discard(
   )
   if remaining == 0:
     # This was the last copy and we just discarded it.
+    if is_hinted:
+      return -0.8  # Hinted last copy -- team invested info tokens.
     return -0.5  # Permanently reduces maximum achievable score.
 
-  # Case 4: Card has other copies remaining.
+  # Case 4: Hinted card with playable potential (not yet playable,
+  # but knowledge suggests it could be useful soon).
+  if is_hinted and playable_frac > 0:
+    return -0.3  # Wasting a partially-useful hinted card.
+
+  # Case 5: Hinted card with no playable potential.
+  if is_hinted:
+    return 0.0  # Neutral -- hinted but not useful right now.
+
+  # Case 6: Unhinted card with other copies remaining.
   # Mildly positive -- regains info token, not critical.
   return 0.1
 
