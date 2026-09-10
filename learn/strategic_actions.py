@@ -506,8 +506,8 @@ def analyze_strategic_actions(
     state,
     player_id: int,
     legal_actions_desc: list[tuple[int, str]],
-    num_generations: int = 16,
-    max_forced_fraction: float = 0.5,
+    num_generations: int = 8,
+    max_forced_fraction: float = 1.0,
 ) -> StrategicActionPlan:
   """Analyse game state and select strategic actions for a GRPO group.
 
@@ -516,7 +516,7 @@ def analyze_strategic_actions(
   each tier for forced inclusion in the GRPO completion group.
 
   The number of forced actions is capped at ``max_forced_fraction * K``
-  to leave enough free slots for the model's own policy exploration.
+  (default 1.0 = 100% strategic actions in early training).
 
   Args:
     state: The current Hanabi game state (must support
@@ -527,7 +527,7 @@ def analyze_strategic_actions(
         from ``render_legal_actions()``.
     num_generations: Total number of completions per GRPO group (K).
     max_forced_fraction: Maximum fraction of K that can be forced
-        (default 0.5 = at most half the group).
+        (default 1.0 = all slots can be strategic actions).
 
   Returns:
     A ``StrategicActionPlan`` with selected actions per tier.
@@ -552,9 +552,7 @@ def analyze_strategic_actions(
   safe_plays = _find_known_safe_plays(
       card_knowledge, fireworks, play_actions
   )
-  # Cap at 2 safe plays (usually there's at most 1-2).
-  safe_plays = safe_plays[:min(2, max_forced)]
-
+  safe_plays = safe_plays[:min(len(safe_plays), max_forced)]
   remaining = max_forced - len(safe_plays)
 
   # ── Tier 2: Risky plays ──
@@ -571,17 +569,29 @@ def analyze_strategic_actions(
   if remaining > 0:
     smart_discards = _find_smart_discards(
         state, player_id, card_knowledge, fireworks, discard_actions,
-        max_discards=min(2, remaining),
+        max_discards=min(3, remaining),
     )
     remaining -= len(smart_discards)
 
-  # ── Tier 4: Diverse hints ──
+  # ── Tier 4: Diverse hints (fills remaining slots with distinct hints) ──
   diverse_hints = []
   if remaining > 0:
     diverse_hints = _find_diverse_hints(
         state, player_id, obs_string, fireworks, hint_actions,
-        max_hints=min(3, remaining),
+        max_hints=remaining,
     )
+    remaining -= len(diverse_hints)
+
+  # ── Overflow: If hints didn't use all slots, fill with more discards ──
+  if remaining > 0 and discard_actions:
+    extra_discards = _find_smart_discards(
+        state, player_id, card_knowledge, fireworks, discard_actions,
+        max_discards=len(smart_discards) + remaining,
+    )
+    for aid in extra_discards:
+      if aid not in smart_discards and remaining > 0:
+        smart_discards.append(aid)
+        remaining -= 1
 
   plan = StrategicActionPlan(
       known_safe_plays=safe_plays,

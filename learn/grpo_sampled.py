@@ -1110,6 +1110,9 @@ def _train_grpo_on_prompts(
           tokenizer=runner._backend.tokenizer,
           runner=runner,
           num_generations=runner._config.num_generations,
+          max_forced_fraction=getattr(
+              runner._config, 'strategic_action_forced_ratio', 1.0
+          ),
       )
       lp_list = kwargs.get('logits_processor', None)
       if lp_list is None:

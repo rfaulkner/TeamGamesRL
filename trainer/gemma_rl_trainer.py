@@ -296,6 +296,12 @@ flags.DEFINE_bool(
     'discards, diverse hints) based on the full game state. '
     'Takes precedence over --constrained_action_types when both are True.',
 )
+flags.DEFINE_float(
+    'strategic_action_forced_ratio',
+    1.0,
+    'Fraction of K completions to force with strategic actions (0.0 to 1.0). '
+    'Default 1.0 (100% strategic actions in early training).',
+)
 flags.DEFINE_bool(
     'llm_partner_response',
     False,
@@ -396,6 +402,7 @@ def main(argv: list[str]) -> None:
       'reward_blend_weight': FLAGS.reward_blend_weight,
       'constrained_action_types': FLAGS.constrained_action_types,
       'strategic_action_selection': FLAGS.strategic_action_selection,
+      'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
       'llm_partner_response': FLAGS.llm_partner_response,
       # REINFORCE-specific configuration.
       'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
@@ -465,6 +472,7 @@ def main(argv: list[str]) -> None:
         reward_blend_weight=FLAGS.reward_blend_weight,
         constrained_action_types=FLAGS.constrained_action_types,
         strategic_action_selection=FLAGS.strategic_action_selection,
+        strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
         llm_partner_response=FLAGS.llm_partner_response,
     )
     # ── Tiny Hanabi-specific tuning ──

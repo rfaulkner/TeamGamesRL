@@ -292,6 +292,14 @@ class GRPOConfig:
   Only affects Hanabi games with observable card knowledge.
   """
 
+  strategic_action_forced_ratio: float = 1.0
+  """Fraction of K completions to force with strategic actions (0.0 to 1.0).
+
+  Defaults to 1.0 (100% strategic actions in early training).  Can be
+  reduced or annealed in later experiments to gradually transfer control
+  to the model's learned policy.
+  """
+
   llm_partner_response: bool = False
   """Sample one LLM response as the partner before heuristic rollout.
 
