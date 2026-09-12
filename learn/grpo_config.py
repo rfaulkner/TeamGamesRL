@@ -294,10 +294,41 @@ class GRPOConfig:
   When True, all actions in a group share the same rollout seed sequence
   (derived from the prompt and pass index), so partner randomness becomes
   common-mode and largely cancels in the within-group contrast.
-  Cancellation is partial -- different actions lead to different states,
-  after which the RNG streams desynchronise -- but it is strictly better
-  than independent seeds and costs nothing.
+  Cancellation is in practice small -- different actions lead to different
+  states, which present different hint lists, so the RNG streams
+  desynchronise on the very first hint.  A simulated probe measured only
+  ~3% of the within-group comparison noise removed.  It costs nothing, so
+  it is left on by default, but do not expect it to matter.
 
+  Only used when ``reward_blend_weight > 0``.
+  """
+
+  reward_survival_exponent: float = 0.0
+  """Convex penalty on spent life tokens, applied to the rollout score.
+
+      game_score_norm *= (lives_after / max_life_tokens) ** exponent
+
+  Motivation (measured, not assumed).  ``SafePlayPlayer`` plays a card only
+  when its knowledge narrows to exactly one colour and one rank *and* that
+  rank is next on the firework, so **it can never lose a life**.  Every
+  other priority is a discard or a hint.  Life tokens therefore never bind
+  during a rollout, and the rollout score is provably invariant to how many
+  lives remain:
+
+      rollout value, 3 lives -> 2 lives : +0.0000
+      rollout value, 2 lives -> 1 life  : +0.0000
+      rollout value, 1 life  -> 0 lives : -0.1890   (terminal, score 0)
+
+  So the reward is blind to the first two bombs and concentrates the entire
+  penalty on the third.  The policy can learn "do not play at 1 life" but
+  has no gradient at all for "do not get to 1 life" -- which matches the
+  observed 64-98% bomb-out rates.
+
+  This factor supplies the missing gradient and is convex, unlike the
+  linear ``lives / max_lives`` in ``HanabiState.state_value()``.  At
+  exponent 2.0 the multipliers are 1.00 / 0.44 / 0.11 for 3 / 2 / 1 lives.
+
+  Default 0.0 disables it (``x ** 0 == 1``), preserving existing behaviour.
   Only used when ``reward_blend_weight > 0``.
   """
 

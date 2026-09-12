@@ -1091,6 +1091,14 @@ def _train_grpo_on_prompts(
             if not blend_state.is_terminal():
               blend_state.apply_action(action_id)
 
+            # Lives remaining *because of this action*, captured before any
+            # partner move so the factor below is attributable to the
+            # candidate action alone.
+            survival_exp = runner._config.reward_survival_exponent
+            lives_after = None
+            if survival_exp > 0 and hasattr(blend_state, 'life_tokens'):
+              lives_after = blend_state.life_tokens()
+
             # Optionally sample one LLM partner response.  This stays
             # outside the rollout sampling loop -- it is an LLM forward
             # pass, orders of magnitude more expensive than a rollout.
@@ -1118,6 +1126,24 @@ def _train_grpo_on_prompts(
                 num_samples=runner._config.reward_rollout_samples,
                 seed=group_seed,
             )
+
+            # ── Convex survival factor ──
+            # SafePlayPlayer never loses a life (it plays only cards it
+            # KNOWS are playable), so the rollout score is provably
+            # invariant to lives remaining: 3->2 and 2->1 both move it by
+            # exactly 0.0000.  The reward is therefore blind to the first
+            # two bombs and dumps the whole penalty on the third.  This
+            # restores the missing gradient.
+            if lives_after is not None:
+              max_lives = 3
+              game_obj = getattr(runner._env, 'game', None)
+              params = getattr(game_obj, '_params', None)
+              if isinstance(params, dict):
+                max_lives = params.get('max_life_tokens', 3)
+              game_score_norm *= (
+                  max(lives_after, 0) / max(max_lives, 1)
+              ) ** survival_exp
+
             reward = (1 - blend_w) * primary_reward + blend_w * game_score_norm
           else:
             reward = primary_reward

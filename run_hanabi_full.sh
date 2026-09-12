@@ -62,6 +62,7 @@ REWARD_MODE="dense_chain"
 REWARD_BLEND_WEIGHT="0.0"
 REWARD_ROLLOUT_SAMPLES="1"
 REWARD_ROLLOUT_COMMON_SEED="true"
+REWARD_SURVIVAL_EXPONENT="0.0"
 CONSTRAINED_ACTION_TYPES="false"
 STRATEGIC_ACTION_SELECTION="false"
 STRATEGIC_ACTION_FORCED_RATIO="1.0"
@@ -118,6 +119,7 @@ for arg in "$@"; do
     --reward_rollout_samples=*) REWARD_ROLLOUT_SAMPLES="${arg#*=}" ;;
     --reward_rollout_common_seed=*) REWARD_ROLLOUT_COMMON_SEED="${arg#*=}" ;;
     --no_reward_rollout_common_seed) REWARD_ROLLOUT_COMMON_SEED="false" ;;
+    --reward_survival_exponent=*) REWARD_SURVIVAL_EXPONENT="${arg#*=}" ;;
     --constrained_action_types) CONSTRAINED_ACTION_TYPES="true" ;;
     --strategic_action_selection) STRATEGIC_ACTION_SELECTION="true" ;;
     --strategic_action_forced_ratio=*) STRATEGIC_ACTION_FORCED_RATIO="${arg#*=}" ;;
@@ -228,6 +230,7 @@ python3 trainer/gemma_rl_trainer.py \
   --reward_blend_weight="${REWARD_BLEND_WEIGHT}" \
   --reward_rollout_samples="${REWARD_ROLLOUT_SAMPLES}" \
   --reward_rollout_common_seed="${REWARD_ROLLOUT_COMMON_SEED}" \
+  --reward_survival_exponent="${REWARD_SURVIVAL_EXPONENT}" \
   --constrained_action_types="${CONSTRAINED_ACTION_TYPES}" \
   --strategic_action_selection="${STRATEGIC_ACTION_SELECTION}" \
   --strategic_action_forced_ratio="${STRATEGIC_ACTION_FORCED_RATIO}" \

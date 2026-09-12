@@ -299,6 +299,16 @@ flags.DEFINE_bool(
     'partner randomness from the within-group comparison that GRPO '
     'actually differentiates. Free variance reduction; default True.',
 )
+flags.DEFINE_float(
+    'reward_survival_exponent',
+    0.0,
+    'Convex penalty on spent life tokens: the rollout score is multiplied '
+    'by (lives_after / max_life_tokens) ** exponent. SafePlayPlayer never '
+    'bombs, so a rollout is provably invariant to lives remaining -- the '
+    'reward is blind to the first two bombs and puts the whole penalty on '
+    'the third. This restores the missing gradient. 2.0 gives multipliers '
+    '1.00 / 0.44 / 0.11 for 3 / 2 / 1 lives. Default 0.0 (disabled).',
+)
 flags.DEFINE_bool(
     'constrained_action_types',
     False,
@@ -422,6 +432,7 @@ def main(argv: list[str]) -> None:
       'reward_blend_weight': FLAGS.reward_blend_weight,
       'reward_rollout_samples': FLAGS.reward_rollout_samples,
       'reward_rollout_common_seed': FLAGS.reward_rollout_common_seed,
+      'reward_survival_exponent': FLAGS.reward_survival_exponent,
       'constrained_action_types': FLAGS.constrained_action_types,
       'strategic_action_selection': FLAGS.strategic_action_selection,
       'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
@@ -494,6 +505,7 @@ def main(argv: list[str]) -> None:
         reward_blend_weight=FLAGS.reward_blend_weight,
         reward_rollout_samples=FLAGS.reward_rollout_samples,
         reward_rollout_common_seed=FLAGS.reward_rollout_common_seed,
+        reward_survival_exponent=FLAGS.reward_survival_exponent,
         constrained_action_types=FLAGS.constrained_action_types,
         strategic_action_selection=FLAGS.strategic_action_selection,
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
