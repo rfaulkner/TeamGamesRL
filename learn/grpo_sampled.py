@@ -22,7 +22,9 @@ All public functions accept a ``runner`` parameter — the ``GRPORunner``
 instance that holds shared state (env, backend, config, callbacks).
 """
 
+import contextlib
 import copy
+import dataclasses
 import os
 import time
 import zlib
@@ -428,19 +430,67 @@ def _classify_hanabi_action_type(state, action_id: int, player_id: int) -> str:
     return 'hint'
 
 
-def _sample_llm_partner_action(runner, state) -> int | None:
-  """Sample one action from the frozen LLM policy for the current player.
+@contextlib.contextmanager
+def _frozen_lora_active(runner):
+  """Temporarily activate the frozen LoRA snapshot for policy inference.
 
-  Swaps in the frozen LoRA weights, generates a single response, parses
-  it to an action ID, then restores the live weights.  Returns None if
-  the state is terminal or no legal actions exist.
+  Partner / continuation moves must be sampled from a *stable* policy, not
+  the one being updated mid-pass, so ``run_sampled`` snapshots the LoRA
+  weights at the top of each pass into ``runner._frozen_lora_state``.  This
+  context manager swaps that snapshot in and restores the live weights on
+  exit.
+
+  Reentrant: nested ``with`` blocks are no-ops, so a caller can wrap a whole
+  multi-turn rollout without every inner sampling call re-cloning the
+  adapter.  Swapping clones every trainable parameter, so an ``m``-turn
+  continuation done naively would pay that cost ``m`` times.
+
+  Yields:
+    None.  The frozen weights are active for the duration of the block.
+  """
+  depth = getattr(runner, '_frozen_lora_depth', 0)
+  if depth > 0 or runner._frozen_lora_state is None:  # pylint: disable=protected-access
+    # Already inside a swap, or nothing to swap in: nothing to do.
+    runner._frozen_lora_depth = depth + 1  # pylint: disable=protected-access
+    try:
+      yield
+    finally:
+      runner._frozen_lora_depth = depth  # pylint: disable=protected-access
+    return
+
+  live_lora_state = {
+      name: param.data.detach().clone()
+      for name, param in runner._backend.model.named_parameters()  # pylint: disable=protected-access
+      if param.requires_grad
+  }
+  for name, param in runner._backend.model.named_parameters():  # pylint: disable=protected-access
+    if name in runner._frozen_lora_state:  # pylint: disable=protected-access
+      param.data.copy_(runner._frozen_lora_state[name])  # pylint: disable=protected-access
+
+  runner._frozen_lora_depth = 1  # pylint: disable=protected-access
+  try:
+    yield
+  finally:
+    for name, param in runner._backend.model.named_parameters():  # pylint: disable=protected-access
+      if name in live_lora_state:
+        param.data.copy_(live_lora_state[name])
+    runner._frozen_lora_depth = 0  # pylint: disable=protected-access
+
+
+def _sample_policy_action(runner, state) -> int | None:
+  """Sample one action from the policy for whoever is on move.
+
+  Performs **no** weight swapping: the caller decides which weights are
+  active, normally by wrapping the call in ``_frozen_lora_active``.
 
   Args:
     runner: The ``GRPORunner`` instance.
     state: The current game state (will NOT be modified).
 
   Returns:
-    The selected action ID, or None if not applicable.
+    The selected action ID, or None if the state is terminal or has no
+    legal actions.  Falls back to a uniformly random legal action when the
+    completion cannot be parsed.
   """
   if state.is_terminal():
     return None
@@ -449,13 +499,13 @@ def _sample_llm_partner_action(runner, state) -> int | None:
   if not legal:
     return None
 
-  # Render the state and legal actions for the partner.
-  state_text = runner._renderers[current_player].render_state(
-      state, current_player, runner._env.game
+  # Render the state and legal actions for the player on move.
+  state_text = runner._renderers[current_player].render_state(  # pylint: disable=protected-access
+      state, current_player, runner._env.game  # pylint: disable=protected-access
   )
-  legal_actions_with_desc = runner._renderers[
+  legal_actions_with_desc = runner._renderers[  # pylint: disable=protected-access
       current_player
-  ].render_legal_actions(state, current_player, runner._env.game)
+  ].render_legal_actions(state, current_player, runner._env.game)  # pylint: disable=protected-access
   legal_actions = [a for a, _ in legal_actions_with_desc]
   action_descriptions = [d for _, d in legal_actions_with_desc]
 
@@ -463,41 +513,74 @@ def _sample_llm_partner_action(runner, state) -> int | None:
       state_text, legal_actions, action_descriptions
   )
 
-  # Swap in frozen LoRA weights for partner inference.
-  live_lora_state = None
-  if runner._frozen_lora_state is not None:
-    live_lora_state = copy.deepcopy({
-        k: v
-        for k, v in runner._backend.model.named_parameters()
-        if v.requires_grad
-    })
-    for name, param in runner._backend.model.named_parameters():
-      if name in runner._frozen_lora_state:
-        param.data.copy_(runner._frozen_lora_state[name])
-
-  try:
-    with torch.no_grad():
-      response, _ = runner._backend.generate_with_logprobs(
-          prompt,
-          temperature=runner._current_temperature,
-          max_tokens=runner._config.max_completion_length,
-      )
-
-    partner_action = runner._renderers[current_player].parse_action(
-        response, legal_actions_with_desc
+  with torch.no_grad():
+    response, _ = runner._backend.generate_with_logprobs(  # pylint: disable=protected-access
+        prompt,
+        temperature=runner._current_temperature,  # pylint: disable=protected-access
+        max_tokens=runner._config.max_completion_length,  # pylint: disable=protected-access
     )
-    if partner_action is None:
-      partner_action = (
-          int(np.random.choice(legal_actions)) if legal_actions else 0
-      )
-  finally:
-    # Restore live LoRA weights.
-    if live_lora_state is not None:
-      for name, param in runner._backend.model.named_parameters():
-        if name in live_lora_state:
-          param.data.copy_(live_lora_state[name].data)
 
-  return partner_action
+  action = runner._renderers[current_player].parse_action(  # pylint: disable=protected-access
+      response, legal_actions_with_desc
+  )
+  if action is None:
+    action = int(np.random.choice(legal_actions)) if legal_actions else 0
+  return action
+
+
+def _sample_llm_partner_action(runner, state) -> int | None:
+  """Sample one action from the frozen LLM policy for the current player.
+
+  Thin wrapper retained for callers that sample a *single* action outside
+  a ``_frozen_lora_active`` block (``learn.action_reward``).  Anything
+  sampling more than one action should open the context manager once and
+  call ``_sample_policy_action`` in a loop.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    state: The current game state (will NOT be modified).
+
+  Returns:
+    The selected action ID, or None if not applicable.
+  """
+  with _frozen_lora_active(runner):
+    return _sample_policy_action(runner, state)
+
+
+def _rollout_policy_turns(runner, state, num_turns: int) -> int:
+  """Play ``num_turns`` policy turns in place, alternating players.
+
+  Extends the reward rollout's policy segment beyond the single candidate
+  action.  With ``m = reward_policy_turns`` the caller has already applied
+  the candidate action (turn 1), so this plays turns ``2 .. m``::
+
+      p1_2, p0_3, ..., p0_m
+
+  All turns are sampled from the frozen LoRA snapshot under a single weight
+  swap.  Stops early on a terminal state or when no action can be produced.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    state: The game state, **modified in place**.
+    num_turns: How many turns to play (``m - 1``).  Values <= 0 are no-ops.
+
+  Returns:
+    The number of turns actually played.
+  """
+  if num_turns <= 0:
+    return 0
+
+  played = 0
+  with _frozen_lora_active(runner):
+    for _ in range(num_turns):
+      if state.is_terminal():
+        break
+      action = _sample_policy_action(runner, state)
+      if action is None:
+        break
+      state.apply_action(action)
+      played += 1
+  return played
 
 
 def _heuristic_rollout_score(
@@ -900,6 +983,56 @@ def _build_prompt_dataset(prompts: list[str]):
   return Dataset.from_dict({'prompt': prompts})
 
 
+def _resolve_scale_rewards(trl_module, scale_mode: str) -> dict:
+  """Resolve the ``scale_rewards`` kwarg for the installed TRL version.
+
+  TRL always subtracts the group mean when forming advantages; this setting
+  picks the *divisor*.  Left unset it defaults to the within-group std,
+  which rescales a group of near-identical rewards (std ~ 1e-3, i.e. pure
+  rollout noise) to the same +/-1 advantages as a group with real spread.
+  ``'batch'`` divides by the batch-wide std instead, so advantage magnitude
+  tracks the size of the actual reward difference.
+
+  The accepted type changed across TRL releases: newer versions take the
+  strings ``'group'`` / ``'batch'`` / ``'none'``, older ones take a bool.
+  Probe the dataclass field rather than crashing on an unknown value.
+
+  Args:
+    trl_module: The imported ``trl`` module.
+    scale_mode: One of ``'group'``, ``'batch'``, ``'none'``.
+
+  Returns:
+    A kwargs dict to splat into ``GRPOConfig``.  Empty when the installed
+    TRL exposes no ``scale_rewards`` field, leaving the library default.
+  """
+  try:
+    fields = {f.name: f for f in dataclasses.fields(trl_module.GRPOConfig)}
+  except (TypeError, AttributeError) as e:
+    logging.warning(
+        'Could not probe TRL scale_rewards (%s); leaving library default.', e
+    )
+    return {}
+
+  if 'scale_rewards' not in fields:
+    logging.warning(
+        'Installed TRL GRPOConfig has no scale_rewards field; advantage '
+        'scaling left at the library default.'
+    )
+    return {}
+
+  annotation = str(fields['scale_rewards'].type)
+  if 'bool' in annotation and 'str' not in annotation:
+    # Legacy bool API: True divides by the group std, False does not.
+    if scale_mode == 'batch':
+      logging.warning(
+          "Installed TRL types scale_rewards as bool; 'batch' is "
+          'unavailable, falling back to group scaling.'
+      )
+    return {'scale_rewards': scale_mode != 'none'}
+
+  return {'scale_rewards': scale_mode}
+
+
 def _train_grpo_on_prompts(
     runner,
     unique_prompts: list[str],
@@ -1091,24 +1224,30 @@ def _train_grpo_on_prompts(
             if not blend_state.is_terminal():
               blend_state.apply_action(action_id)
 
-            # Lives remaining *because of this action*, captured before any
-            # partner move so the factor below is attributable to the
-            # candidate action alone.
+            # ── Policy continuation ──
+            # The candidate action is turn 1 of the policy segment; play
+            # turns 2..m from the frozen policy, alternating players, then
+            # hand over to the heuristic.  Odd m ends the segment on the
+            # acting player, so it has seen and responded to one partner
+            # move -- the shortest rollout in which a hint can actually pay
+            # off.  The legacy llm_partner_response flag is exactly m=2.
+            policy_turns = runner._config.reward_policy_turns
+            if runner._config.llm_partner_response and policy_turns < 2:
+              policy_turns = 2
+            if not blend_state.is_terminal():
+              _rollout_policy_turns(runner, blend_state, policy_turns - 1)
+
+            # Lives remaining after the whole policy segment.  Capturing
+            # them here rather than immediately after the candidate action
+            # is deliberate: life tokens only ever decrease, so this is the
+            # minimum over the segment, and every move in the segment is
+            # the policy's own.  Capturing earlier would make a bomb at
+            # turn 3 invisible, reinstating exactly the blindness this
+            # factor exists to remove.  At m=1 the two are identical.
             survival_exp = runner._config.reward_survival_exponent
             lives_after = None
             if survival_exp > 0 and hasattr(blend_state, 'life_tokens'):
               lives_after = blend_state.life_tokens()
-
-            # Optionally sample one LLM partner response.  This stays
-            # outside the rollout sampling loop -- it is an LLM forward
-            # pass, orders of magnitude more expensive than a rollout.
-            if (
-                runner._config.llm_partner_response
-                and not blend_state.is_terminal()
-            ):
-              partner_action = _sample_llm_partner_action(runner, blend_state)
-              if partner_action is not None:
-                blend_state.apply_action(partner_action)
 
             # Common random numbers: every completion in this group
             # shares one prompt, hence one seed, so the heuristic
@@ -1212,7 +1351,13 @@ def _train_grpo_on_prompts(
   batch_size = max(candidates) if candidates else 1
   gen_batch_size = runner._config.num_generations
 
+  scale_mode = getattr(runner._config, 'grpo_scale_rewards', 'batch')
+  scale_kwargs = _resolve_scale_rewards(trl_module, scale_mode)
+  logging.info('GRPO advantage scaling: requested=%s resolved=%s',
+               scale_mode, scale_kwargs.get('scale_rewards', '<default>'))
+
   training_args = trl_module.GRPOConfig(
+      **scale_kwargs,
       output_dir=out_dir,
       num_train_epochs=runner._config.train_epochs,
       per_device_train_batch_size=batch_size,
@@ -1359,7 +1504,8 @@ def run_sampled(runner) -> None:
 
   logging.info(
       'Starting GRPO training: %d passes, %d episodes/pass, K=%d, '
-      'reward_sim=%s, horizon=%s, blend_w=%.2f, '
+      'reward_sim=%s, horizon=%s, blend_w=%.2f, policy_turns=%d, '
+      'scale_rewards=%s, '
       'constrained_actions=%s, strategic_actions=%s, llm_partner=%s',
       runner._config.passes,
       runner._config.collect_episodes,
@@ -1367,6 +1513,8 @@ def run_sampled(runner) -> None:
       runner._config.reward_simulation_mode,
       runner._config.truncated_rollout_horizon,
       runner._config.reward_blend_weight,
+      runner._config.reward_policy_turns,
+      runner._config.grpo_scale_rewards,
       runner._config.constrained_action_types,
       runner._config.strategic_action_selection,
       runner._config.llm_partner_response,

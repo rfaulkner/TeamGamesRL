@@ -332,6 +332,73 @@ class GRPOConfig:
   Only used when ``reward_blend_weight > 0``.
   """
 
+  reward_policy_turns: int = 1
+  """Number of turns played by the *policy* at the head of a reward rollout.
+
+  The reward rollout previously ran as::
+
+      p0_1  = candidate action        <- the only policy action
+      p1_2 .. terminal                <- SafePlayPlayer, both players
+
+  so the score measured "take this action, then hand the game to a
+  competent heuristic".  A hint's value in Hanabi materialises only once
+  the partner responds and the hinter acts on that response, which that
+  structure cannot represent: the policy never gets a second move.
+
+  With ``m = reward_policy_turns`` the rollout becomes::
+
+      p0_1  = candidate action
+      p1_2, p0_3, ..., p0_m           <- policy, alternating, frozen LoRA
+      p1_(m+1) .. terminal            <- SafePlayPlayer, both players
+
+  Odd ``m`` ends the policy segment on p0, so the heuristic takes over on
+  the partner's turn and the policy has had the chance to follow up on its
+  own move.  ``m = 3`` is the smallest value with that property.
+
+  Values:
+    - ``1``  -- previous behaviour, heuristic from the next turn onward.
+    - ``2``  -- equivalent to the old ``llm_partner_response`` flag.
+    - ``3+`` -- the policy sees a partner response to its own move.
+
+  Cost is roughly linear in ``m``: each extra turn is one LLM generation
+  per candidate action, so K=8 at m=3 costs 8 + 16 = 24 generations per
+  group versus 8 today.  Start at 3.
+
+  Note the ceiling this does *not* remove: the tail is still heuristic, so
+  the reward remains an action value against a heuristic continuation and
+  the resulting policy-improvement bound is still relative to
+  ``SafePlayPlayer``.  Larger ``m`` moves that boundary later; it does not
+  remove it.
+
+  Only used when ``reward_blend_weight > 0``.
+  """
+
+  grpo_scale_rewards: str = 'batch'
+  """How TRL normalises rewards into advantages: group / batch / none.
+
+  TRL always subtracts the *group* mean.  This controls the denominator:
+
+    - ``'group'`` -- divide by the within-group std.  This was the previous
+      behaviour (TRL's default, never set explicitly).  It has a known
+      pathology: a group whose K actions are nearly tied (std ~ 1e-3) is
+      rescaled to advantages of +/-1, exactly like a group with real
+      spread (std ~ 0.5).  Near-tied groups are mostly rollout noise, and
+      this hands them full-magnitude gradients.
+    - ``'batch'`` -- divide by the std across the whole batch, so the
+      advantage magnitude reflects how large the reward difference is in
+      absolute terms.  Default.
+    - ``'none'`` -- no division (Dr. GRPO style); advantage is the raw
+      centred reward.
+
+  A constant baseline cannot be added here: TRL subtracts the group mean
+  unconditionally, so any per-group constant cancels exactly.  Groups whose
+  K rewards are all identical therefore still contribute zero gradient
+  regardless of this setting (measured at 2.33% of groups in run E).
+
+  Older TRL releases type ``scale_rewards`` as a bool; the caller probes
+  for string support and falls back to ``True``/``False``.
+  """
+
   constrained_action_types: bool = False
   """Force action-type diversity in GRPO completion groups.
 

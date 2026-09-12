@@ -309,6 +309,29 @@ flags.DEFINE_float(
     'the third. This restores the missing gradient. 2.0 gives multipliers '
     '1.00 / 0.44 / 0.11 for 3 / 2 / 1 lives. Default 0.0 (disabled).',
 )
+flags.DEFINE_integer(
+    'reward_policy_turns',
+    1,
+    'Number of turns played by the policy at the head of a reward rollout '
+    '(m). The candidate action is turn 1; turns 2..m are sampled from the '
+    'frozen policy, alternating players, before SafePlayPlayer finishes the '
+    'game. Odd m ends the policy segment on the acting player, so it has '
+    'responded to one partner move -- the shortest rollout in which a hint '
+    'can pay off. m=1 is the previous behaviour, m=2 equals the old '
+    '--llm_partner_response. Cost is ~linear in m: K=8 at m=3 is 24 '
+    'generations per group versus 8. Default 1.',
+)
+flags.DEFINE_string(
+    'grpo_scale_rewards',
+    'batch',
+    "How TRL turns rewards into advantages: 'group' (divide by the "
+    "within-group std, TRL's default), 'batch' (divide by the batch-wide "
+    "std), or 'none' (no division). 'group' rescales a group of "
+    'near-identical rewards -- pure rollout noise -- to the same +/-1 '
+    'advantages as a group with real spread, so it hands noise '
+    "full-magnitude gradients. Default 'batch'. Older TRL releases type "
+    'this as a bool; the trainer probes and falls back automatically.',
+)
 flags.DEFINE_bool(
     'constrained_action_types',
     False,
@@ -433,6 +456,8 @@ def main(argv: list[str]) -> None:
       'reward_rollout_samples': FLAGS.reward_rollout_samples,
       'reward_rollout_common_seed': FLAGS.reward_rollout_common_seed,
       'reward_survival_exponent': FLAGS.reward_survival_exponent,
+      'reward_policy_turns': FLAGS.reward_policy_turns,
+      'grpo_scale_rewards': FLAGS.grpo_scale_rewards,
       'constrained_action_types': FLAGS.constrained_action_types,
       'strategic_action_selection': FLAGS.strategic_action_selection,
       'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
@@ -506,6 +531,8 @@ def main(argv: list[str]) -> None:
         reward_rollout_samples=FLAGS.reward_rollout_samples,
         reward_rollout_common_seed=FLAGS.reward_rollout_common_seed,
         reward_survival_exponent=FLAGS.reward_survival_exponent,
+        reward_policy_turns=FLAGS.reward_policy_turns,
+        grpo_scale_rewards=FLAGS.grpo_scale_rewards,
         constrained_action_types=FLAGS.constrained_action_types,
         strategic_action_selection=FLAGS.strategic_action_selection,
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
