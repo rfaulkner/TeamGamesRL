@@ -25,6 +25,7 @@ instance that holds shared state (env, backend, config, callbacks).
 import copy
 import os
 import time
+import zlib
 
 from absl import logging
 from learn.trajectory import PlayerTrajectory
@@ -500,7 +501,8 @@ def _sample_llm_partner_action(runner, state) -> int | None:
 
 
 def _heuristic_rollout_score(
-    runner, state, target_player: int, max_score: float = 25.0
+    runner, state, target_player: int, max_score: float = 25.0,
+    seed: int | None = None,
 ) -> float:
   """Roll out the game to terminal with heuristic play, return game score.
 
@@ -511,6 +513,14 @@ def _heuristic_rollout_score(
     state: The current game state (will be modified in place).
     target_player: The player whose score to return.
     max_score: Maximum possible game score (25 for standard Hanabi).
+    seed: Optional RNG seed for the heuristic partner.  ``SafePlayPlayer``
+        picks a uniformly random legal hint when it has no known-playable
+        card, so the rollout is stochastic.  Passing the *same* seed for
+        every action in a GRPO group (common random numbers) makes that
+        partner randomness common-mode, so it largely cancels in the
+        within-group comparison that GRPO actually differentiates.
+        ``None`` reproduces the previous behaviour (fresh randomness per
+        call).
 
   Returns:
     Normalized game score in [0, 1].
@@ -518,9 +528,11 @@ def _heuristic_rollout_score(
   try:
     from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
 
-    heuristic = SafePlayPlayer()
+    heuristic = SafePlayPlayer(seed=seed)
   except ImportError:
     heuristic = None
+
+  rng = np.random.RandomState(seed) if seed is not None else np.random
 
   game = getattr(runner._env, 'game', None)
 
@@ -532,9 +544,9 @@ def _heuristic_rollout_score(
     if heuristic is not None:
       action = heuristic.select_action(state, player, game)
       if action is None:
-        action = int(np.random.choice(legal))
+        action = int(rng.choice(legal))
     else:
-      action = int(np.random.choice(legal))
+      action = int(rng.choice(legal))
     state.apply_action(action)
 
   # Extract terminal score.
@@ -549,6 +561,87 @@ def _heuristic_rollout_score(
     score = 0.0
 
   return score / max_score
+
+
+def _rollout_value(
+    runner,
+    base_state,
+    target_player: int,
+    num_samples: int = 1,
+    seed: int | None = None,
+    max_score: float = 25.0,
+) -> float:
+  """Estimate the value of ``base_state`` by averaging heuristic rollouts.
+
+  ``base_state`` is the successor state -- the candidate action (and,
+  optionally, one LLM partner response) has already been applied.  This
+  function only estimates how good that state is.
+
+  Because ``_heuristic_rollout_score`` mutates the state in place, each
+  sample runs on a fresh clone.  Samples use consecutive seeds derived
+  from ``seed``, so two different actions scored with the same ``seed``
+  see the same sequence of partner RNG streams (common random numbers).
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    base_state: The successor state to value (not modified).
+    target_player: The player whose score to return.
+    num_samples: Number of rollouts to average.  Rollouts cost
+        milliseconds against a ~16-18 s LLM generation step, so modest
+        values are effectively free.
+    seed: Base seed for the rollouts.  ``None`` disables CRN.
+    max_score: Maximum possible game score (25 for standard Hanabi).
+
+  Returns:
+    Mean normalized game score in [0, 1].
+  """
+  num_samples = max(1, int(num_samples))
+
+  # Fast path: single sample, no clone needed.
+  if num_samples == 1:
+    return _heuristic_rollout_score(
+        runner, base_state, target_player, max_score=max_score, seed=seed
+    )
+
+  scores = []
+  for i in range(num_samples):
+    sample_state = base_state.clone()
+    scores.append(
+        _heuristic_rollout_score(
+            runner,
+            sample_state,
+            target_player,
+            max_score=max_score,
+            seed=None if seed is None else seed + i,
+        )
+    )
+  return float(np.mean(scores))
+
+
+def _group_rollout_seed(prompt_text: str, pass_idx: int) -> int:
+  """Derive a stable per-group rollout seed for common random numbers.
+
+  All completions in a GRPO group share one prompt (one game state), so
+  hashing the prompt gives every candidate action in that group the same
+  seed.  Mixing in ``pass_idx`` means the group is re-evaluated against a
+  different partner trajectory on each pass, so the policy cannot overfit
+  to one lucky rollout.
+
+  ``zlib.crc32`` is used rather than ``hash()`` because the latter is
+  salted per process (``PYTHONHASHSEED``) and would not be reproducible
+  across runs.
+
+  Args:
+    prompt_text: The GRPO prompt (identifies the game state / group).
+    pass_idx: The current GRPO pass index.
+
+  Returns:
+    A non-negative seed suitable for ``np.random.RandomState``.
+  """
+  base = zlib.crc32(prompt_text.encode('utf-8', errors='ignore'))
+  # Knuth multiplicative mix so consecutive passes decorrelate.
+  return int((base ^ (pass_idx * 2654435761)) & 0x7FFFFFFF)
+
 
 
 def _get_target_token_ids(tokenizer, words: list[str]) -> list[int]:
@@ -956,21 +1049,30 @@ def _train_grpo_on_prompts(
         if not parsed:
           reward = -0.3  # Parse failure penalty.
         else:
-          horizon = runner._config.truncated_rollout_horizon or 4
-          discount = getattr(runner._config, 'dense_chain_discount', 0.9)
-          primary_reward = evaluate_dense_chain(
-              runner,
-              action_history,
-              action_id,
-              p_id,
-              serialized_state=ser_state,
-              horizon=horizon,
-              discount=discount,
-              llm_partner_response=(runner._config.llm_partner_response),
-          )
+          blend_w = runner._config.reward_blend_weight
+
+          # ── Dense per-action chain term ──
+          # At blend_w >= 1.0 the dense term is multiplied by zero, so
+          # skip it entirely: evaluate_dense_chain runs a horizon-length
+          # heuristic continuation and is the expensive half of this
+          # branch.  This makes w=1.0 a genuine pure-rollout objective.
+          if blend_w >= 1.0:
+            primary_reward = 0.0
+          else:
+            horizon = runner._config.truncated_rollout_horizon or 4
+            discount = getattr(runner._config, 'dense_chain_discount', 0.9)
+            primary_reward = evaluate_dense_chain(
+                runner,
+                action_history,
+                action_id,
+                p_id,
+                serialized_state=ser_state,
+                horizon=horizon,
+                discount=discount,
+                llm_partner_response=(runner._config.llm_partner_response),
+            )
 
           # ── Blend with heuristic rollout game score ──
-          blend_w = runner._config.reward_blend_weight
           if blend_w > 0:
             # Restore state, apply action, optionally get LLM partner
             # response, then heuristic rollout to terminal.
@@ -989,7 +1091,9 @@ def _train_grpo_on_prompts(
             if not blend_state.is_terminal():
               blend_state.apply_action(action_id)
 
-            # Optionally sample one LLM partner response.
+            # Optionally sample one LLM partner response.  This stays
+            # outside the rollout sampling loop -- it is an LLM forward
+            # pass, orders of magnitude more expensive than a rollout.
             if (
                 runner._config.llm_partner_response
                 and not blend_state.is_terminal()
@@ -998,8 +1102,21 @@ def _train_grpo_on_prompts(
               if partner_action is not None:
                 blend_state.apply_action(partner_action)
 
-            game_score_norm = _heuristic_rollout_score(
-                runner, blend_state, p_id
+            # Common random numbers: every completion in this group
+            # shares one prompt, hence one seed, so the heuristic
+            # partner's coin flips are common-mode across the candidate
+            # actions GRPO compares against each other.
+            group_seed = (
+                _group_rollout_seed(prompt_text, pass_idx)
+                if runner._config.reward_rollout_common_seed
+                else None
+            )
+            game_score_norm = _rollout_value(
+                runner,
+                blend_state,
+                p_id,
+                num_samples=runner._config.reward_rollout_samples,
+                seed=group_seed,
             )
             reward = (1 - blend_w) * primary_reward + blend_w * game_score_norm
           else:

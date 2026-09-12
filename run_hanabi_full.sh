@@ -60,6 +60,8 @@ EPSILON="0.3"
 EPSILON_ANNEAL_END="0.0"
 REWARD_MODE="dense_chain"
 REWARD_BLEND_WEIGHT="0.0"
+REWARD_ROLLOUT_SAMPLES="1"
+REWARD_ROLLOUT_COMMON_SEED="true"
 CONSTRAINED_ACTION_TYPES="false"
 STRATEGIC_ACTION_SELECTION="false"
 STRATEGIC_ACTION_FORCED_RATIO="1.0"
@@ -113,12 +115,15 @@ for arg in "$@"; do
     --epsilon_anneal_end=*) EPSILON_ANNEAL_END="${arg#*=}" ;;
     --reward_mode=*|--reward_simulation_mode=*) REWARD_MODE="${arg#*=}" ;;
     --reward_blend_weight=*) REWARD_BLEND_WEIGHT="${arg#*=}" ;;
+    --reward_rollout_samples=*) REWARD_ROLLOUT_SAMPLES="${arg#*=}" ;;
+    --reward_rollout_common_seed=*) REWARD_ROLLOUT_COMMON_SEED="${arg#*=}" ;;
+    --no_reward_rollout_common_seed) REWARD_ROLLOUT_COMMON_SEED="false" ;;
     --constrained_action_types) CONSTRAINED_ACTION_TYPES="true" ;;
     --strategic_action_selection) STRATEGIC_ACTION_SELECTION="true" ;;
     --strategic_action_forced_ratio=*) STRATEGIC_ACTION_FORCED_RATIO="${arg#*=}" ;;
     --llm_partner_response) LLM_PARTNER_RESPONSE="true" ;;
     --help|-h)
-      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=MODE] [--reward_blend_weight=W] [--constrained_action_types] [--strategic_action_selection] [--strategic_action_forced_ratio=R] [--llm_partner_response] [--extra...]"
+      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=MODE] [--reward_blend_weight=W] [--reward_rollout_samples=N] [--no_reward_rollout_common_seed] [--constrained_action_types] [--strategic_action_selection] [--strategic_action_forced_ratio=R] [--llm_partner_response] [--extra...]"
       exit 0 ;;
     --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
@@ -221,6 +226,8 @@ python3 trainer/gemma_rl_trainer.py \
   --epsilon_anneal_end="${EPSILON_ANNEAL_END}" \
   --reward_simulation_mode="${REWARD_MODE}" \
   --reward_blend_weight="${REWARD_BLEND_WEIGHT}" \
+  --reward_rollout_samples="${REWARD_ROLLOUT_SAMPLES}" \
+  --reward_rollout_common_seed="${REWARD_ROLLOUT_COMMON_SEED}" \
   --constrained_action_types="${CONSTRAINED_ACTION_TYPES}" \
   --strategic_action_selection="${STRATEGIC_ACTION_SELECTION}" \
   --strategic_action_forced_ratio="${STRATEGIC_ACTION_FORCED_RATIO}" \

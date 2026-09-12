@@ -277,7 +277,27 @@ flags.DEFINE_float(
     'Weight for blending game-outcome reward with primary reward signal. '
     'Effective reward = (1-w)*primary + w*game_score/25. '
     'Set > 0 to anchor training to actual game outcomes and prevent '
-    'proxy reward hacking. Recommended: 0.2-0.5. Default 0.0 (disabled).',
+    'proxy reward hacking. Recommended: 0.2-0.5. Default 0.0 (disabled). '
+    'At w=1.0 the primary (dense-chain) term is skipped entirely, which is '
+    'both cheaper and a clean pure-rollout objective.',
+)
+flags.DEFINE_integer(
+    'reward_rollout_samples',
+    1,
+    'Number of heuristic rollouts to average when computing the blended '
+    'game-outcome reward. The heuristic partner is stochastic, so a single '
+    'rollout is a noisy value estimate; averaging N reduces that noise by '
+    'sqrt(N) at N x rollout cost (rollouts are milliseconds against a '
+    '~16-18 s LLM generation step). Default 1 (no averaging).',
+)
+flags.DEFINE_bool(
+    'reward_rollout_common_seed',
+    True,
+    'Use common random numbers across a GRPO group when rolling out. Every '
+    'completion in a group shares one prompt, so all candidate actions are '
+    'scored against the same heuristic-partner RNG stream, removing '
+    'partner randomness from the within-group comparison that GRPO '
+    'actually differentiates. Free variance reduction; default True.',
 )
 flags.DEFINE_bool(
     'constrained_action_types',
@@ -400,6 +420,8 @@ def main(argv: list[str]) -> None:
       'reward_simulation_mode': FLAGS.reward_simulation_mode,
       'dense_chain_discount': FLAGS.dense_chain_discount,
       'reward_blend_weight': FLAGS.reward_blend_weight,
+      'reward_rollout_samples': FLAGS.reward_rollout_samples,
+      'reward_rollout_common_seed': FLAGS.reward_rollout_common_seed,
       'constrained_action_types': FLAGS.constrained_action_types,
       'strategic_action_selection': FLAGS.strategic_action_selection,
       'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
@@ -470,6 +492,8 @@ def main(argv: list[str]) -> None:
         epsilon=FLAGS.epsilon,
         epsilon_anneal_end=FLAGS.epsilon_anneal_end,
         reward_blend_weight=FLAGS.reward_blend_weight,
+        reward_rollout_samples=FLAGS.reward_rollout_samples,
+        reward_rollout_common_seed=FLAGS.reward_rollout_common_seed,
         constrained_action_types=FLAGS.constrained_action_types,
         strategic_action_selection=FLAGS.strategic_action_selection,
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,

@@ -255,7 +255,50 @@ class GRPOConfig:
   This anchors the training signal to actual game outcomes, preventing
   proxy reward hacking where the model maximizes the dense signal without
   improving real play.  Set to 0.0 to disable (pure primary reward).
-  Recommended range: 0.2--0.5.
+
+  At ``w = 1.0`` the primary (dense) term is skipped entirely and the
+  reward is the pure heuristic-rollout game score.  This is *cheaper*
+  than any intermediate weight, since the dense chain is not computed.
+
+  Recommended range: 0.2--0.5 for blended shaping, or 1.0 for a pure
+  outcome-anchored reward.
+  """
+
+  reward_rollout_samples: int = 1
+  """Number of independent heuristic rollouts to average per action.
+
+  ``SafePlayPlayer`` is stochastic (it picks a uniformly random legal hint
+  when it has no known-playable card), so a single rollout to terminal is
+  a noisy one-sample estimate of the successor state's value.  Averaging
+  ``N`` rollouts reduces the residual noise by ``sqrt(N)``.
+
+  Rollouts cost milliseconds against a ~16-18 s LLM generation step, so
+  values up to ~8 are essentially free in wall-clock terms.  Defaults to 1
+  (previous behaviour); raise only if rollout noise is shown to dominate
+  the between-action signal.
+
+  Only used when ``reward_blend_weight > 0``.
+  """
+
+  reward_rollout_common_seed: bool = True
+  """Use common random numbers (CRN) across the actions in a GRPO group.
+
+  Every completion in a GRPO group scores a different candidate action
+  from the *same* game state, and TRL z-scores rewards within the group.
+  Previously each rollout constructed an unseeded ``SafePlayPlayer``, so
+  action *i* and action *j* were evaluated against *different* random
+  partner trajectories -- and GRPO attributed that partner difference to
+  the actions themselves, injecting noise directly into the only
+  comparison that produces gradient.
+
+  When True, all actions in a group share the same rollout seed sequence
+  (derived from the prompt and pass index), so partner randomness becomes
+  common-mode and largely cancels in the within-group contrast.
+  Cancellation is partial -- different actions lead to different states,
+  after which the RNG streams desynchronise -- but it is strictly better
+  than independent seeds and costs nothing.
+
+  Only used when ``reward_blend_weight > 0``.
   """
 
   constrained_action_types: bool = False
