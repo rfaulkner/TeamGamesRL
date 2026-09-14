@@ -543,8 +543,16 @@ def _format_observation(
         lines.append(f'XX || {knowledge_str}')
     else:
       # Other player's hand — show actual cards.
-      # Observed hands are indexed 1..N-1 for the other players.
-      observed_idx = offset - 1 if offset > 0 else 0
+      #
+      # ``observed_hands()`` is indexed by *relative* player: index 0 is the
+      # OBSERVER (whose cards are deliberately invalid), index 1 is the next
+      # player, and so on.  This previously used ``offset - 1``, which for the
+      # partner read index 0 and therefore rendered the observer's own hidden
+      # hand -- every partner card came out as "?0".  The agent could not see
+      # its partner's cards at all, which in Hanabi removes the entire basis
+      # for giving hints.  Note the knowledge lookup below already used the
+      # correct relative index, so the two disagreed.
+      observed_idx = offset
       observed_hands = obs.observed_hands()
       if observed_idx < len(observed_hands):
         hand_cards = observed_hands[observed_idx]

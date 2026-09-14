@@ -152,6 +152,20 @@ class RandomPlayer(HeuristicPlayer):
     return 'random'
 
 
+# Where does a freshly drawn card land in a hand?
+#
+# Verified directly against HLE in scratch/probe_hand_order.py: hands are
+# ordered oldest -> newest and a replacement card is APPENDED to the end, so
+# the OLDEST card sits at index 0.  The original implementation assumed the
+# opposite ("new cards are inserted at position 0") and therefore discarded
+# the NEWEST card whenever it meant to discard the oldest.  A 300-deal paired
+# experiment put the cost of that inversion at +1.30 +/- 0.32 points out of 25
+# (4.16 corrected vs 2.86 as-written).
+#
+# Set this True only to reproduce runs made before the fix.
+_NEW_CARDS_AT_INDEX_ZERO = False
+
+
 class SafePlayPlayer(HeuristicPlayer):
   """Level-1 heuristic that prioritises safe plays over random hints.
 
@@ -169,15 +183,25 @@ class SafePlayPlayer(HeuristicPlayer):
   the next needed card for the corresponding firework.
   """
 
-  def __init__(self, seed: Optional[int] = None, **kwargs) -> None:
+  def __init__(
+      self,
+      seed: Optional[int] = None,
+      new_cards_at_index_zero: bool = _NEW_CARDS_AT_INDEX_ZERO,
+      **kwargs,
+  ) -> None:
     """Initialises a SafePlayPlayer.
 
     Args:
       seed: Optional RNG seed for tie-breaking and hint selection.
+      new_cards_at_index_zero: Whether a freshly drawn card is inserted at
+        hand position 0.  False matches HLE, where replacements are appended
+        and index 0 is the oldest card.  Pass True only to reproduce runs
+        made before this was corrected.
       **kwargs: Ignored keyword arguments for factory compatibility.
     """
     del kwargs
     self._rng = np.random.RandomState(seed)
+    self._new_cards_at_index_zero = new_cards_at_index_zero
 
   # ---------------------------------------------------------------------------
   # Public interface
@@ -223,7 +247,7 @@ class SafePlayPlayer(HeuristicPlayer):
     # are not full).
     if info_tokens < _MAX_INFO_TOKENS and discard_actions:
       oldest_unhinted = self._oldest_unhinted_card(
-          card_knowledge, discard_actions
+          card_knowledge, discard_actions, self._new_cards_at_index_zero
       )
       if oldest_unhinted is not None:
         return oldest_unhinted
@@ -232,9 +256,11 @@ class SafePlayPlayer(HeuristicPlayer):
     if info_tokens > 0 and hint_actions:
       return int(self._rng.choice(hint_actions))
 
-    # Priority 4: Discard the oldest card (highest position index).
+    # Priority 4: Discard the oldest card.  Under HLE ordering that is the
+    # LOWEST position index, not the highest.
     if discard_actions:
-      return max(discard_actions, key=lambda a: discard_actions[a])
+      pick = max if self._new_cards_at_index_zero else min
+      return pick(discard_actions, key=lambda a: discard_actions[a])
 
     # Fallback (should not happen in a valid game state).
     return int(self._rng.choice(legal_actions))
@@ -389,6 +415,7 @@ class SafePlayPlayer(HeuristicPlayer):
   def _oldest_unhinted_card(
       card_knowledge: List[Tuple[str, str]],
       discard_actions: dict[int, int],
+      new_cards_at_index_zero: bool = _NEW_CARDS_AT_INDEX_ZERO,
   ) -> Optional[int]:
     """Returns a Discard action for the oldest card with no hints.
 
@@ -396,12 +423,15 @@ class SafePlayPlayer(HeuristicPlayer):
     all five colours **and** all five ranks (i.e., no Reveal action
     has touched it).
 
-    "Oldest" means the highest card-position index, following Hanabi
-    convention where new cards are inserted at position 0.
+    Which index is "oldest" depends on where the environment inserts a
+    freshly drawn card.  HLE appends replacements, so the oldest card is at
+    the LOWEST index; when ``new_cards_at_index_zero`` is True the oldest is
+    instead at the highest index.
 
     Args:
       card_knowledge: Per-card ``(colors, ranks)`` knowledge tuples.
       discard_actions: ``{action_int: card_position}`` map.
+      new_cards_at_index_zero: Whether new cards are inserted at position 0.
 
     Returns:
       The action integer for discarding the oldest unhinted card, or
@@ -416,5 +446,5 @@ class SafePlayPlayer(HeuristicPlayer):
         unhinted.append((action, position))
     if not unhinted:
       return None
-    # Oldest card = highest position index.
-    return max(unhinted, key=lambda x: x[1])[0]
+    pick = max if new_cards_at_index_zero else min
+    return pick(unhinted, key=lambda x: x[1])[0]

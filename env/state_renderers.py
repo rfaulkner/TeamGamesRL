@@ -1291,18 +1291,69 @@ class HanabiRenderer(BaseStateRenderer):
         if f'discard card {card_idx}' in desc.lower():
           return action_id
 
-    # "hint player 2 about red" or "tell player 2 about rank 3"
+    # Hints: "hint player 1 about rank 4 cards", "tell player 1 red",
+    # "reveal player +1 rank 3".
+    #
+    # The rank digit must be captured explicitly.  A previous version used
+    #     r'(?:hint|tell|reveal).*?player\s+(\d+).*?(?:about\s+)?(\w+)'
+    # and took group 2 as the hint subject.  For *every* rank hint that
+    # group is the literal token 'rank', so the description scan matched
+    # any description merely containing 'rank' and returned the first --
+    # i.e. the lowest-numbered legal rank hint.  Every rank hint collapsed
+    # onto a single action, making the rest of the rank space unreachable
+    # and silently substituting a different action than the one scored.
     hint_match = re.search(
-        r'(?:hint|tell|reveal).*?player\s+(\d+).*?(?:about\s+)?(\w+)',
-        normalized,
+        r'\b(?:hint|tell|reveal|clue)\b(.*)', normalized, re.DOTALL
     )
     if hint_match:
-      target = hint_match.group(1)
-      subject = hint_match.group(2)
-      for action_id, desc in legal_actions:
-        desc_lower = desc.lower()
-        if f'player {target}' in desc_lower and subject in desc_lower:
-          return action_id
+      body = hint_match.group(1)
+
+      # Absolute player index only.  The OpenSpiel '+N' form is a relative
+      # offset, not a player id, so it is deliberately not matched here --
+      # leaving the target unconstrained is correct, whereas reading the
+      # offset as an absolute index would be wrong for every player but 0.
+      target_match = re.search(r'player\s+(\d+)', body)
+      target = target_match.group(1) if target_match else None
+
+      rank_match = re.search(r'\brank\s*(\d+)', body)
+      if rank_match:
+        rank = rank_match.group(1)
+      else:
+        # A bare digit means a rank, as long as it is not the player index
+        # already consumed above.
+        remainder = body
+        if target_match:
+          remainder = body[: target_match.start()] + body[target_match.end() :]
+        bare_digit = re.search(r'\b(\d+)\b', remainder)
+        rank = bare_digit.group(1) if bare_digit else None
+
+      color = None
+      for color_name in _HANABI_COLOR_NAMES.values():
+        if re.search(rf'\b{color_name.lower()}\b', body):
+          color = color_name.lower()
+          break
+
+      if rank is not None or color is not None:
+        matches = []
+        for action_id, desc in legal_actions:
+          desc_lower = desc.lower()
+          if 'hint' not in desc_lower:
+            continue
+          if target is not None and f'player {target}' not in desc_lower:
+            continue
+          is_rank_hint = bool(re.search(r'\brank\s+\d+', desc_lower))
+          if color is not None:
+            if not is_rank_hint and color in desc_lower:
+              matches.append(action_id)
+          elif rank is not None:
+            if re.search(rf'\brank\s+{rank}\b', desc_lower):
+              matches.append(action_id)
+        if len(matches) == 1:
+          return matches[0]
+        # Zero or several candidates: fall through to fuzzy matching rather
+        # than returning an arbitrary hint, which is what caused the bug
+        # above.  A wrong action is worse than an unparsed one, because the
+        # reward is computed for the action that actually executes.
 
     # Fall back to fuzzy matching.
     return _fuzzy_match_action(text, legal_actions)
