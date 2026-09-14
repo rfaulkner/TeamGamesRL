@@ -433,12 +433,37 @@ class GRPOConfig:
   Only affects Hanabi games with observable card knowledge.
   """
 
+  strategic_action_mode: str = 'substitute'
+  """How strategic actions enter the GRPO group: 'substitute' or 'logits'.
+
+  ``'substitute'`` (default) runs *after* generation: sample all K
+  completions freely, parse each to an action ID, keep the first
+  completion per distinct action, then overwrite the duplicate and
+  unparseable slots with strategic actions the group does not already
+  contain.  This is the only mode that can react to what the policy
+  actually produced, so it never spends a slot on an action the model
+  was going to sample anyway.
+
+  ``'logits'`` is the original behaviour: force chosen actions into fixed
+  slots token-by-token *during* generation.  It commits to a slot layout
+  before seeing any sample, so with a collapsed policy it re-forces
+  actions that are already present.  Kept for reproducing earlier runs.
+
+  Ignored unless ``strategic_action_selection`` is True.
+  """
+
   strategic_action_forced_ratio: float = 1.0
-  """Fraction of K completions to force with strategic actions (0.0 to 1.0).
+  """Fraction of K completions strategic actions may occupy (0.0 to 1.0).
 
   Defaults to 1.0 (100% strategic actions in early training).  Can be
   reduced or annealed in later experiments to gradually transfer control
   to the model's learned policy.
+
+  Under ``strategic_action_mode='logits'`` this is the number of slots
+  forced unconditionally.  Under ``'substitute'`` it is only a *cap*: a
+  slot is rewritten only when it duplicates another completion or failed
+  to parse, so at 1.0 the group keeps every distinct action the model
+  produced and fills the rest.
   """
 
   llm_partner_response: bool = False

@@ -591,32 +591,59 @@ def _format_card_knowledge(
 ) -> str:
   """Format card knowledge to match OpenSpiel's format.
 
-  OpenSpiel format: "XX|RYGWB12345" where known info is narrowed.
+  OpenSpiel format: ``"<hinted>|<plausible>"``, e.g. ``"XX|RYGWB12345"``
+  for a card with no hints, or ``"X3|RYGWB3"`` after a rank-3 hint.  The
+  part before ``|`` is what has been *directly hinted* (``X`` where
+  nothing has), and the part after is the set of values still possible.
+
+  This previously returned only the plausibility set, with no ``|``.
+  ``HanabiRenderer._describe_card_knowledge`` splits on ``|`` and needs
+  exactly two parts, so it fell through to its fallback branch and every
+  card in the acting player's own hand rendered as
+  ``"Unknown (raw: RYGWB3)"`` -- even a fully-hinted, immediately
+  playable one.  Hints to the agent were effectively invisible.
+  ``learn.strategic_actions._CARD_KNOWLEDGE_RE`` was already written
+  against the two-part form and tolerates both.
 
   Note: HLE's ``color()``/``rank()`` return -1 when unknown (not None).
+
+  Args:
+    knowledge: The per-card knowledge object from the HLE observation.
+    num_colors: Number of colours in this game variant.
+    num_ranks: Number of ranks in this game variant.
+
+  Returns:
+    The knowledge string, e.g. ``"X3|RYGWB3"``.
   """
   # Color knowledge.
   color_val = knowledge.color()
-  if color_val is not None and color_val >= 0:
-    color_str = _color_char(color_val)
+  color_known = color_val is not None and color_val >= 0
+  if color_known:
+    hinted_color = _color_char(color_val)
+    plausible_colors = hinted_color
   else:
-    color_str = ''.join(
+    hinted_color = 'X'
+    plausible_colors = ''.join(
         _color_char(c)
         for c in range(num_colors)
         if knowledge.color_plausible(c)
     )
-    if not color_str:
-      color_str = 'X'
+    if not plausible_colors:
+      plausible_colors = 'X'
 
   # Rank knowledge.
   rank_val = knowledge.rank()
-  if rank_val is not None and rank_val >= 0:
-    rank_str = str(rank_val + 1)
+  rank_known = rank_val is not None and rank_val >= 0
+  if rank_known:
+    hinted_rank = str(rank_val + 1)
+    plausible_ranks = hinted_rank
   else:
-    rank_str = ''.join(
+    hinted_rank = 'X'
+    plausible_ranks = ''.join(
         str(r + 1) for r in range(num_ranks) if knowledge.rank_plausible(r)
     )
-    if not rank_str:
-      rank_str = 'X'
+    if not plausible_ranks:
+      plausible_ranks = 'X'
 
-  return f'{color_str}{rank_str}'
+  return f'{hinted_color}{hinted_rank}|{plausible_colors}{plausible_ranks}'
+

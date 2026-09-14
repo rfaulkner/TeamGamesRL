@@ -905,18 +905,60 @@ class HanabiRenderer(BaseStateRenderer):
   ) -> str:
     """Describes a visible card (in another player's hand).
 
+    The description states both the card's true identity, which the
+    observer can see, and which hints its holder has already received,
+    which the observer also knows because hints are public.
+
+    That second half was previously dropped: ``knowledge`` was accepted
+    and ignored.  Without it the acting player cannot tell an
+    informative hint from a redundant one, which is the most likely
+    cause of a policy repeating the same hint turn after turn.
+
     Args:
       actual: The actual card identity, e.g. "R2", "Y1".
-      knowledge: The card knowledge string, e.g. "XX|RY123".
+      knowledge: The card knowledge string, e.g. "X2|RY2".
 
     Returns:
-      Human-readable description like "Red 2".
+      Human-readable description like "Red 2 (hinted: rank 2)".
     """
     if len(actual) >= 2 and actual[0] in _HANABI_COLOR_NAMES:
       color = _HANABI_COLOR_NAMES[actual[0]]
       rank = actual[1:]
-      return f'{color} {rank}'
-    return actual
+      description = f'{color} {rank}'
+    else:
+      description = actual
+
+    hints = self._describe_hints_received(knowledge)
+    return f'{description} ({hints})' if hints else description
+
+  def _describe_hints_received(self, knowledge: str) -> str:
+    """Summarises which hints a card's holder has already been given.
+
+    Only the part of ``knowledge`` before the ``|`` is used: that is what
+    has been *directly hinted*, as opposed to what the holder could
+    additionally deduce.  Hints are public, so this is information the
+    observer legitimately has.
+
+    Args:
+      knowledge: The card knowledge string, e.g. "X2|RY2".
+
+    Returns:
+      A short phrase such as "hinted: Red, rank 2" or "not hinted", or
+      the empty string when ``knowledge`` is not in the expected form.
+    """
+    parts = knowledge.split('|')
+    if len(parts) != 2:
+      return ''
+    card_part = parts[0]
+    if len(card_part) < 2:
+      return ''
+
+    told = []
+    if card_part[0] != 'X':
+      told.append(_HANABI_COLOR_NAMES.get(card_part[0], card_part[0]))
+    if card_part[1] != 'X':
+      told.append(f'rank {card_part[1]}')
+    return 'hinted: ' + ', '.join(told) if told else 'not hinted'
 
   def _describe_card_knowledge(self, knowledge: str) -> str:
     """Describes what is known about a card from hints.

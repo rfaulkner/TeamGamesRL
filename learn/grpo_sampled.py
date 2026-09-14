@@ -971,6 +971,342 @@ class StrategicActionLogitsProcessor:
     return scores
 
 
+def _lookup_prompt_metadata(runner, prompt_text: str):
+  """Finds the metadata entry for a decoded prompt.
+
+  Decoded prompts do not always round-trip byte-for-byte (chat templates
+  and special-token stripping both perturb them), so fall back to a
+  containment match before giving up.
+
+  Args:
+    runner: The ``GRPORunner`` holding ``_prompt_metadata``.
+    prompt_text: Decoded prompt text.
+
+  Returns:
+    The metadata dict, or ``None`` when nothing matches.
+  """
+  metadata = runner._prompt_metadata.get(prompt_text)  # pylint: disable=protected-access
+  if metadata is not None:
+    return metadata
+  stripped = prompt_text.strip()
+  for key, value in runner._prompt_metadata.items():  # pylint: disable=protected-access
+    if key.strip() == stripped or stripped in key or key in stripped:
+      return value
+  return None
+
+
+class GroupDiversifier:
+  """De-duplicates a GRPO completion group and back-fills strategic actions.
+
+  ``StrategicActionLogitsProcessor`` forces actions into fixed slots
+  *before* generation, so it cannot know what the policy was about to
+  produce and routinely spends a slot on an action the model would have
+  sampled anyway.  Measured on a live run, a group of K=16 completions
+  collapsed to roughly 3 distinct actions (the ``Reward cache`` log line
+  reported ~80% duplicates), which leaves GRPO comparing an action almost
+  entirely against itself.
+
+  This class runs *after* generation instead:
+
+    1. Decode all K completions and parse each to an action ID with the
+       same renderer ``reward_fn`` uses, so the de-duplication key is
+       exactly the key rewards are cached under.
+    2. Keep the first completion for each distinct action.  Every later
+       repeat -- and every completion that fails to parse, since those
+       are assigned a uniformly random legal action downstream -- frees
+       its slot.
+    3. Fill freed slots with actions not yet represented in the group,
+       best tier first (known-safe plays, risky plays, smart discards,
+       diverse hints), then any remaining legal action as a floor.
+    4. Overwrite those slots' completion token IDs in place.
+
+  Because the substitution rewrites the tokens themselves, the text TRL
+  backpropagates through and the action the reward function scores stay
+  aligned.  This is the mismatch that ``reward_fn`` warns about and that
+  rules out substituting action IDs at reward time.
+
+  Substituted completions are off-policy -- the policy did not propose
+  them.  TRL recomputes log-probabilities from the final token IDs, so
+  the gradient is well formed, but it is REINFORCE on forced samples
+  rather than on-policy GRPO.  That is the intent: it is what makes the
+  group span distinct actions early in training, when the policy has not
+  yet learnt that anything other than a hint exists.
+  """
+
+  def __init__(
+      self,
+      tokenizer,
+      runner,
+      num_generations: int,
+      max_substitution_fraction: float = 1.0,
+  ):
+    self._tokenizer = tokenizer
+    self._runner = runner
+    self._k = num_generations
+    self._max_fraction = max_substitution_fraction
+    self._eos_token_id = tokenizer.eos_token_id
+    pad_id = getattr(tokenizer, 'pad_token_id', None)
+    self._pad_token_id = pad_id if pad_id is not None else tokenizer.eos_token_id
+    # Number of groups seen; used to throttle the per-action detail block.
+    self._group_counter = 0
+    # Pass-level totals, reported by ``log_summary``.
+    self.total_groups = 0
+    self.total_sampled_distinct = 0
+    self.total_final_distinct = 0
+    self.total_substituted = 0
+    self.total_slots_left_duplicate = 0
+
+  def _encode_completion(self, text: str, width: int, device) -> torch.Tensor:
+    """Tokenises a substituted action to exactly ``width`` token IDs.
+
+    Args:
+      text: The action description to write into the slot.
+      width: Completion width of the generated tensor.
+      device: Device of the tensor being written.
+
+    Returns:
+      A 1-D tensor of length ``width``: the action tokens, EOS, then pad.
+    """
+    # The prompt ends with "Action:\n", so completions begin with a
+    # leading space in the model's own samples; match that.
+    ids = self._tokenizer.encode(' ' + text, add_special_tokens=False)
+    if not ids:
+      ids = self._tokenizer.encode(text, add_special_tokens=False)
+    if self._eos_token_id is not None:
+      # EOS must survive truncation: TRL builds the completion mask from
+      # the first EOS, and a slot with no EOS is masked to full width.
+      ids = ids[: max(width - 1, 0)] + [self._eos_token_id]
+    ids = ids[:width]
+    pad = self._pad_token_id if self._pad_token_id is not None else 0
+    ids = ids + [pad] * (width - len(ids))
+    return torch.tensor(ids, dtype=torch.long, device=device)
+
+  def _candidate_actions(
+      self,
+      ser_state,
+      player_id: int,
+      legal_actions_desc: list[tuple[int, str]],
+      present: set[int],
+  ) -> list[tuple[int, str, str]]:
+    """Ranks actions missing from the group, best first.
+
+    Args:
+      ser_state: Serialized game+state for this prompt.
+      player_id: The acting player.
+      legal_actions_desc: ``(action_id, description)`` for every legal action.
+      present: Action IDs already covered by a kept completion.
+
+    Returns:
+      ``(action_id, description, tier)`` triples, highest value first.
+    """
+    text_by_id = dict(legal_actions_desc)
+    ordered: list[tuple[int, str, str]] = []
+    chosen: set[int] = set()
+
+    try:
+      from learn.strategic_actions import analyze_strategic_actions  # pylint: disable=g-import-not-at-top
+
+      _, state = _deserialize_game_and_state(ser_state)
+      plan = analyze_strategic_actions(
+          state=state,
+          player_id=player_id,
+          legal_actions_desc=legal_actions_desc,
+          num_generations=self._k,
+          # Rank every tier; the caller caps how many are actually used.
+          max_forced_fraction=1.0,
+      )
+      tiers = (
+          ('safe_play', plan.known_safe_plays),
+          ('risky_play', plan.risky_plays),
+          ('smart_discard', plan.smart_discards),
+          ('diverse_hint', plan.diverse_hints),
+      )
+      for tier_name, action_ids in tiers:
+        for aid in action_ids:
+          if aid in present or aid in chosen:
+            continue
+          desc = plan.action_texts.get(aid) or text_by_id.get(aid, '')
+          if desc:
+            ordered.append((aid, desc, tier_name))
+            chosen.add(aid)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logging.warning('[diversify] strategic analysis failed: %s', e)
+
+    # Diversity floor: the strategic tiers can come back short (e.g. no
+    # safe play exists and every hint duplicates one already sampled).
+    # An unexplored legal action is still worth more than a duplicate.
+    for aid, desc in legal_actions_desc:
+      if aid in present or aid in chosen or not desc:
+        continue
+      ordered.append((aid, desc, 'legal_fill'))
+      chosen.add(aid)
+
+    return ordered
+
+  def _diversify_group(
+      self,
+      sequences: torch.Tensor,
+      prompt_len: int,
+      width: int,
+      group_start: int,
+      max_subs: int,
+  ) -> None:
+    """De-duplicates and back-fills one group of K completions in place."""
+    tokenizer = self._tokenizer
+    prompt_text = tokenizer.decode(
+        sequences[group_start, :prompt_len], skip_special_tokens=True
+    ).strip()
+    metadata = _lookup_prompt_metadata(self._runner, prompt_text)
+    if not metadata:
+      return
+    legal_actions_desc = metadata.get('legal_actions_desc') or []
+    ser_state = metadata.get('serialized_state')
+    if not legal_actions_desc or ser_state is None:
+      return
+    player_id = metadata.get('player_id', 0)
+    renderer = self._runner._renderers[player_id]  # pylint: disable=protected-access
+
+    texts: list[str] = []
+    action_ids: list[int | None] = []
+    for j in range(self._k):
+      text = tokenizer.decode(
+          sequences[group_start + j, prompt_len:], skip_special_tokens=True
+      ).strip()
+      texts.append(text)
+      action_ids.append(renderer.parse_action(text, legal_actions_desc))
+
+    # First completion per distinct action keeps its slot; repeats and
+    # parse failures free theirs.
+    kept: dict[int, int] = {}
+    counts: dict[int, int] = {}
+    free_slots: list[int] = []
+    num_unparsed = 0
+    for j, aid in enumerate(action_ids):
+      if aid is None:
+        num_unparsed += 1
+        free_slots.append(j)
+        continue
+      counts[aid] = counts.get(aid, 0) + 1
+      if aid in kept:
+        free_slots.append(j)
+      else:
+        kept[aid] = j
+
+    candidates = self._candidate_actions(
+        ser_state, player_id, legal_actions_desc, set(kept)
+    )
+    num_subs = min(len(free_slots), len(candidates), max_subs)
+
+    substitutions: list[tuple[int, int, str, str]] = []
+    device = sequences.device
+    for slot, (aid, desc, tier) in zip(free_slots[:num_subs], candidates):
+      sequences[group_start + slot, prompt_len:] = self._encode_completion(
+          desc, width, device
+      )
+      substitutions.append((slot, aid, desc, tier))
+
+    self._group_counter += 1
+    self.total_groups += 1
+    self.total_sampled_distinct += len(kept)
+    self.total_final_distinct += len(kept) + num_subs
+    self.total_substituted += num_subs
+    self.total_slots_left_duplicate += len(free_slots) - num_subs
+
+    logging.info(
+        '[diversify] P%d group: K=%d | model sampled %d distinct '
+        '(%d unparseable) -> %d distinct after %d substitutions '
+        '| %d slots still duplicate',
+        player_id,
+        self._k,
+        len(kept),
+        num_unparsed,
+        len(kept) + num_subs,
+        num_subs,
+        len(free_slots) - num_subs,
+    )
+
+    # Per-action detail for the first few groups of each pass: enough to
+    # see the collapse and the fix without flooding the log.
+    if self._group_counter <= 5:
+      for aid, slot in sorted(
+          kept.items(), key=lambda kv: -counts.get(kv[0], 0)
+      ):
+        logging.info(
+            '[diversify]   kept  x%-2d a=%-3d %r',
+            counts.get(aid, 1),
+            aid,
+            texts[slot][:60],
+        )
+      if num_unparsed:
+        logging.info(
+            '[diversify]   unparseable x%d (slots freed)', num_unparsed
+        )
+      for slot, aid, desc, tier in substitutions:
+        logging.info(
+            '[diversify]   +sub  slot %-2d a=%-3d [%s] %r',
+            slot,
+            aid,
+            tier,
+            desc[:60],
+        )
+
+  def diversify(self, sequences: torch.Tensor, prompt_len: int):
+    """Rewrites duplicate completion slots across every group in a batch.
+
+    Args:
+      sequences: ``[batch, prompt_len + completion_len]`` generated IDs.
+        Modified in place.
+      prompt_len: Number of prompt tokens prefixed to every row.
+
+    Returns:
+      ``sequences`` (same object), for call-site convenience.
+    """
+    if not torch.is_tensor(sequences) or sequences.dim() != 2:
+      return sequences
+    total, seq_len = sequences.shape
+    width = seq_len - prompt_len
+    if width <= 0 or self._k <= 1 or total < self._k:
+      return sequences
+    max_subs = max(0, int(self._k * self._max_fraction))
+    if max_subs == 0:
+      return sequences
+
+    for group_start in range(0, total - self._k + 1, self._k):
+      try:
+        self._diversify_group(
+            sequences, prompt_len, width, group_start, max_subs
+        )
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        # A failure here must never take down training: the group simply
+        # stays as the model sampled it.
+        logging.warning(
+            '[diversify] group at batch index %d skipped: %s', group_start, e
+        )
+    return sequences
+
+  def log_summary(self, pass_idx: int, player_id) -> None:
+    """Logs pass-level de-duplication totals."""
+    if not self.total_groups:
+      logging.warning(
+          '[diversify] pass %d: NO groups were processed -- the generate '
+          'wrapper never fired or no prompt metadata matched.',
+          pass_idx,
+      )
+      return
+    logging.info(
+        '[diversify] pass %d P%s SUMMARY: %d groups | mean distinct '
+        '%.2f -> %.2f of K=%d | %d substitutions | %d slots left duplicate',
+        pass_idx,
+        player_id,
+        self.total_groups,
+        self.total_sampled_distinct / self.total_groups,
+        self.total_final_distinct / self.total_groups,
+        self._k,
+        self.total_substituted,
+        self.total_slots_left_duplicate,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # TRL-based GRPO training step
 # ═══════════════════════════════════════════════════════════════════════
@@ -1384,10 +1720,55 @@ def _train_grpo_on_prompts(
   # ── Constrained / strategic action generation ──
   # When enabled, wrap model.generate to force action diversity.
   original_generate = runner._backend.model.generate
-  if runner._config.strategic_action_selection:
+  diversifier = None
+  strategic_mode = getattr(
+      runner._config, 'strategic_action_mode', 'substitute'
+  )
+  if runner._config.strategic_action_selection and strategic_mode == 'substitute':
+    # Post-generation substitution.  Sample K freely, de-duplicate by
+    # parsed action, then overwrite the freed slots with strategic
+    # actions the group does not already contain.
+    sub_ratio = getattr(
+        runner._config, 'strategic_action_forced_ratio', 1.0
+    )
     logging.info(
-        'Enabling strategic action selection: state-aware action injection '
-        '(safe plays, risky plays, smart discards, diverse hints) for K=%d',
+        'Enabling strategic action selection [mode=substitute]: sample K=%d, '
+        'de-duplicate by parsed action, back-fill up to %d slots with '
+        'strategic actions (safe plays, risky plays, smart discards, '
+        'diverse hints, then any unexplored legal action)',
+        runner._config.num_generations,
+        int(runner._config.num_generations * sub_ratio),
+    )
+    diversifier = GroupDiversifier(
+        tokenizer=runner._backend.tokenizer,
+        runner=runner,
+        num_generations=runner._config.num_generations,
+        max_substitution_fraction=sub_ratio,
+    )
+
+    def wrapped_generate(*args, **kwargs):
+      output = original_generate(*args, **kwargs)
+      # TRL calls generate(prompt_ids, attention_mask=..., ...), so the
+      # prompt width comes from the first positional argument.
+      prompt_ids = args[0] if args else kwargs.get('input_ids')
+      if prompt_ids is None or not torch.is_tensor(prompt_ids):
+        logging.warning(
+            '[diversify] could not locate prompt ids in generate() call; '
+            'group left as sampled'
+        )
+        return output
+      prompt_len = prompt_ids.shape[1]
+      # ``return_dict_in_generate`` yields an object wrapping the tensor.
+      sequences = getattr(output, 'sequences', output)
+      diversifier.diversify(sequences, prompt_len)
+      return output
+
+    runner._backend.model.generate = wrapped_generate
+  elif runner._config.strategic_action_selection:
+    logging.info(
+        'Enabling strategic action selection [mode=logits]: state-aware '
+        'action injection (safe plays, risky plays, smart discards, '
+        'diverse hints) for K=%d',
         runner._config.num_generations,
     )
 
@@ -1449,6 +1830,8 @@ def _train_grpo_on_prompts(
         or runner._config.constrained_action_types
     ):
       runner._backend.model.generate = original_generate
+    if diversifier is not None:
+      diversifier.log_summary(pass_idx, player_id)
 
   # Extract training metrics.
   pass_loss = 0.0

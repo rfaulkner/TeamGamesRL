@@ -349,11 +349,24 @@ flags.DEFINE_bool(
     'discards, diverse hints) based on the full game state. '
     'Takes precedence over --constrained_action_types when both are True.',
 )
+flags.DEFINE_enum(
+    'strategic_action_mode',
+    'substitute',
+    ['substitute', 'logits'],
+    'How strategic actions enter the GRPO group. "substitute" (default) '
+    'samples all K completions freely, de-duplicates them by parsed '
+    'action, then overwrites the duplicate and unparseable slots with '
+    'strategic actions not already in the group. "logits" is the original '
+    'behaviour: force actions into fixed slots during generation, before '
+    'seeing what the policy would have sampled.',
+)
 flags.DEFINE_float(
     'strategic_action_forced_ratio',
     1.0,
-    'Fraction of K completions to force with strategic actions (0.0 to 1.0). '
-    'Default 1.0 (100% strategic actions in early training).',
+    'Fraction of K completions strategic actions may occupy (0.0 to 1.0). '
+    'Default 1.0. Under mode=logits this many slots are forced '
+    'unconditionally; under mode=substitute it is only a cap on how many '
+    'duplicate slots may be rewritten.',
 )
 flags.DEFINE_bool(
     'llm_partner_response',
@@ -460,6 +473,7 @@ def main(argv: list[str]) -> None:
       'grpo_scale_rewards': FLAGS.grpo_scale_rewards,
       'constrained_action_types': FLAGS.constrained_action_types,
       'strategic_action_selection': FLAGS.strategic_action_selection,
+      'strategic_action_mode': FLAGS.strategic_action_mode,
       'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
       'llm_partner_response': FLAGS.llm_partner_response,
       # REINFORCE-specific configuration.
@@ -535,6 +549,7 @@ def main(argv: list[str]) -> None:
         grpo_scale_rewards=FLAGS.grpo_scale_rewards,
         constrained_action_types=FLAGS.constrained_action_types,
         strategic_action_selection=FLAGS.strategic_action_selection,
+        strategic_action_mode=FLAGS.strategic_action_mode,
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
         llm_partner_response=FLAGS.llm_partner_response,
     )
