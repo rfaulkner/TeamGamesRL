@@ -373,6 +373,35 @@ class GRPOConfig:
   Only used when ``reward_blend_weight > 0``.
   """
 
+  reward_turn_discount: float = 1.0
+  """Per-turn discount gamma on the heuristic rollout's terminal score.
+
+  The rollout reward becomes ``gamma**turns * score``, where ``turns`` is
+  the number of turns the heuristic continuation needs to reach terminal.
+  ``1.0`` (default) disables it and reproduces the undiscounted reward.
+
+  Why it exists: the undiscounted rollout reward is dominated by the deal
+  rather than by the candidate action.  All rewards land in a narrow
+  positive band (0.0-0.4 observed), advantages are noise, and the only
+  action class with real downside is *playing*, because only a play can
+  bomb.  The argmax of that reward is "never play", and runs 5454236 /
+  5454292 both converged to exactly that: ~1% plays and games running to
+  deck exhaustion at score 0.  Discounting makes a successful play win
+  twice -- higher score AND fewer turns to terminal -- and makes an
+  unbounded hint loop exponentially bad.
+
+  Must be multiplicative.  An additive per-turn cost would make bombing out
+  at turn 6 (score 0, tiny cost) beat stalling 80 turns to a score of 2,
+  i.e. it would reward losing on purpose.  With a multiplicative discount,
+  score 0 is a fixed point and that inversion cannot happen.
+
+  Suggested range: 0.95-0.99.  At gamma=0.98 and a typical 40-turn tail the
+  terminal score is scaled by ~0.45, so each wasted turn costs ~2% of the
+  score; at 0.95 the tail factor is ~0.13 and the pressure is much sharper.
+
+  Only used when ``reward_blend_weight > 0``.
+  """
+
   grpo_scale_rewards: str = 'batch'
   """How TRL normalises rewards into advantages: group / batch / none.
 

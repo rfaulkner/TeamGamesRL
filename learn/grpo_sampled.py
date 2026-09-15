@@ -585,7 +585,7 @@ def _rollout_policy_turns(runner, state, num_turns: int) -> int:
 
 def _heuristic_rollout_score(
     runner, state, target_player: int, max_score: float = 25.0,
-    seed: int | None = None,
+    seed: int | None = None, turn_discount: float = 1.0,
 ) -> float:
   """Roll out the game to terminal with heuristic play, return game score.
 
@@ -604,10 +604,41 @@ def _heuristic_rollout_score(
         within-group comparison that GRPO actually differentiates.
         ``None`` reproduces the previous behaviour (fresh randomness per
         call).
+    turn_discount: Per-turn discount gamma applied to the terminal score,
+        i.e. the return is ``gamma**turns * score``.  ``1.0`` disables it
+        and reproduces the undiscounted behaviour.  See the note below.
 
   Returns:
-    Normalized game score in [0, 1].
+    Normalized, turn-discounted game score in [0, 1].
   """
+  # ── Why discount by turns ──
+  # Without this, the reward is the terminal score of a SafePlayPlayer
+  # continuation, which is dominated by the deal rather than by the
+  # candidate action: every action in a GRPO group scores within a whisker
+  # of every other, all rewards land in a narrow band around +0.1, and the
+  # advantages are pure noise.  Worse, the only action class with any real
+  # downside is *playing* (it can bomb), so the argmax of that reward is
+  # "never play".  Runs 5454236 / 5454292 both collapsed into exactly that:
+  # ~1% plays, games running to deck exhaustion at score 0.
+  #
+  # Discounting makes reaching a given score sooner strictly better, so a
+  # successful play beats a hint twice over -- it raises the score and it
+  # shortens the remaining game.
+  #
+  # It MUST be multiplicative, not an additive per-turn cost.  With an
+  # additive cost, bombing out after 6 turns (score 0, small cost) scores
+  # HIGHER than stalling 80 turns to a score of 2, so the reward would
+  # actively teach the model to lose on purpose.  Multiplicatively, score 0
+  # is a fixed point: gamma**6 * 0 == 0 < gamma**80 * 0.08.
+  #
+  # Honest caveat: Hanabi ends on deck exhaustion, and discards/plays draw
+  # while hints do not, so discounting also mildly favours discarding over
+  # hinting.  That is the intended direction here (the hint spiral is the
+  # worse failure mode) but it is not a pure "progress" signal.
+  #
+  # Across-group level differences (late states have fewer turns left, so
+  # larger gamma**turns) do not matter: TRL subtracts the group mean, and a
+  # group is one prompt, hence one game state.
   try:
     from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
 
@@ -619,6 +650,7 @@ def _heuristic_rollout_score(
 
   game = getattr(runner._env, 'game', None)
 
+  turns = 0
   while not state.is_terminal():
     player = state.current_player()
     legal = state.legal_actions(player)
@@ -631,6 +663,7 @@ def _heuristic_rollout_score(
     else:
       action = int(rng.choice(legal))
     state.apply_action(action)
+    turns += 1
 
   # Extract terminal score.
   if state.is_terminal() and state.rewards() is not None:
@@ -643,7 +676,10 @@ def _heuristic_rollout_score(
   else:
     score = 0.0
 
-  return score / max_score
+  value = score / max_score
+  if turn_discount != 1.0:
+    value *= turn_discount**turns
+  return value
 
 
 def _rollout_value(
@@ -653,6 +689,7 @@ def _rollout_value(
     num_samples: int = 1,
     seed: int | None = None,
     max_score: float = 25.0,
+    turn_discount: float = 1.0,
 ) -> float:
   """Estimate the value of ``base_state`` by averaging heuristic rollouts.
 
@@ -674,16 +711,23 @@ def _rollout_value(
         values are effectively free.
     seed: Base seed for the rollouts.  ``None`` disables CRN.
     max_score: Maximum possible game score (25 for standard Hanabi).
+    turn_discount: Per-turn discount applied to each rollout's terminal
+        score; see ``_heuristic_rollout_score``.  ``1.0`` disables it.
 
   Returns:
-    Mean normalized game score in [0, 1].
+    Mean normalized, turn-discounted game score in [0, 1].
   """
   num_samples = max(1, int(num_samples))
 
   # Fast path: single sample, no clone needed.
   if num_samples == 1:
     return _heuristic_rollout_score(
-        runner, base_state, target_player, max_score=max_score, seed=seed
+        runner,
+        base_state,
+        target_player,
+        max_score=max_score,
+        seed=seed,
+        turn_discount=turn_discount,
     )
 
   scores = []
@@ -696,6 +740,7 @@ def _rollout_value(
             target_player,
             max_score=max_score,
             seed=None if seed is None else seed + i,
+            turn_discount=turn_discount,
         )
     )
   return float(np.mean(scores))
@@ -1389,11 +1434,16 @@ def _train_grpo_on_prompts(
     Tuple of ``(mean_loss, mean_reward)``.
   """
   eval_counter = [0]
+  # Monotonic GRPO-group id within this pass.  Lives outside reward_fn
+  # because TRL calls reward_fn once per generation batch and we want
+  # group numbers that keep counting up across the whole pass.
+  group_counter = [0]
 
   def reward_fn(completions, prompts=None, **kwargs):
     del kwargs
     rewards = []
     reward_cache = {}  # (prompt_text, action_id) -> reward tensor
+    group_records = []  # one dict per completion, for the group/z-score dump
     _action_type_tracker = {}  # prompt_text -> {play, discard, hint, total}
     cache_hits = 0
     for i, completion in enumerate(completions):
@@ -1430,8 +1480,16 @@ def _train_grpo_on_prompts(
         rewards.append(reward_cache[cache_key])
         cache_hits += 1
         eval_counter[0] += 1
+        status = 'parsed' if parsed else 'random_fallback'
+        group_records.append({
+            'prompt': prompt_text,
+            'player': p_id,
+            'text': comp_text.strip()[:60],
+            'action': action_id,
+            'status': status + '/cached',
+            'reward': float(reward_cache[cache_key]),
+        })
         if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
-          status = 'parsed' if parsed else 'random_fallback'
           logging.info(
               '[GRPO eval #%d] P%d | completion=%r '
               '-> action=%s (%s) | reward=%.1f (cached)',
@@ -1600,6 +1658,7 @@ def _train_grpo_on_prompts(
                 p_id,
                 num_samples=runner._config.reward_rollout_samples,
                 seed=group_seed,
+                turn_discount=runner._config.reward_turn_discount,
             )
 
             # ── Convex survival factor ──
@@ -1646,8 +1705,16 @@ def _train_grpo_on_prompts(
       reward_cache[cache_key] = reward_tensor
 
       eval_counter[0] += 1
+      status = 'parsed' if parsed else 'random_fallback'
+      group_records.append({
+          'prompt': prompt_text,
+          'player': p_id,
+          'text': comp_text.strip()[:60],
+          'action': action_id,
+          'status': status,
+          'reward': float(reward),
+      })
       if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
-        status = 'parsed' if parsed else 'random_fallback'
         logging.info(
             '[GRPO eval #%d] P%d | completion=%r '
             '-> action=%s (%s) | reward=%.1f',
@@ -1666,6 +1733,59 @@ def _train_grpo_on_prompts(
           len(rewards),
           100.0 * cache_hits / len(rewards),
       )
+
+    # ── Per-group reward / z-score dump ──
+    # One GRPO group == one prompt == one game state, and the K completions
+    # in it are K candidate actions.  TRL ALWAYS subtracts the group mean;
+    # only the denominator depends on ``grpo_scale_rewards`` ('group' ->
+    # group std, 'batch' -> batch std, 'none' -> 1).  The z-score logged
+    # here is the 'group' normalisation, (r - mean) / (std + 1e-4), which
+    # is the exact advantage under scale_rewards='group' and is
+    # proportional to it under 'batch'.
+    #
+    # The point of this dump is diagnostic: a group whose rewards are all
+    # equal has std=0, every advantage is 0, and the group contributes NO
+    # gradient no matter how many tokens it cost to generate.  Counting
+    # those lines tells us directly how much of a pass was wasted.
+    groups = {}
+    for rec in group_records:
+      groups.setdefault(rec['prompt'], []).append(rec)
+    for recs in groups.values():
+      group_counter[0] += 1
+      vals = np.asarray([r['reward'] for r in recs], dtype=np.float64)
+      mean_r = float(vals.mean())
+      std_r = float(vals.std())
+      gid = group_counter[0]
+      logging.info(
+          '[GRPO group #%d] P%d | n=%d distinct_actions=%d | '
+          'reward mean=%+.4f std=%.4f min=%+.4f max=%+.4f%s',
+          gid,
+          recs[0]['player'],
+          len(recs),
+          len({r['action'] for r in recs}),
+          mean_r,
+          std_r,
+          float(vals.min()),
+          float(vals.max()),
+          '  *** DEGENERATE: std=0, zero gradient ***'
+          if std_r < 1e-6
+          else '',
+      )
+      for slot, rec in enumerate(recs):
+        adv = rec['reward'] - mean_r
+        logging.info(
+            '[GRPO group #%d]   [%d] a=%-3s %-15s r=%+.4f adv=%+.4f '
+            'z=%+.4f | %r',
+            gid,
+            slot,
+            rec['action'],
+            rec['status'],
+            rec['reward'],
+            adv,
+            adv / (std_r + 1e-4),
+            rec['text'],
+        )
+
     return rewards
 
   # Build output directory.
@@ -1888,7 +2008,7 @@ def run_sampled(runner) -> None:
   logging.info(
       'Starting GRPO training: %d passes, %d episodes/pass, K=%d, '
       'reward_sim=%s, horizon=%s, blend_w=%.2f, policy_turns=%d, '
-      'scale_rewards=%s, '
+      'turn_discount=%.3f, scale_rewards=%s, '
       'constrained_actions=%s, strategic_actions=%s, llm_partner=%s',
       runner._config.passes,
       runner._config.collect_episodes,
@@ -1897,6 +2017,7 @@ def run_sampled(runner) -> None:
       runner._config.truncated_rollout_horizon,
       runner._config.reward_blend_weight,
       runner._config.reward_policy_turns,
+      runner._config.reward_turn_discount,
       runner._config.grpo_scale_rewards,
       runner._config.constrained_action_types,
       runner._config.strategic_action_selection,

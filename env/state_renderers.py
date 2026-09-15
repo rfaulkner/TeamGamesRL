@@ -1392,10 +1392,28 @@ class HanabiRenderer(BaseStateRenderer):
               matches.append(action_id)
         if len(matches) == 1:
           return matches[0]
-        # Zero or several candidates: fall through to fuzzy matching rather
-        # than returning an arbitrary hint, which is what caused the bug
-        # above.  A wrong action is worse than an unparsed one, because the
-        # reward is computed for the action that actually executes.
+        # Zero or several candidates: fall through rather than returning an
+        # arbitrary hint, which is what caused the bug above.  A wrong action
+        # is worse than an unparsed one, because the reward is computed for
+        # the action that actually executes.
+
+    # Hint intent with no unique match: give up rather than fuzzy-match.
+    #
+    # ``_fuzzy_match_action`` scores by string similarity, and the nearest
+    # legal action to 'Hint card 1 about rank 4' is 'Discard card 1 from
+    # your hand' -- same index, same shape.  Observed in real runs:
+    #     'Hint card 1 about rank 4 cards.' -> action=1  (Discard 1)
+    #     'Hint card 2 about rank 4'        -> action=2  (Discard 2)
+    #     'Hint Player 1 about White cards' -> action=5  (Play 0)
+    # This happens whenever the named hint is illegal (the partner holds no
+    # card of that rank/colour), which is common.  It is far worse than a
+    # parse failure: it is a *deterministic* map from hint text to a discard
+    # of the same index, so the discard's reward gets attributed to the hint
+    # text and the model learns 'say hint, get discard credit'.  Returning
+    # None makes the caller fall back to a uniformly random legal action,
+    # which is wrong but uncorrelated, so it cannot be learned.
+    if hint_match:
+      return None
 
     # Fall back to fuzzy matching.
     return _fuzzy_match_action(text, legal_actions)

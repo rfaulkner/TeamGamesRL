@@ -309,6 +309,20 @@ flags.DEFINE_float(
     'the third. This restores the missing gradient. 2.0 gives multipliers '
     '1.00 / 0.44 / 0.11 for 3 / 2 / 1 lives. Default 0.0 (disabled).',
 )
+flags.DEFINE_float(
+    'reward_turn_discount',
+    1.0,
+    'Per-turn discount gamma on the heuristic rollout score: the reward '
+    'becomes gamma ** turns_to_terminal * score. Undiscounted, the reward '
+    'is deal-dominated and nearly flat across a group, and the only action '
+    'class with real downside is playing (only a play can bomb) -- so the '
+    'argmax is "never play" and runs collapse into a hint/discard loop that '
+    'runs to deck exhaustion at score 0. Discounting makes a successful '
+    'play win twice: higher score AND fewer turns left. Must be '
+    'multiplicative, not an additive per-turn cost, or bombing out early '
+    'would outscore a slow positive result. Try 0.95-0.99. '
+    'Default 1.0 (disabled).',
+)
 flags.DEFINE_integer(
     'reward_policy_turns',
     1,
@@ -469,6 +483,7 @@ def main(argv: list[str]) -> None:
       'reward_rollout_samples': FLAGS.reward_rollout_samples,
       'reward_rollout_common_seed': FLAGS.reward_rollout_common_seed,
       'reward_survival_exponent': FLAGS.reward_survival_exponent,
+      'reward_turn_discount': FLAGS.reward_turn_discount,
       'reward_policy_turns': FLAGS.reward_policy_turns,
       'grpo_scale_rewards': FLAGS.grpo_scale_rewards,
       'constrained_action_types': FLAGS.constrained_action_types,
@@ -545,6 +560,7 @@ def main(argv: list[str]) -> None:
         reward_rollout_samples=FLAGS.reward_rollout_samples,
         reward_rollout_common_seed=FLAGS.reward_rollout_common_seed,
         reward_survival_exponent=FLAGS.reward_survival_exponent,
+        reward_turn_discount=FLAGS.reward_turn_discount,
         reward_policy_turns=FLAGS.reward_policy_turns,
         grpo_scale_rewards=FLAGS.grpo_scale_rewards,
         constrained_action_types=FLAGS.constrained_action_types,
