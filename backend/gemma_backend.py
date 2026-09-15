@@ -83,6 +83,7 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
       use_4bit: bool = True,
       max_seq_len: int = 512,
       device: Optional[str] = None,
+      lora_checkpoint: Optional[str] = None,
   ):
     """Initializes the Gemma LLM backend with LoRA.
 
@@ -94,6 +95,7 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
       use_4bit: Whether to load the base model in 4-bit precision.
       max_seq_len: Maximum sequence length for tokenization.
       device: Target device ('cuda', 'cpu', or None for auto).
+      lora_checkpoint: Optional path to a pre-trained LoRA adapter to load (warm start).
     """
     _lazy_import_hf()
 
@@ -147,7 +149,13 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
     if use_4bit:
       self.model = peft.prepare_model_for_kbit_training(self.model)
 
-    self.model = peft.get_peft_model(self.model, self._lora_config_template)
+    if lora_checkpoint and os.path.exists(lora_checkpoint):
+      logging.info('Loading pre-trained LoRA adapter from: %s', lora_checkpoint)
+      self.model = peft.PeftModel.from_pretrained(
+          self.model, lora_checkpoint, is_trainable=True
+      )
+    else:
+      self.model = peft.get_peft_model(self.model, self._lora_config_template)
     self.model.print_trainable_parameters()
     self._active_adapter: str = 'default'
 

@@ -132,6 +132,8 @@ for arg in "$@"; do
     --strategic_action_mode=*) STRATEGIC_ACTION_MODE="${arg#*=}" ;;
     --strategic_action_forced_ratio=*) STRATEGIC_ACTION_FORCED_RATIO="${arg#*=}" ;;
     --llm_partner_response) LLM_PARTNER_RESPONSE="true" ;;
+    --initial_lora_checkpoint=*|--warm_start_adapter=*)
+      EXTRA_FLAGS="${EXTRA_FLAGS} --initial_lora_checkpoint=${arg#*=}" ;;
     --help|-h)
       echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=MODE] [--reward_blend_weight=W] [--reward_rollout_samples=N] [--no_reward_rollout_common_seed] [--reward_survival_exponent=E] [--reward_turn_discount=G] [--reward_policy_turns=M] [--grpo_scale_rewards=group|batch|none] [--constrained_action_types] [--strategic_action_selection] [--strategic_action_mode=substitute|logits] [--strategic_action_forced_ratio=R] [--llm_partner_response] [--extra...]"
       exit 0 ;;
@@ -145,7 +147,8 @@ echo "[CONFIG] Profile: ${PROFILE} | Passes: ${GRPO_PASSES} | Episodes/Pass: ${C
 # ── Derived settings ─────────────────────────────────────────────────────────
 
 project_dir="/home/$USER/projects/aip-rgrosse/$USER/TeamGamesRL"
-output_dir="/scratch/$USER/teamgamesrl/${GAME}_gemma3-12b_lr${LR}_rank${LORA_RANK}_passes${GRPO_PASSES}_${SLURM_JOB_ID}"
+MODEL_TAG=$(echo "$MODEL_ID" | tr '/' '_')
+output_dir="/scratch/$USER/teamgamesrl/${GAME}_${MODEL_TAG}_lr${LR}_rank${LORA_RANK}_passes${GRPO_PASSES}_${SLURM_JOB_ID}"
 
 export HF_HOME="/scratch/$USER/hf_cache"
 export WANDB_DISABLED=true

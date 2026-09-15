@@ -95,6 +95,11 @@ flags.DEFINE_bool(
     'use_4bit', True, 'Use 4-bit NF4 quantization for the base model.'
 )
 flags.DEFINE_string(
+    'initial_lora_checkpoint',
+    None,
+    'Path to a pre-trained LoRA adapter to load for warm-start initialization.',
+)
+flags.DEFINE_string(
     'output_dir',
     '/tmp/teamgamesrl',
     'Directory for checkpoints, logs, and metrics.',
@@ -427,6 +432,7 @@ def main(argv: list[str]) -> None:
       lora_dropout=FLAGS.lora_dropout,
       use_4bit=FLAGS.use_4bit,
       max_seq_len=FLAGS.max_seq_len,
+      lora_checkpoint=FLAGS.initial_lora_checkpoint,
   )
 
   # ── Build full experiment config for reproducibility ──
