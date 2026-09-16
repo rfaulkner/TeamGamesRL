@@ -1150,7 +1150,15 @@ class GroupDiversifier:
     if self._eos_token_id is not None:
       # EOS must survive truncation: TRL builds the completion mask from
       # the first EOS, and a slot with no EOS is masked to full width.
-      ids = ids[: max(width - 1, 0)] + [self._eos_token_id]
+      if len(ids) >= width:
+        logging.warning(
+            '[diversify] completion %r has %d tokens >= width %d; truncating',
+            text,
+            len(ids),
+            width,
+        )
+        ids = ids[: max(width - 1, 0)]
+      ids = ids + [self._eos_token_id]
     ids = ids[:width]
     pad = self._pad_token_id if self._pad_token_id is not None else 0
     ids = ids + [pad] * (width - len(ids))
@@ -1325,16 +1333,16 @@ class GroupDiversifier:
             desc[:60],
         )
 
-  def diversify(self, sequences: torch.Tensor, prompt_len: int):
+  def diversify(self, sequences: torch.Tensor, prompt_len: int) -> torch.Tensor:
     """Rewrites duplicate completion slots across every group in a batch.
 
     Args:
       sequences: ``[batch, prompt_len + completion_len]`` generated IDs.
-        Modified in place.
+        Modified in place where possible, or reallocated if width expands.
       prompt_len: Number of prompt tokens prefixed to every row.
 
     Returns:
-      ``sequences`` (same object), for call-site convenience.
+      ``sequences`` (possibly extended along sequence dimension).
     """
     if not torch.is_tensor(sequences) or sequences.dim() != 2:
       return sequences
@@ -1345,6 +1353,28 @@ class GroupDiversifier:
     max_subs = max(0, int(self._k * self._max_fraction))
     if max_subs == 0:
       return sequences
+
+    # Expand width if current generated completion length is shorter than
+    # max_completion_length, so that longer substituted actions (e.g. rank hints)
+    # are never truncated.
+    target_width = max(
+        width, getattr(self._runner._config, 'max_completion_length', 20)
+    )
+    if target_width > width:
+      pad_id = (
+          self._pad_token_id
+          if self._pad_token_id is not None
+          else (self._eos_token_id or 0)
+      )
+      pad_len = target_width - width
+      padding = torch.full(
+          (total, pad_len),
+          pad_id,
+          dtype=sequences.dtype,
+          device=sequences.device,
+      )
+      sequences = torch.cat([sequences, padding], dim=1)
+      width = target_width
 
     for group_start in range(0, total - self._k + 1, self._k):
       try:
@@ -1504,30 +1534,57 @@ def _train_grpo_on_prompts(
         parsed = False
         action_id = int(np.random.choice(legal_actions)) if legal_actions else 0
 
-      # Check reward cache for duplicate (prompt, action) pairs.
-      cache_key = (prompt_text, action_id)
-      if cache_key in reward_cache:
-        rewards.append(reward_cache[cache_key])
-        cache_hits += 1
+      # If parsing failed, apply parse failure penalty immediately without
+      # touching the reward cache. This prevents parse failures from poisoning
+      # legitimate actions in the cache, and prevents unparseable text from
+      # receiving cached positive rewards.
+      if not parsed:
+        parse_penalty = -0.3
+        reward_tensor = torch.tensor(float(parse_penalty))
+        rewards.append(reward_tensor)
         eval_counter[0] += 1
-        status = 'parsed' if parsed else 'random_fallback'
         group_records.append({
             'prompt': prompt_text,
             'player': p_id,
             'text': comp_text.strip()[:60],
             'action': action_id,
-            'status': status + '/cached',
+            'status': 'random_fallback',
+            'reward': float(parse_penalty),
+        })
+        if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
+          logging.info(
+              '[GRPO eval #%d] P%d | completion=%r '
+              '-> action=%s (random_fallback) | reward=%.1f',
+              eval_counter[0],
+              p_id,
+              comp_text.strip()[:60],
+              action_id,
+              parse_penalty,
+          )
+        continue
+
+      # Check reward cache for duplicate (prompt, action) pairs (parsed only).
+      cache_key = (prompt_text, action_id)
+      if cache_key in reward_cache:
+        rewards.append(reward_cache[cache_key])
+        cache_hits += 1
+        eval_counter[0] += 1
+        group_records.append({
+            'prompt': prompt_text,
+            'player': p_id,
+            'text': comp_text.strip()[:60],
+            'action': action_id,
+            'status': 'parsed/cached',
             'reward': float(reward_cache[cache_key]),
         })
         if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
           logging.info(
               '[GRPO eval #%d] P%d | completion=%r '
-              '-> action=%s (%s) | reward=%.1f (cached)',
+              '-> action=%s (parsed) | reward=%.1f (cached)',
               eval_counter[0],
               p_id,
               comp_text.strip()[:60],
               action_id,
-              status,
               float(reward_cache[cache_key]),
           )
         continue
@@ -1735,7 +1792,7 @@ def _train_grpo_on_prompts(
       reward_cache[cache_key] = reward_tensor
 
       eval_counter[0] += 1
-      status = 'parsed' if parsed else 'random_fallback'
+      status = 'parsed'
       group_records.append({
           'prompt': prompt_text,
           'player': p_id,
@@ -1747,12 +1804,11 @@ def _train_grpo_on_prompts(
       if eval_counter[0] <= 5 or eval_counter[0] % 25 == 0:
         logging.info(
             '[GRPO eval #%d] P%d | completion=%r '
-            '-> action=%s (%s) | reward=%.1f',
+            '-> action=%s (parsed) | reward=%.1f',
             eval_counter[0],
             p_id,
             comp_text.strip()[:60],
             action_id,
-            status,
             reward,
         )
 
@@ -1908,10 +1964,12 @@ def _train_grpo_on_prompts(
         )
         return output
       prompt_len = prompt_ids.shape[1]
-      # ``return_dict_in_generate`` yields an object wrapping the tensor.
       sequences = getattr(output, 'sequences', output)
-      diversifier.diversify(sequences, prompt_len)
-      return output
+      sequences = diversifier.diversify(sequences, prompt_len)
+      if hasattr(output, 'sequences'):
+        output.sequences = sequences
+        return output
+      return sequences
 
     runner._backend.model.generate = wrapped_generate
   elif runner._config.strategic_action_selection:
@@ -2072,9 +2130,20 @@ def run_sampled(runner) -> None:
     # ── Temperature annealing ──
     if runner._config.temperature_anneal_end is not None:
       progress = (pass_idx - 1) / max(runner._config.passes - 1, 1)
-      runner._current_temperature = runner._config.temperature + progress * (
+      annealed_temp = runner._config.temperature + progress * (
           runner._config.temperature_anneal_end - runner._config.temperature
       )
+      min_floor = getattr(runner._config, 'temperature_floor', 0.5)
+      if min_floor is not None and annealed_temp < min_floor:
+        if pass_idx == 1 or pass_idx % 5 == 0:
+          logging.warning(
+              'Temperature %.3f is below floor %.3f; clamping to floor to'
+              ' preserve generation diversity',
+              annealed_temp,
+              min_floor,
+          )
+        annealed_temp = min_floor
+      runner._current_temperature = annealed_temp
       logging.info(
           'Temperature annealed to %.3f (pass %d/%d)',
           runner._current_temperature,

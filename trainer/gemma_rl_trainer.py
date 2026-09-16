@@ -74,6 +74,11 @@ flags.DEFINE_float(
     'to 0.7 over the course of GRPO passes.',
 )
 flags.DEFINE_float(
+    'temperature_floor',
+    0.5,
+    'Minimum floor for annealed temperature to prevent generation collapse.',
+)
+flags.DEFINE_float(
     'epsilon',
     0.3,
     'Epsilon-greedy exploration rate during game collection. With this '
@@ -569,6 +574,7 @@ def main(argv: list[str]) -> None:
         reward_simulation_mode=FLAGS.reward_simulation_mode,
         dense_chain_discount=FLAGS.dense_chain_discount,
         temperature_anneal_end=FLAGS.temperature_anneal_end,
+        temperature_floor=FLAGS.temperature_floor,
         epsilon=FLAGS.epsilon,
         epsilon_anneal_end=FLAGS.epsilon_anneal_end,
         reward_blend_weight=FLAGS.reward_blend_weight,

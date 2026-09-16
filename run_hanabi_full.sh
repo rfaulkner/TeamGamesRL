@@ -55,6 +55,7 @@ COLLECT_EPISODES=20
 MAX_SEQ_LEN=2048
 TEMPERATURE="1.2"
 TEMPERATURE_ANNEAL_END="0.7"
+TEMPERATURE_FLOOR="0.5"
 MAX_COMPLETION_LENGTH=20
 EPSILON="0.3"
 EPSILON_ANNEAL_END="0.0"
@@ -116,6 +117,7 @@ for arg in "$@"; do
     --eval_episodes=*|--num_eval_episodes=*) NUM_EVAL_EPISODES="${arg#*=}" ;;
     --temperature=*)  TEMPERATURE="${arg#*=}" ;;
     --temperature_anneal_end=*) TEMPERATURE_ANNEAL_END="${arg#*=}" ;;
+    --temperature_floor=*) TEMPERATURE_FLOOR="${arg#*=}" ;;
     --max_completion_length=*) MAX_COMPLETION_LENGTH="${arg#*=}" ;;
     --epsilon=*)      EPSILON="${arg#*=}" ;;
     --epsilon_anneal_end=*) EPSILON_ANNEAL_END="${arg#*=}" ;;
@@ -218,6 +220,9 @@ mkdir -p slurm/output
 ANNEAL_FLAGS=""
 if [ -n "${TEMPERATURE_ANNEAL_END}" ] && [ "${TEMPERATURE_ANNEAL_END}" != "none" ]; then
   ANNEAL_FLAGS="--temperature_anneal_end=${TEMPERATURE_ANNEAL_END}"
+fi
+if [ -n "${TEMPERATURE_FLOOR}" ] && [ "${TEMPERATURE_FLOOR}" != "none" ]; then
+  ANNEAL_FLAGS="${ANNEAL_FLAGS} --temperature_floor=${TEMPERATURE_FLOOR}"
 fi
 
 # ── Run training ─────────────────────────────────────────────────────────────

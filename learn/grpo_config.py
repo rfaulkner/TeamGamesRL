@@ -96,6 +96,7 @@ class GRPOConfig:
   num_eval_episodes: int = 10
   per_player_updates: bool = True
   temperature_anneal_end: float | None = 0.7
+  temperature_floor: float = 0.5
   reward_variance_penalty: float = 0.0
   reward_num_simulations: int = 5
   exhaustive_groups: bool = False
