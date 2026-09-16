@@ -50,7 +50,7 @@ from open_spiel.python import rl_agent
 from env import state_renderers
 
 
-# System prompt template for the LLM agent.
+# System prompt template for the direct-action LLM agent (non-reasoning).
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert game-playing AI agent. You are playing the game: {game_name}.
 
@@ -62,6 +62,24 @@ RULES:
 - Do NOT add explanations, reasoning, commentary, or newlines.
 - Copy the action text exactly as shown in the legal actions list.
 - Think strategically to maximize your chance of winning.
+
+You are Player {player_id}.
+"""
+
+# System prompt template for the reasoning (Chain of Thought) LLM agent.
+_SYSTEM_PROMPT_REASONING_TEMPLATE = """\
+You are an expert game-playing AI agent. You are playing the game: {game_name}.
+
+{game_description}
+
+RULES:
+- You must select exactly one action from the list of legal actions provided.
+- First, analyze the current situation step-by-step inside <think>...</think>. Consider:
+  1. Fireworks status and remaining life / info tokens.
+  2. Confirmed playable or safe discard cards in your hand based on received clues.
+  3. Playable or critical cards in your partner's hand that need hints.
+  4. Which action (Play, Discard, or Hint) creates the highest game value.
+- After </think>, output the chosen action on a new line, matching the legal actions list.
 
 You are Player {player_id}.
 """
@@ -394,6 +412,7 @@ class LLMAgent:
       temperature: float = 0.7,
       max_retries: int = 3,
       seed: Optional[int] = None,
+      reasoning: bool = False,
   ):
     """Initializes the LLMAgent.
 
@@ -407,6 +426,8 @@ class LLMAgent:
       max_retries: Maximum number of retries when the LLM response cannot
         be parsed into a valid action.
       seed: Optional random seed for the fallback random action selection.
+      reasoning: If True, prompt the LLM to think step-by-step inside
+        <think>...</think> before selecting an action.
     """
     self.player_id = player_id
     self._renderer = renderer
@@ -417,6 +438,7 @@ class LLMAgent:
     self._temperature = temperature
     self._max_retries = max_retries
     self._rng = np.random.RandomState(seed)
+    self._reasoning = reasoning
 
     # Pre-compute the system prompt.
     game_type = game.get_type()
@@ -425,7 +447,12 @@ class LLMAgent:
         f'Number of players: {game.num_players()}\n'
         f'Number of distinct actions: {game.num_distinct_actions()}'
     )
-    self._system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+    prompt_template = (
+        _SYSTEM_PROMPT_REASONING_TEMPLATE
+        if reasoning
+        else _SYSTEM_PROMPT_TEMPLATE
+    )
+    self._system_prompt = prompt_template.format(
         game_name=game_type.short_name,
         game_description=game_description,
         player_id=player_id,

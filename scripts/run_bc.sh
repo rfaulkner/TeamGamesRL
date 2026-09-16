@@ -27,6 +27,8 @@ EPOCHS=3
 BATCH_SIZE=4
 GRAD_ACCUM=4
 LR="1e-4"
+REASONING=""
+DATA_DIR=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -36,12 +38,20 @@ for arg in "$@"; do
     --epochs=*) EPOCHS="${arg#*=}" ;;
     --batch_size=*) BATCH_SIZE="${arg#*=}" ;;
     --lr=*) LR="${arg#*=}" ;;
+    --reasoning) REASONING="--reasoning" ;;
+    --data_dir=*) DATA_DIR="${arg#*=}" ;;
     *) echo "Unknown flag: $arg"; exit 1 ;;
   esac
 done
 
 project_dir="/home/$USER/projects/aip-rgrosse/$USER/TeamGamesRL"
-data_dir="${project_dir}/data/bc_hanabi"
+if [ -n "${DATA_DIR}" ]; then
+  data_dir="${DATA_DIR}"
+elif [ -n "${REASONING}" ]; then
+  data_dir="${project_dir}/data/bc_hanabi_reasoning"
+else
+  data_dir="${project_dir}/data/bc_hanabi"
+fi
 MODEL_TAG=$(echo "$MODEL_ID" | tr '/' '_')
 output_dir="${project_dir}/checkpoints/bc_${MODEL_TAG}_${SLURM_JOB_ID}"
 
@@ -76,7 +86,8 @@ if [ ! -f "${data_dir}/train.jsonl" ]; then
   python3 data/generate_bc_data.py \
     --num_games="${NUM_GAMES}" \
     --n_worlds="${N_WORLDS}" \
-    --output_dir="${data_dir}"
+    --output_dir="${data_dir}" \
+    ${REASONING}
 else
   echo "[Step 1] Existing BC data found in ${data_dir}. Reusing dataset."
 fi

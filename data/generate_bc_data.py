@@ -47,6 +47,23 @@ RULES:
 You are Player {player_id}.
 """
 
+_SYSTEM_PROMPT_REASONING_TEMPLATE = """\
+You are an expert game-playing AI agent. You are playing the game: {game_name}.
+
+{game_description}
+
+RULES:
+- You must select exactly one action from the list of legal actions provided.
+- First, analyze the current situation step-by-step inside <think>...</think>. Consider:
+  1. Fireworks status and remaining life / info tokens.
+  2. Confirmed playable or safe discard cards in your hand based on received clues.
+  3. Playable or critical cards in your partner's hand that need hints.
+  4. Which action (Play, Discard, or Hint) creates the highest game value.
+- After </think>, output the chosen action on a new line, matching the legal actions list.
+
+You are Player {player_id}.
+"""
+
 _USER_PROMPT_TEMPLATE = """\
 Current game state:
 {state_text}
@@ -57,18 +74,58 @@ Legal actions:
 Action:"""
 
 
-def build_system_prompt(game, player_id: int) -> str:
+def build_system_prompt(game, player_id: int, reasoning: bool = False) -> str:
   game_type = game.get_type()
   game_description = (
       f'Game type: {game_type.short_name}\n'
       f'Number of players: {game.num_players()}\n'
       f'Number of distinct actions: {game.num_distinct_actions()}'
   )
-  return _SYSTEM_PROMPT_TEMPLATE.format(
+  template = _SYSTEM_PROMPT_REASONING_TEMPLATE if reasoning else _SYSTEM_PROMPT_TEMPLATE
+  return template.format(
       game_name=game_type.short_name,
       game_description=game_description,
       player_id=player_id,
   )
+
+
+def generate_cot_reasoning(state, player_id: int, target_desc: str, bot) -> str:
+  """Generates a concise, structured reasoning block for the chosen action."""
+  obs_string = state.observation_string(player_id)
+  fireworks = bot._parse_fireworks(obs_string)
+  info_tokens = state.information_tokens()
+  lives = state.life_tokens()
+
+  fw_str = ', '.join(f'{c}:{h}' for c, h in sorted(fireworks.items()))
+
+  reasons = [f'Fireworks: {fw_str} | Info: {info_tokens}/8 | Lives: {lives}/3.']
+
+  action_lower = target_desc.lower()
+  if 'play' in action_lower:
+    reasons.append(
+        f'My hand knowledge confirms this card is playable on the fireworks stacks.'
+    )
+    reasons.append(f'Playing will increase team score without losing a life.')
+  elif 'hint' in action_lower:
+    reasons.append(
+        f'No 100% safe play in my own hand, but info tokens ({info_tokens}) are available.'
+    )
+    reasons.append(
+        f'Providing this clue guides partner toward a safe play or protects a critical card.'
+    )
+  elif 'discard' in action_lower:
+    reasons.append(
+        f'No safe play available and info tokens ({info_tokens}) can be replenished.'
+    )
+    reasons.append(
+        f'Discarding an unhinted or dead card regains 1 info token safely.'
+    )
+  else:
+    reasons.append(f'Evaluating legal options to maximize expected team score.')
+
+  reasons.append(f'Best action: {target_desc}.')
+  think_body = '\n'.join(f'- {r}' for r in reasons)
+  return f'<think>\n{think_body}\n</think>\n{target_desc}'
 
 
 def build_full_prompt(system_prompt: str, state_text: str, action_descriptions: list[str]) -> str:
@@ -89,6 +146,7 @@ def main():
   parser.add_argument('--output_dir', type=str, default='data/bc_hanabi', help='Directory to write JSONL.')
   parser.add_argument('--train_split', type=float, default=0.9, help='Fraction of data for training.')
   parser.add_argument('--seed', type=int, default=42, help='Base random seed.')
+  parser.add_argument('--reasoning', action='store_true', help='Generate Chain-of-Thought <think> blocks in completions.')
   args = parser.parse_args()
 
   out_path = pathlib.Path(args.output_dir)
@@ -99,9 +157,12 @@ def main():
   renderer = state_renderers.HanabiRenderer(max_history_turns=args.max_history_turns)
   expert = belief_expert.SafeBeliefLookaheadPlayer(game, dz, n_worlds=args.n_worlds, seed=args.seed)
 
-  system_prompts = [build_system_prompt(game, p) for p in range(game.num_players())]
+  system_prompts = [
+      build_system_prompt(game, p, reasoning=args.reasoning)
+      for p in range(game.num_players())
+  ]
 
-  print(f'Starting BC generation: {args.num_games} games, n_worlds={args.n_worlds}')
+  print(f'Starting BC generation (reasoning={args.reasoning}): {args.num_games} games, n_worlds={args.n_worlds}')
   records = []
   scores = []
   t0 = time.time()
@@ -133,16 +194,21 @@ def main():
           break
       assert target_desc is not None, f'Action {action_id} not found in legal actions'
 
+      if args.reasoning:
+        completion = generate_cot_reasoning(state, player, target_desc, expert._bot)
+      else:
+        completion = target_desc
+
       # Round-trip verification:
-      parsed_id = renderer.parse_action(target_desc, legal_actions_with_desc)
-      assert parsed_id == action_id, f'Parse mismatch: {parsed_id} != {action_id} for "{target_desc}"'
+      parsed_id = renderer.parse_action(completion, legal_actions_with_desc)
+      assert parsed_id == action_id, f'Parse mismatch: {parsed_id} != {action_id} for "{completion}"'
 
       game_records.append({
           'game_id': g,
           'turn': turn,
           'player': player,
           'prompt': prompt,
-          'completion': target_desc,
+          'completion': completion,
           'action_id': action_id,
       })
 

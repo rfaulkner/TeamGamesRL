@@ -1297,6 +1297,14 @@ class HanabiRenderer(BaseStateRenderer):
     Returns:
       The best matching action_id, or None if no match found.
     """
+    # If the response contains a <think>...</think> reasoning block,
+    # extract the text following </think> to parse the final action.
+    if '</think>' in text:
+      text = text.split('</think>')[-1].strip()
+    elif '<think>' in text:
+      # In case of truncated generation where </think> was cut off
+      text = text.split('<think>')[-1].strip()
+
     normalized = text.strip().lower()
 
     # Try to extract a bare integer (the prompt asks for "action number only").

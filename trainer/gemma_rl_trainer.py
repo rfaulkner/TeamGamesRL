@@ -406,6 +406,12 @@ flags.DEFINE_bool(
     'Collection alternates roles (odd: P0=LLM, P1=Bot; even: P0=Bot, P1=LLM) '
     'and evaluation splits into LLM+Bot, Bot+LLM, and LLM+LLM sets.',
 )
+flags.DEFINE_bool(
+    'reasoning',
+    False,
+    'Prompt the LLM to think step-by-step inside <think>...</think> before '
+    'selecting an action (Chain of Thought single-pass).',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -540,6 +546,7 @@ def main(argv: list[str]) -> None:
       max_history_turns=FLAGS.max_history_turns or None,
       experiment_config=experiment_config,
       bot_partner=FLAGS.bot_partner,
+      reasoning=FLAGS.reasoning,
   )
 
   # ── Train ──

@@ -88,6 +88,7 @@ class RLTrainer:
       max_history_turns: int | None = 20,
       experiment_config: dict | None = None,
       bot_partner: bool = False,
+      reasoning: bool = False,
   ):
     """Initializes the RLTrainer.
 
@@ -156,6 +157,7 @@ class RLTrainer:
           llm=backend,
           env=self.env,
           temperature=temperature,
+          reasoning=reasoning,
       )
       self.agents.append(agent)
 
