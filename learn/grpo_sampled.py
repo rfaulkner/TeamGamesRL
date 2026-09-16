@@ -239,7 +239,15 @@ def collect_game_prompts(
       num_episodes,
       mean_collected,
   )
-  return all_prompts
+  collect_stats = {
+      'mean_reward': mean_collected,
+      'min_reward': float(np.min(ep_rewards)) if ep_rewards else 0.0,
+      'max_reward': float(np.max(ep_rewards)) if ep_rewards else 0.0,
+      'std_reward': float(np.std(ep_rewards)) if ep_rewards else 0.0,
+      'num_episodes': num_episodes,
+      'num_prompts': len(all_prompts),
+  }
+  return all_prompts, collect_stats
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2173,13 +2181,39 @@ def run_sampled(runner) -> None:
 
     # ── Step 1: Collect prompts ──
     runner._backend.model.eval()
-    prompt_entries = collect_game_prompts(
+    prompt_entries, collect_stats = collect_game_prompts(
         runner,
         num_episodes=runner._config.collect_episodes,
         pass_idx=pass_idx,
         start_time=start_time,
     )
     total_episodes_so_far += runner._config.collect_episodes
+
+    # Record collection metrics to results/collection_metrics.csv
+    results_dir = os.path.join(runner._output_dir, 'results')
+    if os.path.exists(results_dir):
+      collect_csv_path = os.path.join(results_dir, 'collection_metrics.csv')
+      write_header = not os.path.exists(collect_csv_path)
+      try:
+        with open(collect_csv_path, 'a') as f:
+          if write_header:
+            f.write(
+                'pass,episode,collect/mean_reward,collect/min_reward,'
+                'collect/max_reward,collect/std_reward,num_episodes,'
+                'num_prompts,elapsed_sec\n'
+            )
+          f.write(
+              f"{pass_idx},{total_episodes_so_far},"
+              f"{collect_stats['mean_reward']:.6f},"
+              f"{collect_stats['min_reward']:.6f},"
+              f"{collect_stats['max_reward']:.6f},"
+              f"{collect_stats['std_reward']:.6f},"
+              f"{collect_stats['num_episodes']},"
+              f"{collect_stats['num_prompts']},"
+              f"{time.time() - start_time:.1f}\n"
+          )
+      except IOError as e:
+        logging.warning('Failed to write collection metrics CSV: %s', e)
 
     if not prompt_entries:
       logging.warning('No prompts collected in pass %d, skipping.', pass_idx)
@@ -2248,6 +2282,7 @@ def run_sampled(runner) -> None:
     # ── Step 5: Evaluate ──
     runner._backend.model.eval()
     eval_metrics = runner._evaluate_fn(runner._config.num_eval_episodes)
+    eval_metrics['eval/collection_mean_reward'] = collect_stats['mean_reward']
     logging.info('--- Evaluation after GRPO pass %d ---', pass_idx)
     for k, v in sorted(eval_metrics.items()):
       logging.info('  %s: %.4f', k, v)

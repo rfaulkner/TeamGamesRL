@@ -392,6 +392,38 @@ class RLTrainer:
       if self.log_episodes_every > 0:
         self._log_episode(ep_i + 1, trajectories, 0.0, is_evaluation=True)
 
+      # Log full eval play results to results/eval_episodes.jsonl
+      eval_log_path = os.path.join(self.results_dir, 'eval_episodes.jsonl')
+      eval_record = {
+          'eval_episode': ep_i + 1,
+          'mode': mode_label,
+          'game': self.game_name,
+          'mean_reward': mean_r,
+          'players': [],
+      }
+      for traj in trajectories:
+        p_data = {
+            'player_id': traj.player_id,
+            'reward': traj.reward,
+            'steps': [
+                {
+                    'state_text': s.state_text,
+                    'prompt': s.prompt,
+                    'llm_response': s.llm_response,
+                    'game_action': s.game_action_text,
+                    'action_id': s.action_id,
+                    'log_prob': s.log_prob,
+                }
+                for s in traj.steps
+            ],
+        }
+        eval_record['players'].append(p_data)
+      try:
+        with open(eval_log_path, 'a') as f:
+          f.write(json.dumps(eval_record) + '\n')
+      except IOError as e:
+        logging.warning('Failed to write eval episode log: %s', e)
+
     # Log action distribution summary across eval episodes.
     for p in range(num_players):
       total_actions = sum(action_counts[p].values())
