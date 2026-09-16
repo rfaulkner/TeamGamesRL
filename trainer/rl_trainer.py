@@ -87,6 +87,7 @@ class RLTrainer:
       wandb_config: dict | None = None,
       max_history_turns: int | None = 20,
       experiment_config: dict | None = None,
+      bot_partner: bool = False,
   ):
     """Initializes the RLTrainer.
 
@@ -113,6 +114,8 @@ class RLTrainer:
           (model, LoRA, training, GRPO, etc.) to persist in the results
           directory as ``config.json``.  When provided, this config is
           also embedded in the final ``summary.json``.
+      bot_partner: Whether to partner with SafePlayPlayer during collection
+          and evaluation.
 
     Raises:
       ValueError: If game_name is not recognized.
@@ -132,6 +135,8 @@ class RLTrainer:
     self.wandb_project = wandb_project
     self.wandb_config = wandb_config or {}
     self.backend = backend
+    self.bot_partner = bot_partner
+    self._bot = None
 
     # ── OpenSpiel environment ──
     self.env = game_env.create_env(self.game_config)
@@ -158,14 +163,19 @@ class RLTrainer:
     trainable_params = [
         p for p in backend.model.parameters() if p.requires_grad
     ]
-    self.optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+    self.optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=lr,
+        weight_decay=0.01,
+    )
 
-    # ── Metrics ──
+    # ── Training state ──
+    self._total_episodes = 0
+    self._total_steps = 0
     self._episode_rewards: list[float] = []
     self._episode_losses: list[float] = []
     self._player_wins = np.zeros(self.game_config.num_players, dtype=np.int64)
     self._team_wins = 0
-    self._total_episodes = 0
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -190,7 +200,6 @@ class RLTrainer:
 
     # Initialize eval metrics CSV.
     self._eval_csv_path = os.path.join(self.results_dir, 'eval_metrics.csv')
-    # Eval CSV header will be written dynamically on first eval.
     self._eval_csv_header_written = False
 
     # ── Reference model for KL penalty (frozen copy) ──
@@ -199,22 +208,21 @@ class RLTrainer:
         for k, v in backend.model.named_parameters()
         if v.requires_grad
     }
-
     logging.info(
-        'RLTrainer ready: game=%s, lr=%g, lora_params=%d',
-        game_name,
-        lr,
-        sum(p.numel() for p in trainable_params),
+        'Reference LoRA state dict snapshotted (%d tensors).',
+        len(self._ref_state_dict),
     )
 
   def run_episode(
       self,
       is_evaluation: bool = False,
+      bot_player: int | None = None,
   ) -> list[PlayerTrajectory]:
-    """Plays one full episode, collecting trajectory data per player.
+    """Runs a single episode and returns the trajectory.
 
     Args:
-      is_evaluation: If True, use greedy decoding (temperature -> 0).
+      is_evaluation: If True, uses greedy action selection (temp=0.01).
+      bot_player: If set, this player is controlled by SafePlayPlayer.
 
     Returns:
       List of PlayerTrajectory objects, one per player.
@@ -228,8 +236,6 @@ class RLTrainer:
       current_player = time_step.current_player()
 
       # ── Swap LoRA adapter for phased training ──
-      # When per-player adapters exist, activate the current player's
-      # adapter so each player uses its own learned policy.
       if hasattr(self.backend, 'set_active_adapter'):
         adapter_name = f'player_{current_player}'
         try:
@@ -250,34 +256,49 @@ class RLTrainer:
       legal_actions = [a for a, _ in legal_actions_with_desc]
       action_descriptions = [d for _, d in legal_actions_with_desc]
 
-      # Build prompt.
-      prompt = self.agents[current_player]._build_prompt(
-          state_text, legal_actions, action_descriptions
-      )
+      if bot_player is not None and current_player == bot_player:
+        if self._bot is None:
+          try:
+            from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+            self._bot = SafePlayPlayer(seed=42)
+          except ImportError:
+            self._bot = None
+        if self._bot is not None:
+          action_id = self._bot.select_action(state, current_player, self.env.game)
+        else:
+          action_id = int(np.random.choice(legal_actions))
+        response = state.action_to_string(current_player, action_id)
+        log_prob = 0.0
+        prompt = ''
+      else:
+        # Build prompt.
+        prompt = self.agents[current_player]._build_prompt(
+            state_text, legal_actions, action_descriptions
+        )
 
-      # Generate action.
-      temp = 0.01 if is_evaluation else self.temperature
-      response, log_prob = self.backend.generate_with_logprobs(
-          prompt, temperature=temp, max_tokens=64
-      )
+        # Generate action.
+        temp = 0.01 if is_evaluation else self.temperature
+        response, log_prob = self.backend.generate_with_logprobs(
+            prompt, temperature=temp, max_tokens=64
+        )
 
-      # Parse action.
-      action_id = self.renderers[current_player].parse_action(
-          response, legal_actions_with_desc
-      )
-      if action_id is None:
-        action_id = int(np.random.choice(legal_actions))
+        # Parse action.
+        action_id = self.renderers[current_player].parse_action(
+            response, legal_actions_with_desc
+        )
+        if action_id is None:
+          action_id = int(np.random.choice(legal_actions))
 
       action_text = state.action_to_string(current_player, action_id)
 
       trajectories[current_player].steps.append(
           RLTrajectoryStep(
               prompt=prompt,
-              action_text=response.strip(),
+              action_text=response.strip() if response else '',
               action_id=action_id,
               log_prob=log_prob,
               state_text=state_text,
-              llm_response=response,
+              llm_response=response if response else '',
               game_action_text=action_text,
           )
       )
@@ -294,6 +315,10 @@ class RLTrainer:
   def evaluate(self, num_episodes: int = 10) -> dict[str, float]:
     """Evaluates the current policy over multiple episodes.
 
+    If bot_partner is True and num_players == 2, splits episodes evenly
+    across three conditions: P0=LLM vs P1=Bot, P0=Bot vs P1=LLM, and
+    pure self-play (P0=LLM vs P1=LLM).
+
     Args:
       num_episodes: Number of evaluation episodes.
 
@@ -306,9 +331,26 @@ class RLTrainer:
     wins = np.zeros(num_players, dtype=np.int64)
     action_counts: list[dict[int, int]] = [{} for _ in range(num_players)]
 
-    for ep_i in range(num_episodes):
-      trajectories = self.run_episode(is_evaluation=True)
+    if self.bot_partner and num_players == 2:
+      n_llm_bot = max(1, num_episodes // 3)
+      n_bot_llm = max(1, num_episodes // 3)
+      n_self_play = max(1, num_episodes - n_llm_bot - n_bot_llm)
+      eval_plan = (
+          [(1, 'P0:LLM vs P1:Bot')] * n_llm_bot
+          + [(0, 'P0:Bot vs P1:LLM')] * n_bot_llm
+          + [(None, 'Self-Play (LLM vs LLM)')] * n_self_play
+      )
+    else:
+      eval_plan = [(None, 'Self-Play')] * num_episodes
+
+    mode_rewards: dict[str, list[float]] = {}
+
+    for ep_i, (bot_player, mode_label) in enumerate(eval_plan):
+      trajectories = self.run_episode(is_evaluation=True, bot_player=bot_player)
       rewards = [t.reward for t in trajectories]
+      mean_r = float(np.mean(rewards))
+      mode_rewards.setdefault(mode_label, []).append(mean_r)
+
       for p in range(num_players):
         all_rewards[p].append(rewards[p])
         for step in trajectories[p].steps:
@@ -328,10 +370,6 @@ class RLTrainer:
         )
         actions_summary.append(f'P{t.player_id}:[{steps_summary}]')
 
-      # Extract dealt cards (chance outcomes) from the terminal state.
-      # In OpenSpiel, the first num_players history entries are chance actions
-      # (e.g. card deals).  The HLE Hanabi adapter does not track chance
-      # actions, so guard with hasattr.
       state = self.env._state  # pylint: disable=protected-access
       cards_str = ''
       if hasattr(state, 'history') and callable(state.history):
@@ -340,11 +378,11 @@ class RLTrainer:
           cards = [history[p] for p in range(num_players)]
           cards_str = ' | cards=' + ','.join(str(c) for c in cards)
 
-      mean_r = float(np.mean(rewards))
       logging.info(
-          '  [eval %d/%d] reward=%.1f%s | %s',
+          '  [eval %d/%d] (%s) reward=%.1f%s | %s',
           ep_i + 1,
-          num_episodes,
+          len(eval_plan),
+          mode_label,
           mean_r,
           cards_str,
           ' | '.join(actions_summary),
@@ -370,7 +408,13 @@ class RLTrainer:
     for p in range(num_players):
       pr = np.array(all_rewards[p])
       metrics[f'eval/mean_reward_p{p}'] = float(np.mean(pr))
-      metrics[f'eval/win_rate_p{p}'] = float(wins[p] / num_episodes)
+      metrics[f'eval/win_rate_p{p}'] = float(wins[p] / len(eval_plan))
+
+    if self.bot_partner and num_players == 2:
+      for m_label, r_list in mode_rewards.items():
+        safe_key = m_label.lower().replace(' ', '_').replace(':', '_').replace('-', '_').replace('(', '').replace(')', '')
+        metrics[f'eval/{safe_key}'] = float(np.mean(r_list)) if r_list else 0.0
+
     return metrics
 
   def save_checkpoint(self, episode: int = 0, suffix=None) -> str:
@@ -762,6 +806,9 @@ class RLTrainer:
       config_path = os.path.join(self.results_dir, 'config.json')
       with open(config_path, 'w') as f:
         json.dump(self._experiment_config, f, indent=2)
+
+    if getattr(grpo_config, 'bot_partner', False):
+      self.bot_partner = True
 
     runner = GRPORunner(
         env=self.env,

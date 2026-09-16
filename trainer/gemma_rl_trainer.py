@@ -394,6 +394,13 @@ flags.DEFINE_bool(
     'rollout in dense_chain reward computation. Closes the train-eval gap '
     'from using SafePlayPlayer vs LLM as partner. Adds ~10-15%% overhead.',
 )
+flags.DEFINE_bool(
+    'bot_partner',
+    False,
+    'Partner with SafePlayPlayer during collection and evaluation. '
+    'Collection alternates roles (odd: P0=LLM, P1=Bot; even: P0=Bot, P1=LLM) '
+    'and evaluation splits into LLM+Bot, Bot+LLM, and LLM+LLM sets.',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -497,6 +504,7 @@ def main(argv: list[str]) -> None:
       'strategic_action_mode': FLAGS.strategic_action_mode,
       'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
       'llm_partner_response': FLAGS.llm_partner_response,
+      'bot_partner': FLAGS.bot_partner,
       # REINFORCE-specific configuration.
       'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
       'baseline_window_size': FLAGS.baseline_window_size,
@@ -526,6 +534,7 @@ def main(argv: list[str]) -> None:
       wandb_config=experiment_config,
       max_history_turns=FLAGS.max_history_turns or None,
       experiment_config=experiment_config,
+      bot_partner=FLAGS.bot_partner,
   )
 
   # ── Train ──
@@ -574,6 +583,7 @@ def main(argv: list[str]) -> None:
         strategic_action_mode=FLAGS.strategic_action_mode,
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
         llm_partner_response=FLAGS.llm_partner_response,
+        bot_partner=FLAGS.bot_partner,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

@@ -510,3 +510,13 @@ class GRPOConfig:
   Set to False to disable (pure heuristic continuation).
   """
 
+  bot_partner: bool = False
+  """Use SafePlayPlayer as an alternating partner during collection and eval.
+
+  When True:
+  - Collection alternates roles: odd episodes have P0=LLM and P1=Bot; even
+    episodes have P0=Bot and P1=LLM. Only LLM prompts are collected.
+  - Evaluation splits episodes across three conditions: P0=LLM vs P1=Bot,
+    P0=Bot vs P1=LLM, and P0=LLM vs P1=LLM (self-play).
+  """
+

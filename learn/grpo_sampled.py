@@ -105,6 +105,11 @@ def collect_game_prompts(
     action_history = []
     trajectories = [PlayerTrajectory(player_id=p) for p in range(num_players)]
 
+    bot_player = None
+    if getattr(runner._config, 'bot_partner', False) and num_players == 2:
+      # Alternating roles: odd episodes -> P1 is bot; even episodes -> P0 is bot.
+      bot_player = 1 if ep % 2 == 1 else 0
+
     while not time_step.last():
       current_player = time_step.current_player()
       state = runner._env._state  # pylint: disable=protected-access
@@ -118,57 +123,79 @@ def collect_game_prompts(
       legal_actions = [a for a, _ in legal_actions_with_desc]
       action_descriptions = [d for _, d in legal_actions_with_desc]
 
-      prompt = runner._agents[current_player]._build_prompt(  # pylint: disable=protected-access
-          state_text, legal_actions, action_descriptions
-      )
+      is_bot_turn = (bot_player is not None and current_player == bot_player)
+      prompt = None
+      response = None
+      log_prob = 0.0
 
-      response, log_prob = runner._backend.generate_with_logprobs(
-          prompt,
-          temperature=runner._current_temperature,
-          max_tokens=runner._config.max_completion_length,
-      )
-      action_id = runner._renderers[current_player].parse_action(
-          response, legal_actions_with_desc
-      )
-      if action_id is None:
-        action_id = int(np.random.choice(legal_actions))
+      if is_bot_turn:
+        if not hasattr(runner, '_heuristic_bot') or runner._heuristic_bot is None:
+          try:
+            from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+            runner._heuristic_bot = SafePlayPlayer(seed=42)
+          except ImportError:
+            runner._heuristic_bot = None
 
-      # Epsilon-greedy exploration: with probability epsilon, override the
-      # model's action with a uniformly random legal action.  This prevents
-      # game-ending action collapse (e.g. always playing cards in Hanabi)
-      # and ensures longer, more diverse collection episodes.
-      epsilon_explored = False
-      if (
-          runner._current_epsilon > 0
-          and np.random.random() < runner._current_epsilon
-      ):
-        action_id = int(np.random.choice(legal_actions))
-        epsilon_explored = True
+        if runner._heuristic_bot is not None:
+          action_id = runner._heuristic_bot.select_action(
+              state, current_player, runner._env.game
+          )
+        else:
+          action_id = int(np.random.choice(legal_actions))
+        action_text = state.action_to_string(current_player, action_id)
+        response = action_text
+      else:
+        prompt = runner._agents[current_player]._build_prompt(  # pylint: disable=protected-access
+            state_text, legal_actions, action_descriptions
+        )
 
-      action_text = state.action_to_string(current_player, action_id)
+        response, log_prob = runner._backend.generate_with_logprobs(
+            prompt,
+            temperature=runner._current_temperature,
+            max_tokens=runner._config.max_completion_length,
+        )
+        action_id = runner._renderers[current_player].parse_action(
+            response, legal_actions_with_desc
+        )
+        if action_id is None:
+          action_id = int(np.random.choice(legal_actions))
 
-      prompt_entry = {
-          'prompt': prompt,
-          'player_id': current_player,
-          'action_history': list(action_history),
-          'legal_actions': legal_actions,
-          'legal_actions_desc': legal_actions_with_desc,
-          'state_text': state_text,
-          'serialized_state': _serialize_game_and_state(
-              runner._env.game, state
-          ),
-      }
-      all_prompts.append(prompt_entry)
-      runner._prompt_metadata[prompt] = prompt_entry
+        # Epsilon-greedy exploration: with probability epsilon, override the
+        # model's action with a uniformly random legal action.  This prevents
+        # game-ending action collapse (e.g. always playing cards in Hanabi)
+        # and ensures longer, more diverse collection episodes.
+        epsilon_explored = False
+        if (
+            runner._current_epsilon > 0
+            and np.random.random() < runner._current_epsilon
+        ):
+          action_id = int(np.random.choice(legal_actions))
+          epsilon_explored = True
+
+        action_text = state.action_to_string(current_player, action_id)
+
+        prompt_entry = {
+            'prompt': prompt,
+            'player_id': current_player,
+            'action_history': list(action_history),
+            'legal_actions': legal_actions,
+            'legal_actions_desc': legal_actions_with_desc,
+            'state_text': state_text,
+            'serialized_state': _serialize_game_and_state(
+                runner._env.game, state
+            ),
+        }
+        all_prompts.append(prompt_entry)
+        runner._prompt_metadata[prompt] = prompt_entry
 
       trajectories[current_player].steps.append(
           RLTrajectoryStep(
-              prompt=prompt,
-              action_text=response.strip(),
+              prompt=prompt or '',
+              action_text=response.strip() if response else '',
               action_id=action_id,
               log_prob=log_prob,
               state_text=state_text,
-              llm_response=response,
+              llm_response=response or '',
               game_action_text=action_text,
           )
       )
@@ -194,8 +221,11 @@ def collect_game_prompts(
         f'P{t.player_id}:[{",".join(s.game_action_text for s in t.steps)}]'
         for t in trajectories
     )
+    role_info = ''
+    if bot_player is not None:
+      role_info = f' (P{1-bot_player}:LLM vs P{bot_player}:Bot)'
     print(
-        f'[pass {pass_idx} collect {ep}/{num_episodes}] reward={mean_r:.2f} '
+        f'[pass {pass_idx} collect {ep}/{num_episodes}]{role_info} reward={mean_r:.2f} '
         f'({ep_elapsed:.1f}s) {actions_summary}',
         flush=True,
     )

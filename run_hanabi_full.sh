@@ -71,6 +71,7 @@ STRATEGIC_ACTION_SELECTION="false"
 STRATEGIC_ACTION_MODE="substitute"
 STRATEGIC_ACTION_FORCED_RATIO="1.0"
 LLM_PARTNER_RESPONSE="false"
+BOT_PARTNER="false"
 # ── 1. Determine profile first ───────────────────────────────────────────────
 
 PROFILE="full"
@@ -132,10 +133,12 @@ for arg in "$@"; do
     --strategic_action_mode=*) STRATEGIC_ACTION_MODE="${arg#*=}" ;;
     --strategic_action_forced_ratio=*) STRATEGIC_ACTION_FORCED_RATIO="${arg#*=}" ;;
     --llm_partner_response) LLM_PARTNER_RESPONSE="true" ;;
+    --bot_partner) BOT_PARTNER="true" ;;
+    --bot_partner=*) BOT_PARTNER="${arg#*=}" ;;
     --initial_lora_checkpoint=*|--warm_start_adapter=*)
       EXTRA_FLAGS="${EXTRA_FLAGS} --initial_lora_checkpoint=${arg#*=}" ;;
     --help|-h)
-      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=MODE] [--reward_blend_weight=W] [--reward_rollout_samples=N] [--no_reward_rollout_common_seed] [--reward_survival_exponent=E] [--reward_turn_discount=G] [--reward_policy_turns=M] [--grpo_scale_rewards=group|batch|none] [--constrained_action_types] [--strategic_action_selection] [--strategic_action_mode=substitute|logits] [--strategic_action_forced_ratio=R] [--llm_partner_response] [--extra...]"
+      echo "Usage: sbatch run_hanabi_full.sh [--profile=express|quick|full] [--collect=N] [--grpo_passes=P] [--k=K] [--lr=L] [--temperature=T] [--temperature_anneal_end=T] [--reward_simulation_mode=MODE] [--reward_blend_weight=W] [--reward_rollout_samples=N] [--no_reward_rollout_common_seed] [--reward_survival_exponent=E] [--reward_turn_discount=G] [--reward_policy_turns=M] [--grpo_scale_rewards=group|batch|none] [--constrained_action_types] [--strategic_action_selection] [--strategic_action_mode=substitute|logits] [--strategic_action_forced_ratio=R] [--llm_partner_response] [--bot_partner] [--extra...]"
       exit 0 ;;
     --*) EXTRA_FLAGS="${EXTRA_FLAGS} ${arg}" ;;
     *) echo "Unknown flag: $arg (try --help)"; exit 1 ;;
@@ -250,6 +253,7 @@ python3 trainer/gemma_rl_trainer.py \
   --strategic_action_mode="${STRATEGIC_ACTION_MODE}" \
   --strategic_action_forced_ratio="${STRATEGIC_ACTION_FORCED_RATIO}" \
   --llm_partner_response="${LLM_PARTNER_RESPONSE}" \
+  --bot_partner="${BOT_PARTNER}" \
   --max_seq_len="${MAX_SEQ_LEN}" \
   --use_4bit \
   --output_dir="${output_dir}" \
