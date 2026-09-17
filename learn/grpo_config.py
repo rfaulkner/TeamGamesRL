@@ -521,3 +521,6 @@ class GRPOConfig:
     P0=Bot vs P1=LLM, and P0=LLM vs P1=LLM (self-play).
   """
 
+  reasoning: bool = False
+  """If True, prompt the LLM to think inside <think>...</think> before acting."""
+

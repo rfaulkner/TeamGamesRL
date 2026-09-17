@@ -597,6 +597,7 @@ def main(argv: list[str]) -> None:
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
         llm_partner_response=FLAGS.llm_partner_response,
         bot_partner=FLAGS.bot_partner,
+        reasoning=FLAGS.reasoning,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This
