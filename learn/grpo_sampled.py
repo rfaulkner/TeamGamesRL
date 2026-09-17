@@ -1482,6 +1482,34 @@ def _resolve_scale_rewards(trl_module, scale_mode: str) -> dict:
   return {'scale_rewards': scale_mode}
 
 
+def _cleanup_ref_adapter(model, active_adapter: str | None = None) -> None:
+  """Removes the temporary 'ref' adapter created by TRL's GRPOTrainer.
+
+  TRL's GRPOTrainer automatically adds a frozen reference adapter named 'ref'
+  to a PeftModel when beta > 0. Because we train iteratively across players
+  and passes with the same backend model instance, subsequent GRPOTrainer
+  initializations will fail with:
+      ValueError: Adapter with name 'ref' already exists.
+  This helper cleans up the 'ref' adapter and restores the active adapter.
+  """
+  actual_model = getattr(model, 'module', model)
+  if hasattr(actual_model, 'delete_adapter'):
+    peft_config = getattr(actual_model, 'peft_config', None)
+    if peft_config and 'ref' in peft_config:
+      try:
+        actual_model.delete_adapter('ref')
+        logging.info("Cleaned up temporary 'ref' adapter from model.")
+      except Exception as e:
+        logging.warning("Failed to delete 'ref' adapter: %s", e)
+  if active_adapter and hasattr(actual_model, 'set_adapter'):
+    try:
+      peft_config = getattr(actual_model, 'peft_config', None)
+      if peft_config and active_adapter in peft_config:
+        actual_model.set_adapter(active_adapter)
+    except Exception as e:
+      logging.warning("Failed to restore active adapter '%s': %s", active_adapter, e)
+
+
 def _train_grpo_on_prompts(
     runner,
     unique_prompts: list[str],
@@ -1892,6 +1920,14 @@ def _train_grpo_on_prompts(
 
   runner._backend.model.train()
 
+  # Ensure no leftover 'ref' adapter from a previous GRPOTrainer step.
+  prev_adapter = (
+      runner._backend.get_active_adapter()
+      if hasattr(runner._backend, 'get_active_adapter')
+      else getattr(runner._backend.model, 'active_adapter', 'default')
+  )
+  _cleanup_ref_adapter(runner._backend.model, prev_adapter)
+
   max_train_batch = 4
   candidates = [
       d
@@ -2048,6 +2084,9 @@ def _train_grpo_on_prompts(
       runner._backend.model.generate = original_generate
     if diversifier is not None:
       diversifier.log_summary(pass_idx, player_id)
+    _cleanup_ref_adapter(runner._backend.model, prev_adapter)
+    if hasattr(runner._backend, 'set_active_adapter') and prev_adapter:
+      runner._backend.set_active_adapter(prev_adapter)
 
   # Extract training metrics.
   pass_loss = 0.0
@@ -2067,6 +2106,10 @@ def _train_grpo_on_prompts(
       pass_loss = float(np.mean(losses))
     if rew_vals:
       pass_reward = float(np.mean(rew_vals))
+
+  del trainer
+  if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
   player_label = f' (Player {player_id})' if player_id is not None else ''
   logging.info(
