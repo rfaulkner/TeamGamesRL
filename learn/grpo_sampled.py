@@ -1326,7 +1326,7 @@ class GroupDiversifier:
             '[diversify]   kept  x%-2d a=%-3d %r',
             counts.get(aid, 1),
             aid,
-            texts[slot][:60],
+            texts[slot],
         )
       if num_unparsed:
         logging.info(
@@ -1338,7 +1338,7 @@ class GroupDiversifier:
             slot,
             aid,
             tier,
-            desc[:60],
+            desc,
         )
 
   def diversify(self, sequences: torch.Tensor, prompt_len: int) -> torch.Tensor:
@@ -1582,7 +1582,7 @@ def _train_grpo_on_prompts(
         group_records.append({
             'prompt': prompt_text,
             'player': p_id,
-            'text': comp_text.strip()[:60],
+            'text': comp_text.strip(),
             'action': action_id,
             'status': 'random_fallback',
             'reward': float(parse_penalty),
@@ -1593,7 +1593,7 @@ def _train_grpo_on_prompts(
               '-> action=%s (random_fallback) | reward=%.1f',
               eval_counter[0],
               p_id,
-              comp_text.strip()[:60],
+              comp_text.strip(),
               action_id,
               parse_penalty,
           )
@@ -1608,7 +1608,7 @@ def _train_grpo_on_prompts(
         group_records.append({
             'prompt': prompt_text,
             'player': p_id,
-            'text': comp_text.strip()[:60],
+            'text': comp_text.strip(),
             'action': action_id,
             'status': 'parsed/cached',
             'reward': float(reward_cache[cache_key]),
@@ -1619,7 +1619,7 @@ def _train_grpo_on_prompts(
               '-> action=%s (parsed) | reward=%.1f (cached)',
               eval_counter[0],
               p_id,
-              comp_text.strip()[:60],
+              comp_text.strip(),
               action_id,
               float(reward_cache[cache_key]),
           )
@@ -1832,7 +1832,7 @@ def _train_grpo_on_prompts(
       group_records.append({
           'prompt': prompt_text,
           'player': p_id,
-          'text': comp_text.strip()[:60],
+          'text': comp_text.strip(),
           'action': action_id,
           'status': status,
           'reward': float(reward),
@@ -1843,7 +1843,7 @@ def _train_grpo_on_prompts(
             '-> action=%s (parsed) | reward=%.1f',
             eval_counter[0],
             p_id,
-            comp_text.strip()[:60],
+            comp_text.strip(),
             action_id,
             reward,
         )
