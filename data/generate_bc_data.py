@@ -101,25 +101,25 @@ def generate_cot_reasoning(state, player_id: int, target_desc: str, bot) -> str:
   reasons = [f'Fireworks: {fw_str} | Info: {info_tokens}/8 | Lives: {lives}/3.']
 
   action_lower = target_desc.lower()
-  if 'play' in action_lower:
-    reasons.append(
-        f'My hand knowledge confirms this card is playable on the fireworks stacks.'
-    )
-    reasons.append(f'Playing will increase team score without losing a life.')
-  elif 'hint' in action_lower:
+  if action_lower.startswith('hint') or 'reveal' in action_lower or 'hint ' in action_lower:
     reasons.append(
         f'No 100% safe play in my own hand, but info tokens ({info_tokens}) are available.'
     )
     reasons.append(
         f'Providing this clue guides partner toward a safe play or protects a critical card.'
     )
-  elif 'discard' in action_lower:
+  elif action_lower.startswith('discard'):
     reasons.append(
         f'No safe play available and info tokens ({info_tokens}) can be replenished.'
     )
     reasons.append(
         f'Discarding an unhinted or dead card regains 1 info token safely.'
     )
+  elif action_lower.startswith('play'):
+    reasons.append(
+        f'My hand knowledge confirms this card is playable on the fireworks stacks.'
+    )
+    reasons.append(f'Playing will increase team score without losing a life.')
   else:
     reasons.append(f'Evaluating legal options to maximize expected team score.')
 
