@@ -1302,8 +1302,13 @@ class HanabiRenderer(BaseStateRenderer):
     if '</think>' in text:
       text = text.split('</think>')[-1].strip()
     elif '<think>' in text:
-      # In case of truncated generation where </think> was cut off
-      text = text.split('<think>')[-1].strip()
+      # In case of truncated generation where </think> was cut off, only extract
+      # if a clear "Best action:" tag is present to avoid matching scratchpad words.
+      match = re.search(r'best action:\s*([^\n\.]+)', text, re.IGNORECASE)
+      if match:
+        text = match.group(1).strip()
+      else:
+        return None
 
     normalized = text.strip().lower()
 

@@ -160,6 +160,7 @@ class RLTrainer:
           reasoning=reasoning,
       )
       self.agents.append(agent)
+    self.reasoning = reasoning
 
     # ── Optimizer (only trainable params) ──
     trainable_params = [
@@ -279,9 +280,11 @@ class RLTrainer:
         )
 
         # Generate action.
-        temp = 0.01 if is_evaluation else self.temperature
+        eval_temp = 0.2 if self.reasoning else 0.01
+        max_tokens = 200 if self.reasoning else 64
+        temp = eval_temp if is_evaluation else self.temperature
         response, log_prob = self.backend.generate_with_logprobs(
-            prompt, temperature=temp, max_tokens=64
+            prompt, temperature=temp, max_tokens=max_tokens
         )
 
         # Parse action.

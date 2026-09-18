@@ -1290,9 +1290,31 @@ class GroupDiversifier:
 
     substitutions: list[tuple[int, int, str, str]] = []
     device = sequences.device
+    is_reasoning = getattr(self._runner._config, 'reasoning', False)
+    cot_bot = None
+    cot_state = None
+    cot_fn = None
+    if is_reasoning:
+      try:
+        from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+        from data.generate_bc_data import generate_cot_reasoning  # pylint: disable=g-import-not-at-top
+        _, cot_state = _deserialize_game_and_state(ser_state)
+        cot_bot = SafePlayPlayer(seed=42)
+        cot_fn = generate_cot_reasoning
+      except Exception:  # pylint: disable=broad-exception-caught
+        cot_bot = None
+        cot_state = None
+        cot_fn = None
+
     for slot, (aid, desc, tier) in zip(free_slots[:num_subs], candidates):
+      completion_text = desc
+      if is_reasoning and cot_bot is not None and cot_state is not None and cot_fn is not None:
+        try:
+          completion_text = cot_fn(cot_state, player_id, desc, cot_bot)
+        except Exception:  # pylint: disable=broad-exception-caught
+          completion_text = desc
       sequences[group_start + slot, prompt_len:] = self._encode_completion(
-          desc, width, device
+          completion_text, width, device
       )
       substitutions.append((slot, aid, desc, tier))
 
