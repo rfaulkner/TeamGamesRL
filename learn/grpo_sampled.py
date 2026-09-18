@@ -717,6 +717,14 @@ def _heuristic_rollout_score(
   value = score / max_score
   if turn_discount != 1.0:
     value *= turn_discount**turns
+
+  # Penalize non-scoring stalls: if the continuation finishes with score <= 1.0,
+  # apply a stall penalty. This eliminates the zero fixed-point of multiplicative
+  # turn discounting (where 0 * gamma^turns == 0) and creates a clear advantage gap
+  # between actions that enable scoring vs passive hint/discard stalling.
+  if score <= 1.0:
+    value = -0.1 * (1.0 - score / 2.0)
+
   return value
 
 
@@ -1819,9 +1827,12 @@ def _train_grpo_on_prompts(
               params = getattr(game_obj, '_params', None)
               if isinstance(params, dict):
                 max_lives = params.get('max_life_tokens', 3)
-              game_score_norm *= (
-                  max(lives_after, 0) / max(max_lives, 1)
-              ) ** survival_exp
+              life_fraction = max(lives_after, 0) / max(max_lives, 1)
+              if game_score_norm >= 0:
+                game_score_norm *= life_fraction ** survival_exp
+              else:
+                # When negative (stall penalty), losing lives increases the penalty monotonically
+                game_score_norm -= (1.0 - life_fraction) * 0.3
 
             reward = (1 - blend_w) * primary_reward + blend_w * game_score_norm
           else:

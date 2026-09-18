@@ -56,9 +56,9 @@ RULES:
 - You must select exactly one action from the list of legal actions provided.
 - First, analyze the current situation step-by-step inside <think>...</think>. Consider:
   1. Fireworks status and remaining life / info tokens.
-  2. Confirmed playable or safe discard cards in your hand based on received clues.
+  2. Cards in your hand: identify which cards are likely playable based on partner clues (matching active firework stacks), safe to discard, or uncertain.
   3. Playable or critical cards in your partner's hand that need hints.
-  4. Which action (Play, Discard, or Hint) creates the highest game value.
+  4. Which action (Play, Discard, or Hint) creates the highest expected game value (remember: advancing score requires playing cards; taking calculated risks on hinted cards is necessary).
 - After </think>, output the chosen action on a new line, matching the legal actions list.
 
 You are Player {player_id}.
@@ -103,25 +103,25 @@ def generate_cot_reasoning(state, player_id: int, target_desc: str, bot) -> str:
   action_lower = target_desc.lower()
   if action_lower.startswith('hint') or 'reveal' in action_lower or 'hint ' in action_lower:
     reasons.append(
-        f'No 100% safe play in my own hand, but info tokens ({info_tokens}) are available.'
+        f'No confident playable card in hand, but info tokens ({info_tokens}) are available.'
     )
     reasons.append(
-        f'Providing this clue guides partner toward a safe play or protects a critical card.'
+        'Providing this clue guides partner toward a safe play or protects a critical card.'
     )
   elif action_lower.startswith('discard'):
     reasons.append(
-        f'No safe play available and info tokens ({info_tokens}) can be replenished.'
+        f'No clear play available and info tokens ({info_tokens}) can be replenished.'
     )
     reasons.append(
-        f'Discarding an unhinted or dead card regains 1 info token safely.'
+        'Discarding an unhinted or dead card regains 1 info token safely.'
     )
   elif action_lower.startswith('play'):
     reasons.append(
-        f'My hand knowledge confirms this card is playable on the fireworks stacks.'
+        'Card clues indicate this card is likely playable on the fireworks stacks.'
     )
-    reasons.append(f'Playing will increase team score without losing a life.')
+    reasons.append('Playing advances team score towards completing the fireworks.')
   else:
-    reasons.append(f'Evaluating legal options to maximize expected team score.')
+    reasons.append('Evaluating legal options to maximize expected team score.')
 
   reasons.append(f'Best action: {target_desc}.')
   think_body = '\n'.join(f'- {r}' for r in reasons)

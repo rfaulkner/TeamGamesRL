@@ -76,9 +76,9 @@ RULES:
 - You must select exactly one action from the list of legal actions provided.
 - First, analyze the current situation step-by-step inside <think>...</think>. Consider:
   1. Fireworks status and remaining life / info tokens.
-  2. Confirmed playable or safe discard cards in your hand based on received clues.
+  2. Cards in your hand: identify which cards are likely playable based on partner clues (matching active firework stacks), safe to discard, or uncertain.
   3. Playable or critical cards in your partner's hand that need hints.
-  4. Which action (Play, Discard, or Hint) creates the highest game value.
+  4. Which action (Play, Discard, or Hint) creates the highest expected game value (remember: advancing score requires playing cards; taking calculated risks on hinted cards is necessary).
 - After </think>, output the chosen action on a new line, matching the legal actions list.
 
 You are Player {player_id}.

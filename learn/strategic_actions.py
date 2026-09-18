@@ -268,7 +268,7 @@ def _find_risky_plays(
     fireworks: dict[str, int],
     play_actions: dict[int, int],
     safe_plays: list[int],
-    min_playable_frac: float = 0.3,
+    min_playable_frac: float = 0.18,
     max_risky: int = 2,
 ) -> list[int]:
   """Find play actions with non-trivial playability probability.
@@ -283,7 +283,8 @@ def _find_risky_plays(
     play_actions: ``{action_id: card_position}`` map.
     safe_plays: Already-selected known-safe play action IDs.
     min_playable_frac: Minimum fraction of combos that must be playable
-        to qualify as a risky play (default 0.3 = 30%).
+        to qualify as a risky play (default 0.18, so a single-color hint
+        with 1/5 = 20% playable qualifies).
     max_risky: Maximum number of risky plays to select.
 
   Returns:
@@ -317,6 +318,26 @@ def _find_risky_plays(
     frac = playable_combos / total_combos
     if frac >= min_playable_frac:
       candidates.append((frac, action))
+
+  # If no card meets min_playable_frac, fallback to any hinted card with playable_combos > 0
+  if not candidates:
+    for action, position in play_actions.items():
+      if action in safe_set or position >= len(card_knowledge):
+        continue
+      colors, ranks = card_knowledge[position]
+      if len(colors) >= 5 and len(ranks) >= 5:
+        continue
+      total_combos = len(colors) * len(ranks)
+      if total_combos == 0:
+        continue
+      playable_combos = 0
+      for c in colors:
+        needed_rank = fireworks.get(c, 0) + 1
+        for r in ranks:
+          if int(r) == needed_rank:
+            playable_combos += 1
+      if playable_combos > 0:
+        candidates.append((playable_combos / total_combos, action))
 
   # Sort by playability fraction (highest first) and take top max_risky.
   candidates.sort(reverse=True)
@@ -573,12 +594,12 @@ def analyze_strategic_actions(
     )
     remaining -= len(smart_discards)
 
-  # ── Tier 4: Diverse hints (fills remaining slots with distinct hints) ──
+  # ── Tier 4: Diverse hints (fills remaining slots with distinct hints, capped at 2) ──
   diverse_hints = []
   if remaining > 0:
     diverse_hints = _find_diverse_hints(
         state, player_id, obs_string, fireworks, hint_actions,
-        max_hints=remaining,
+        max_hints=min(2, remaining),
     )
     remaining -= len(diverse_hints)
 
