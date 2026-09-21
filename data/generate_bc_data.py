@@ -54,11 +54,10 @@ You are an expert game-playing AI agent. You are playing the game: {game_name}.
 
 RULES:
 - You must select exactly one action from the list of legal actions provided.
-- First, analyze the current situation step-by-step inside <think>...</think>. Consider:
-  1. Fireworks status and remaining life / info tokens.
-  2. Cards in your hand: identify which cards are likely playable based on partner clues (matching active firework stacks), safe to discard, or uncertain.
-  3. Playable or critical cards in your partner's hand that need hints.
-  4. Which action (Play, Discard, or Hint) creates the highest expected game value (remember: advancing score requires playing cards; taking calculated risks on hinted cards is necessary).
+- First, analyze the current situation step-by-step inside <think>...</think> following this strict 3-step hierarchy:
+  1. STEP 1 (Own Hand - Can I score now?): Check if your card clues indicate any card is guaranteed or likely playable on active fireworks (matching needed ranks). If yes, select PLAY for that card.
+  2. STEP 2 (Partner's Hand - Can I expose an immediate safe play?): Look at partner's visible cards. Does partner hold a card currently needed on fireworks? If yes and info tokens > 0, select HINT for that card so partner can safely play it on their turn.
+  3. STEP 3 (Safe Discard - Fallback): If no safe play in own hand and no playable card to hint (or info tokens = 0), select DISCARD for a dead card (already completed) or your oldest unhinted card to regain an info token.
 - After </think>, output the chosen action on a new line, matching the legal actions list.
 
 You are Player {player_id}.
@@ -96,30 +95,42 @@ def generate_cot_reasoning(state, player_id: int, target_desc: str, bot) -> str:
   info_tokens = state.information_tokens()
   lives = state.life_tokens()
 
+  needed = {c: fireworks.get(c, 0) + 1 for c in ('B', 'G', 'R', 'W', 'Y') if fireworks.get(c, 0) < 5}
+  needed_str = ', '.join(f'{c}{r}' for c, r in sorted(needed.items()))
   fw_str = ', '.join(f'{c}:{h}' for c, h in sorted(fireworks.items()))
 
-  reasons = [f'Fireworks: {fw_str} | Info: {info_tokens}/8 | Lives: {lives}/3.']
+  reasons = [
+      f'Fireworks: {fw_str} | Needed: {needed_str} | Info: {info_tokens}/8 | Lives: {lives}/3.'
+  ]
 
   action_lower = target_desc.lower()
-  if action_lower.startswith('hint') or 'reveal' in action_lower or 'hint ' in action_lower:
+  if action_lower.startswith('play'):
     reasons.append(
-        f'No confident playable card in hand, but info tokens ({info_tokens}) are available.'
+        'Step 1 (Own Hand): Clues indicate this card matches an active firework requirement.'
     )
     reasons.append(
-        'Providing this clue guides partner toward a safe play or protects a critical card.'
+        'Executing play to advance fireworks score.'
+    )
+  elif action_lower.startswith('hint') or 'reveal' in action_lower or 'hint ' in action_lower:
+    reasons.append(
+        'Step 1 (Own Hand): No card in own hand is confirmed playable.'
+    )
+    reasons.append(
+        f'Step 2 (Partner Hand): Partner holds cards matching needed fireworks ({needed_str}).'
+    )
+    reasons.append(
+        'Giving this clue exposes an immediate safe play or protects a vital card.'
     )
   elif action_lower.startswith('discard'):
     reasons.append(
-        f'No clear play available and info tokens ({info_tokens}) can be replenished.'
+        'Step 1 (Own Hand): No card in own hand is confirmed playable.'
     )
     reasons.append(
-        'Discarding an unhinted or dead card regains 1 info token safely.'
+        'Step 2 (Partner Hand): No immediate safe-play clue available or info tokens must be replenished.'
     )
-  elif action_lower.startswith('play'):
     reasons.append(
-        'Card clues indicate this card is likely playable on the fireworks stacks.'
+        'Step 3 (Discard): Safely discarding unneeded or dead card to regain 1 info token.'
     )
-    reasons.append('Playing advances team score towards completing the fireworks.')
   else:
     reasons.append('Evaluating legal options to maximize expected team score.')
 

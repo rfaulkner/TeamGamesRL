@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-MODEL_ID="google/gemma-3-12b-it"
+MODEL_ID="google/gemma-2-2b" # "google/gemma-3-12b-it"
 NUM_GAMES=100
 N_WORLDS=3
 EPOCHS=3
@@ -29,6 +29,7 @@ GRAD_ACCUM=4
 LR="1e-4"
 REASONING=""
 DATA_DIR=""
+FORCE_REGEN=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -40,6 +41,7 @@ for arg in "$@"; do
     --lr=*) LR="${arg#*=}" ;;
     --reasoning) REASONING="--reasoning" ;;
     --data_dir=*) DATA_DIR="${arg#*=}" ;;
+    --force_regen) FORCE_REGEN=true ;;
     *) echo "Unknown flag: $arg"; exit 1 ;;
   esac
 done
@@ -80,8 +82,8 @@ echo "  Num games:   ${NUM_GAMES}"
 echo "  Output dir:  ${output_dir}"
 echo "============================================"
 
-# Step 1: Generate BC dataset if train.jsonl does not exist or has < 1000 lines
-if [ ! -f "${data_dir}/train.jsonl" ]; then
+# Step 1: Generate BC dataset if train.jsonl does not exist or force_regen is true
+if [ ! -f "${data_dir}/train.jsonl" ] || [ "${FORCE_REGEN}" = "true" ]; then
   echo "[Step 1] Generating BC demonstration data from SafeBeliefLookaheadPlayer..."
   python3 data/generate_bc_data.py \
     --num_games="${NUM_GAMES}" \
@@ -89,7 +91,7 @@ if [ ! -f "${data_dir}/train.jsonl" ]; then
     --output_dir="${data_dir}" \
     ${REASONING}
 else
-  echo "[Step 1] Existing BC data found in ${data_dir}. Reusing dataset."
+  echo "[Step 1] Existing BC data found in ${data_dir}. Reusing dataset (pass --force_regen to overwrite)."
 fi
 
 # Step 2: Run Supervised Fine-Tuning

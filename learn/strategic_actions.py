@@ -268,14 +268,15 @@ def _find_risky_plays(
     fireworks: dict[str, int],
     play_actions: dict[int, int],
     safe_plays: list[int],
-    min_playable_frac: float = 0.18,
+    min_playable_frac: float = 0.40,
     max_risky: int = 2,
 ) -> list[int]:
-  """Find play actions with non-trivial playability probability.
+  """Find play actions with high playability probability.
 
   Selects cards where hints narrow the possibilities enough that at
   least ``min_playable_frac`` of remaining (colour, rank) combos would
-  be immediately playable.  Excludes cards already in ``safe_plays``.
+  be immediately playable (default 0.40). Excludes cards already in
+  ``safe_plays``. Does NOT fall back to low-probability blind plays.
 
   Args:
     card_knowledge: Per-card knowledge tuples.
@@ -283,12 +284,11 @@ def _find_risky_plays(
     play_actions: ``{action_id: card_position}`` map.
     safe_plays: Already-selected known-safe play action IDs.
     min_playable_frac: Minimum fraction of combos that must be playable
-        to qualify as a risky play (default 0.18, so a single-color hint
-        with 1/5 = 20% playable qualifies).
+        to qualify as a risky play (default 0.40).
     max_risky: Maximum number of risky plays to select.
 
   Returns:
-    List of action IDs for risky-but-plausible plays.
+    List of action IDs for plausible play candidates.
   """
   safe_set = set(safe_plays)
   candidates: list[tuple[float, int]] = []  # (playable_frac, action_id)
@@ -318,26 +318,6 @@ def _find_risky_plays(
     frac = playable_combos / total_combos
     if frac >= min_playable_frac:
       candidates.append((frac, action))
-
-  # If no card meets min_playable_frac, fallback to any hinted card with playable_combos > 0
-  if not candidates:
-    for action, position in play_actions.items():
-      if action in safe_set or position >= len(card_knowledge):
-        continue
-      colors, ranks = card_knowledge[position]
-      if len(colors) >= 5 and len(ranks) >= 5:
-        continue
-      total_combos = len(colors) * len(ranks)
-      if total_combos == 0:
-        continue
-      playable_combos = 0
-      for c in colors:
-        needed_rank = fireworks.get(c, 0) + 1
-        for r in ranks:
-          if int(r) == needed_rank:
-            playable_combos += 1
-      if playable_combos > 0:
-        candidates.append((playable_combos / total_combos, action))
 
   # Sort by playability fraction (highest first) and take top max_risky.
   candidates.sort(reverse=True)

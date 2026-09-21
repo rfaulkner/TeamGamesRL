@@ -867,6 +867,33 @@ class HanabiRenderer(BaseStateRenderer):
         parts.append(f'{color_name}: {rank}')
     return ', '.join(parts) if parts else fireworks_str
 
+  def _format_needed_cards(self, fireworks_str: str) -> str:
+    """Formats list of cards currently needed to advance fireworks.
+
+    Converts "R0 Y2 G1 W0 B0" into "Red 1, Yellow 3, Green 2, White 1, Blue 1".
+
+    Args:
+      fireworks_str: Raw fireworks string like "R0 Y2 G1".
+
+    Returns:
+      Human-readable list of next needed cards.
+    """
+    if not fireworks_str.strip():
+      return 'Red 1, Yellow 1, Green 1, White 1, Blue 1'
+
+    needed = []
+    for token in fireworks_str.strip().split():
+      if len(token) >= 2:
+        color_code = token[0]
+        try:
+          rank = int(token[1:])
+        except ValueError:
+          continue
+        if rank < 5:
+          color_name = _HANABI_COLOR_NAMES.get(color_code, color_code)
+          needed.append(f'{color_name} {rank + 1}')
+    return ', '.join(needed) if needed else 'None (all completed)'
+
   def _format_card_info(
       self, card_str: str, is_own_hand: bool
   ) -> str:
@@ -1166,6 +1193,9 @@ class HanabiRenderer(BaseStateRenderer):
     lines.append(f'Information tokens remaining: {parsed["info_tokens"]}')
     lines.append(
         f'Fireworks on table: {self._format_fireworks(parsed["fireworks"])}'
+    )
+    lines.append(
+        f'Needed next to advance fireworks: {self._format_needed_cards(parsed["fireworks"])}'
     )
     lines.append(f'Cards remaining in deck: {parsed["deck_size"]}')
 

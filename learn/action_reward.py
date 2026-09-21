@@ -70,6 +70,7 @@ _FIREWORKS_RE = re.compile(r'Fireworks:\s*((?:[RYGWB]\d\s*)+)')
 _CARD_KNOWLEDGE_RE = re.compile(
     r'XX\s*\|\|\s*(?:[A-Z0-9]+[|])?([RYGWB]+)[|]?([1-5]+)'
 )
+_VISIBLE_CARD_RE = re.compile(r'([RYGWB])(\d)\s*\|\|')
 
 # Maximum ranks per colour in standard Hanabi.
 _MAX_RANK = 5
@@ -113,7 +114,8 @@ def evaluate_action_quality(
   # -- Play action ----------------------------------------------------------
   play_match = _PLAY_RE.search(action_str)
   if play_match:
-    return _evaluate_play(state, action_id)
+    card_pos = int(play_match.group(1))
+    return _evaluate_play(state, action_id, player_id, card_pos)
 
   # -- Discard action -------------------------------------------------------
   discard_match = _DISCARD_RE.search(action_str)
@@ -142,51 +144,7 @@ def evaluate_action_quality(
 
 
 # =============================================================================
-# Play evaluation
-# =============================================================================
-
-
-def _evaluate_play(state, action_id: int) -> float:
-  """Evaluate a Play action by checking the state transition.
-
-  Clones the state, applies the action, and checks whether the score
-  increased (successful play) or a life token was lost (failed play).
-
-  Args:
-    state: The pre-action state.
-    action_id: The Play action UID.
-
-  Returns:
-    +1.0 for a valid play, +1.5 if it completes a colour, -1.0 for
-    an invalid play.
-  """
-  score_before = state.score()
-  lives_before = state.life_tokens()
-
-  sim = state.clone()
-  sim.apply_action(action_id)
-
-  score_after = sim.score()
-  lives_after = sim.life_tokens()
-
-  if score_after > score_before:
-    # Successful play.
-    # Check if this completed a colour stack (rank 5 -> score mod 5 == 0
-    # after increment, meaning the stack went from 4 to 5).
-    score_delta = score_after - score_before
-    if score_delta == 1 and score_after % _MAX_RANK == 0:
-      return 1.5  # Completed a colour + regains info token.
-    return 1.0
-  elif lives_after < lives_before:
-    return -1.0  # Invalid play -- lost a life token.
-  else:
-    # Edge case: score didn't change, no life lost (shouldn't happen
-    # in standard Hanabi, but handle gracefully).
-    return 0.0
-
-
-# =============================================================================
-# Discard evaluation
+# Playability and play evaluation
 # =============================================================================
 
 
@@ -240,6 +198,69 @@ def _card_playability_from_knowledge(
         playable_combos += 1
 
   return True, playable_combos / total_combos
+
+
+def _evaluate_play(
+    state,
+    action_id: int,
+    player_id: int = 0,
+    card_pos: int = 0,
+) -> float:
+  """Evaluate a Play action by checking the state transition.
+
+  Clones the state, applies the action, and checks whether the score
+  increased (successful play) or a life token was lost (failed play).
+  If the card was hinted with positive playability potential, the
+  failure penalty is softened to prevent play extinction.
+
+  Args:
+    state: The pre-action state.
+    action_id: The Play action UID.
+    player_id: Index of the acting player.
+    card_pos: Hand position of the played card.
+
+  Returns:
+    +1.0 for a valid play, +1.5 if it completes a colour, -0.3 for
+    a failed play on a hinted card, -1.0 for an unhinted blind failed play.
+  """
+  score_before = state.score()
+  lives_before = state.life_tokens()
+
+  sim = state.clone()
+  sim.apply_action(action_id)
+
+  score_after = sim.score()
+  lives_after = sim.life_tokens()
+
+  if score_after > score_before:
+    # Successful play.
+    # Check if this completed a colour stack (rank 5 -> score mod 5 == 0
+    # after increment, meaning the stack went from 4 to 5).
+    score_delta = score_after - score_before
+    if score_delta == 1 and score_after % _MAX_RANK == 0:
+      return 1.5  # Completed a colour + regains info token.
+    return 1.0
+  elif lives_after < lives_before:
+    # Invalid play -- lost a life token.
+    # Check if the player had clues suggesting playability.
+    obs_str = state.observation_string(player_id)
+    card_knowledge = _CARD_KNOWLEDGE_RE.findall(obs_str)
+    fireworks = _parse_fireworks_from_state(state, player_id)
+    is_hinted, playable_frac = _card_playability_from_knowledge(
+        card_knowledge, card_pos, fireworks
+    )
+    if is_hinted and playable_frac > 0:
+      return -0.3  # Softened penalty for play attempt on hinted card.
+    return -1.0  # Full penalty for unhinted blind play.
+  else:
+    # Edge case: score didn't change, no life lost (shouldn't happen
+    # in standard Hanabi, but handle gracefully).
+    return 0.0
+
+
+# =============================================================================
+# Discard evaluation
+# =============================================================================
 
 
 def _evaluate_discard(
@@ -505,24 +526,54 @@ def _evaluate_hint(
   if new_facts == 0:
     return -0.2  # Redundant hint -- no new information.
 
-  # Base reward from information gain.
-  # 1 fact -> +0.1, 2 facts -> +0.2, 3+ facts -> +0.3
-  base_reward = min(0.1 * new_facts, 0.3)
+  # Base reward from information gain (capped lower so play-exposing hints dominate).
+  # 1 fact -> +0.05, 2 facts -> +0.10, 3+ facts -> +0.15
+  base_reward = min(0.05 * new_facts, 0.15)
 
-  # Bonus: does this hint enable an immediately playable card?
-  # Check if any of the target's cards are now identifiable as playable.
+  # Check fireworks.
   fireworks = _parse_fireworks_from_state(sim, target_id)
-  playability_bonus = 0.0
+
+  # Check partner's visible cards from hinter's perspective.
+  hinter_obs = state.observation_string(hinter_id)
+  partner_cards = [
+      (m.group(1), int(m.group(2)))
+      for m in _VISIBLE_CARD_RE.finditer(hinter_obs)
+  ]
+
+  # Does this hint touch an immediately playable card in the partner's hand?
+  touches_playable = False
+  for color, rank in partner_cards:
+    needed_rank = fireworks.get(color, 0) + 1
+    if rank == needed_rank:
+      if hint_type == 'color' and color == hint_value:
+        touches_playable = True
+        break
+      elif hint_type == 'rank' and str(rank) == str(hint_value):
+        touches_playable = True
+        break
+
+  # Playability bonus: +0.4 if touching an immediately playable card.
+  # Also check target's updated knowledge: if a card became 100% uniquely identified & playable.
+  knowledge_playable = False
   for i in range(min(len(knowledge_after), 5)):
     colors_known, ranks_known = knowledge_after[i]
     if len(colors_known) == 1 and len(ranks_known) == 1:
       needed_rank = fireworks.get(colors_known, 0) + 1
       if int(ranks_known) == needed_rank:
-        # This card is now known to be playable!
-        playability_bonus = 0.2
+        knowledge_playable = True
         break
 
-  return min(base_reward + playability_bonus, 0.5)
+  if touches_playable or knowledge_playable:
+    playability_bonus = 0.40
+  else:
+    # If info tokens are scarce (<= 2) and this hint does NOT expose a playable card,
+    # penalize wasting an info token.
+    info_tokens = state.information_tokens()
+    if info_tokens <= 2:
+      return -0.20  # Wasted scarce info token on non-playable card.
+    playability_bonus = 0.0
+
+  return min(base_reward + playability_bonus, 0.55)
 
 
 # =============================================================================

@@ -74,11 +74,10 @@ You are an expert game-playing AI agent. You are playing the game: {game_name}.
 
 RULES:
 - You must select exactly one action from the list of legal actions provided.
-- First, analyze the current situation step-by-step inside <think>...</think>. Consider:
-  1. Fireworks status and remaining life / info tokens.
-  2. Cards in your hand: identify which cards are likely playable based on partner clues (matching active firework stacks), safe to discard, or uncertain.
-  3. Playable or critical cards in your partner's hand that need hints.
-  4. Which action (Play, Discard, or Hint) creates the highest expected game value (remember: advancing score requires playing cards; taking calculated risks on hinted cards is necessary).
+- First, analyze the current situation step-by-step inside <think>...</think> following this strict 3-step hierarchy:
+  1. STEP 1 (Own Hand - Can I score now?): Check if your card clues indicate any card is guaranteed or likely playable on active fireworks (matching needed ranks). If yes, select PLAY for that card.
+  2. STEP 2 (Partner's Hand - Can I expose an immediate safe play?): Look at partner's visible cards. Does partner hold a card currently needed on fireworks? If yes and info tokens > 0, select HINT for that card so partner can safely play it on their turn.
+  3. STEP 3 (Safe Discard - Fallback): If no safe play in own hand and no playable card to hint (or info tokens = 0), select DISCARD for a dead card (already completed) or your oldest unhinted card to regain an info token.
 - After </think>, output the chosen action on a new line, matching the legal actions list.
 
 You are Player {player_id}.
