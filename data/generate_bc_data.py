@@ -54,10 +54,12 @@ You are an expert game-playing AI agent. You are playing the game: {game_name}.
 
 RULES:
 - You must select exactly one action from the list of legal actions provided.
-- First, analyze the current situation step-by-step inside <think>...</think> following this strict 3-step hierarchy:
-  1. STEP 1 (Own Hand - Can I score now?): Check if your card clues indicate any card is guaranteed or likely playable on active fireworks (matching needed ranks). If yes, select PLAY for that card.
-  2. STEP 2 (Partner's Hand - Can I expose an immediate safe play?): Look at partner's visible cards. Does partner hold a card currently needed on fireworks? If yes and info tokens > 0, select HINT for that card so partner can safely play it on their turn.
-  3. STEP 3 (Safe Discard - Fallback): If no safe play in own hand and no playable card to hint (or info tokens = 0), select DISCARD for a dead card (already completed) or your oldest unhinted card to regain an info token.
+- Inside <think>...</think>, deliberate across these key aspects before choosing:
+  1. Fireworks & Needed Cards: Note current firework heights and what ranks are needed next.
+  2. Own Hand (Playability & Risk): Evaluate your card clues against needed fireworks and remaining lives. Is a card confirmed playable, or is playing it a gamble?
+  3. Partner & Communication: Look at partner's visible cards and info tokens. Does partner need an immediate clue to play safely or avoid discarding a critical card?
+  4. Token Management & Discards: If info tokens are low, identify safe discards (dead cards or duplicate ranks) to replenish tokens without risking vital cards.
+  5. Decision: Weigh your options (Play, Hint, Discard) to balance scoring progress, communication, and team survival.
 - After </think>, output the chosen action on a new line, matching the legal actions list.
 
 You are Player {player_id}.
@@ -89,52 +91,52 @@ def build_system_prompt(game, player_id: int, reasoning: bool = False) -> str:
 
 
 def generate_cot_reasoning(state, player_id: int, target_desc: str, bot) -> str:
-  """Generates a concise, structured reasoning block for the chosen action."""
+  """Generates a concise, evaluative reasoning block for the chosen action."""
   obs_string = state.observation_string(player_id)
   fireworks = bot._parse_fireworks(obs_string)
   info_tokens = state.information_tokens()
   lives = state.life_tokens()
 
   needed = {c: fireworks.get(c, 0) + 1 for c in ('B', 'G', 'R', 'W', 'Y') if fireworks.get(c, 0) < 5}
-  needed_str = ', '.join(f'{c}{r}' for c, r in sorted(needed.items()))
+  needed_str = ', '.join(f'{c}{r}' for c, r in sorted(needed.items())) if needed else 'None'
   fw_str = ', '.join(f'{c}:{h}' for c, h in sorted(fireworks.items()))
 
   reasons = [
-      f'Fireworks: {fw_str} | Needed: {needed_str} | Info: {info_tokens}/8 | Lives: {lives}/3.'
+      f'State: Fireworks [{fw_str}], Needed [{needed_str}], Info {info_tokens}/8, Lives {lives}/3.',
   ]
 
   action_lower = target_desc.lower()
   if action_lower.startswith('play'):
     reasons.append(
-        'Step 1 (Own Hand): Clues indicate this card matches an active firework requirement.'
+        'Own hand: Card clues confirm this card matches a currently needed firework rank.'
     )
     reasons.append(
-        'Executing play to advance fireworks score.'
+        'Evaluation: Playing is safe and directly advances the team score.'
     )
   elif action_lower.startswith('hint') or 'reveal' in action_lower or 'hint ' in action_lower:
     reasons.append(
-        'Step 1 (Own Hand): No card in own hand is confirmed playable.'
+        'Own hand: No cards confirmed safe to play without risking a life.'
     )
     reasons.append(
-        f'Step 2 (Partner Hand): Partner holds cards matching needed fireworks ({needed_str}).'
+        f'Partner & Clues: Partner holds cards matching needed fireworks ({needed_str}); giving clue to enable safe play.'
     )
     reasons.append(
-        'Giving this clue exposes an immediate safe play or protects a vital card.'
+        'Evaluation: Providing information coordinates progress while keeping team safe.'
     )
   elif action_lower.startswith('discard'):
     reasons.append(
-        'Step 1 (Own Hand): No card in own hand is confirmed playable.'
+        'Own hand: No cards confirmed safe to play.'
     )
     reasons.append(
-        'Step 2 (Partner Hand): No immediate safe-play clue available or info tokens must be replenished.'
+        f'Token management: Info tokens ({info_tokens}/8) need replenishment; identifying a safe, non-critical discard.'
     )
     reasons.append(
-        'Step 3 (Discard): Safely discarding unneeded or dead card to regain 1 info token.'
+        'Evaluation: Discarding regains an info token for future communication without losing a unique card.'
     )
   else:
-    reasons.append('Evaluating legal options to maximize expected team score.')
+    reasons.append('Deliberating options across playability, communication, and token management.')
 
-  reasons.append(f'Best action: {target_desc}.')
+  reasons.append(f'Decision: {target_desc}.')
   think_body = '\n'.join(f'- {r}' for r in reasons)
   return f'<think>\n{think_body}\n</think>\n{target_desc}'
 

@@ -73,6 +73,7 @@ STRATEGIC_ACTION_MODE="substitute"
 STRATEGIC_ACTION_FORCED_RATIO="1.0"
 LLM_PARTNER_RESPONSE="false"
 BOT_PARTNER="false"
+BOT_TYPE="belief_lookahead"
 REASONING="false"
 EVAL_BATCH_SIZE=4
 # ── 1. Determine profile first ───────────────────────────────────────────────
@@ -139,6 +140,7 @@ for arg in "$@"; do
     --llm_partner_response) LLM_PARTNER_RESPONSE="true" ;;
     --bot_partner) BOT_PARTNER="true" ;;
     --bot_partner=*) BOT_PARTNER="${arg#*=}" ;;
+    --bot_type=*) BOT_TYPE="${arg#*=}" ;;
     --reasoning) REASONING="true" ;;
     --reasoning=*) REASONING="${arg#*=}" ;;
     --eval_batch_size=*) EVAL_BATCH_SIZE="${arg#*=}" ;;
@@ -264,6 +266,7 @@ python3 trainer/gemma_rl_trainer.py \
   --strategic_action_forced_ratio="${STRATEGIC_ACTION_FORCED_RATIO}" \
   --llm_partner_response="${LLM_PARTNER_RESPONSE}" \
   --bot_partner="${BOT_PARTNER}" \
+  --bot_type="${BOT_TYPE}" \
   --reasoning="${REASONING}" \
   --eval_batch_size="${EVAL_BATCH_SIZE}" \
   --max_seq_len="${MAX_SEQ_LEN}" \

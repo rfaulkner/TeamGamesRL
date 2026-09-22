@@ -130,11 +130,28 @@ def collect_game_prompts(
 
       if is_bot_turn:
         if not hasattr(runner, '_heuristic_bot') or runner._heuristic_bot is None:
-          try:
-            from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-            runner._heuristic_bot = SafePlayPlayer(seed=42)
-          except ImportError:
-            runner._heuristic_bot = None
+          bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
+          if bot_type == 'belief_lookahead':
+            try:
+              from env.hanabi.belief_expert import SafeBeliefLookaheadPlayer  # pylint: disable=g-import-not-at-top
+              runner._heuristic_bot = SafeBeliefLookaheadPlayer(
+                  runner._env.game, n_worlds=1, seed=42
+              )
+            except Exception as e:
+              logging.warning(
+                  'Failed to load SafeBeliefLookaheadPlayer: %s, falling back to SafePlayPlayer', e
+              )
+              try:
+                from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+                runner._heuristic_bot = SafePlayPlayer(seed=42)
+              except ImportError:
+                runner._heuristic_bot = None
+          else:
+            try:
+              from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+              runner._heuristic_bot = SafePlayPlayer(seed=42)
+            except ImportError:
+              runner._heuristic_bot = None
 
         if runner._heuristic_bot is not None:
           action_id = runner._heuristic_bot.select_action(

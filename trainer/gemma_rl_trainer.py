@@ -408,9 +408,15 @@ flags.DEFINE_bool(
 flags.DEFINE_bool(
     'bot_partner',
     False,
-    'Partner with SafePlayPlayer during collection and evaluation. '
+    'Partner with a bot during collection and evaluation. '
     'Collection alternates roles (odd: P0=LLM, P1=Bot; even: P0=Bot, P1=LLM) '
     'and evaluation splits into LLM+Bot, Bot+LLM, and LLM+LLM sets.',
+)
+flags.DEFINE_string(
+    'bot_type',
+    'belief_lookahead',
+    'Type of bot partner to use: "belief_lookahead" (SafeBeliefLookaheadPlayer) '
+    'or "safe_play" (SafePlayPlayer).',
 )
 flags.DEFINE_bool(
     'reasoning',
@@ -522,6 +528,7 @@ def main(argv: list[str]) -> None:
       'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
       'llm_partner_response': FLAGS.llm_partner_response,
       'bot_partner': FLAGS.bot_partner,
+      'bot_type': FLAGS.bot_type,
       # REINFORCE-specific configuration.
       'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
       'baseline_window_size': FLAGS.baseline_window_size,
@@ -552,6 +559,7 @@ def main(argv: list[str]) -> None:
       max_history_turns=FLAGS.max_history_turns or None,
       experiment_config=experiment_config,
       bot_partner=FLAGS.bot_partner,
+      bot_type=FLAGS.bot_type,
       reasoning=FLAGS.reasoning,
       eval_batch_size=FLAGS.eval_batch_size,
   )
@@ -604,6 +612,7 @@ def main(argv: list[str]) -> None:
         strategic_action_forced_ratio=FLAGS.strategic_action_forced_ratio,
         llm_partner_response=FLAGS.llm_partner_response,
         bot_partner=FLAGS.bot_partner,
+        bot_type=FLAGS.bot_type,
         reasoning=FLAGS.reasoning,
     )
     # ── Tiny Hanabi-specific tuning ──

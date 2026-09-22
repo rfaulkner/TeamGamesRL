@@ -88,6 +88,7 @@ class RLTrainer:
       max_history_turns: int | None = 20,
       experiment_config: dict | None = None,
       bot_partner: bool = False,
+      bot_type: str = 'belief_lookahead',
       reasoning: bool = False,
       eval_batch_size: int = 4,
   ):
@@ -116,8 +117,9 @@ class RLTrainer:
           (model, LoRA, training, GRPO, etc.) to persist in the results
           directory as ``config.json``.  When provided, this config is
           also embedded in the final ``summary.json``.
-      bot_partner: Whether to partner with SafePlayPlayer during collection
+      bot_partner: Whether to partner with a bot during collection
           and evaluation.
+      bot_type: Type of bot partner ('belief_lookahead' or 'safe_play').
       reasoning: Whether to use chain-of-thought reasoning prompts.
       eval_batch_size: Number of evaluation episodes to run concurrently in lockstep.
 
@@ -140,6 +142,7 @@ class RLTrainer:
     self.wandb_config = wandb_config or {}
     self.backend = backend
     self.bot_partner = bot_partner
+    self.bot_type = bot_type
     self.eval_batch_size = eval_batch_size
     self.max_history_turns = max_history_turns
     self._bot = None
@@ -221,6 +224,24 @@ class RLTrainer:
         len(self._ref_state_dict),
     )
 
+  def _create_bot(self):
+    """Creates the partner bot based on bot_type."""
+    bot_type = getattr(self, 'bot_type', 'belief_lookahead')
+    if bot_type == 'belief_lookahead':
+      try:
+        from env.hanabi.belief_expert import SafeBeliefLookaheadPlayer  # pylint: disable=g-import-not-at-top
+        return SafeBeliefLookaheadPlayer(self.env.game, n_worlds=1, seed=42)
+      except Exception as e:
+        logging.warning(
+            'Failed to load SafeBeliefLookaheadPlayer: %s, falling back to SafePlayPlayer', e
+        )
+    try:
+      from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+      return SafePlayPlayer(seed=42)
+    except Exception as e:
+      logging.warning('Failed to load SafePlayPlayer: %s', e)
+      return None
+
   def run_episode(
       self,
       is_evaluation: bool = False,
@@ -230,7 +251,7 @@ class RLTrainer:
 
     Args:
       is_evaluation: If True, uses greedy action selection (temp=0.01).
-      bot_player: If set, this player is controlled by SafePlayPlayer.
+      bot_player: If set, this player is controlled by the partner bot.
 
     Returns:
       List of PlayerTrajectory objects, one per player.
@@ -266,11 +287,7 @@ class RLTrainer:
 
       if bot_player is not None and current_player == bot_player:
         if self._bot is None:
-          try:
-            from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-            self._bot = SafePlayPlayer(seed=42)
-          except ImportError:
-            self._bot = None
+          self._bot = self._create_bot()
         if self._bot is not None:
           action_id = self._bot.select_action(state, current_player, self.env.game)
         else:
@@ -356,11 +373,7 @@ class RLTrainer:
     ]
 
     if self._bot is None:
-      try:
-        from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-        self._bot = SafePlayPlayer(seed=42)
-      except ImportError:
-        self._bot = None
+      self._bot = self._create_bot()
 
     eval_temp = 0.2 if self.reasoning else 0.01
     max_tokens = 200 if self.reasoning else 64

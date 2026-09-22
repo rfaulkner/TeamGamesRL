@@ -512,7 +512,7 @@ class GRPOConfig:
   """
 
   bot_partner: bool = False
-  """Use SafePlayPlayer as an alternating partner during collection and eval.
+  """Use a bot as an alternating partner during collection and eval.
 
   When True:
   - Collection alternates roles: odd episodes have P0=LLM and P1=Bot; even
@@ -520,6 +520,9 @@ class GRPOConfig:
   - Evaluation splits episodes across three conditions: P0=LLM vs P1=Bot,
     P0=Bot vs P1=LLM, and P0=LLM vs P1=LLM (self-play).
   """
+
+  bot_type: str = 'belief_lookahead'
+  """Bot partner type: 'belief_lookahead' (SafeBeliefLookaheadPlayer) or 'safe_play'."""
 
   reasoning: bool = False
   """If True, prompt the LLM to think inside <think>...</think> before acting."""
