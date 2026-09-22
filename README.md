@@ -1,60 +1,62 @@
 # TeamGamesRL
 
 **A modular framework for training LLM agents on cooperative and competitive
-multi-agent games using reinforcement learning and
-[OpenSpiel](https://github.com/google-deepmind/open_spiel).**
+multi-agent games using reinforcement learning, behavioral cloning, and
+[OpenSpiel](https://github.com/google-deepmind/open_spiel) /
+[Hanabi Learning Environment (HLE)](https://github.com/google-deepmind/hanabi-learning-environment).**
 
 ---
 
 ## Project Goals
 
 TeamGamesRL explores a novel research direction: using reinforcement learning to
-fine-tune large language models so they become better strategic players in
+fine-tune large language models so they become strategic, communicative players in
 multi-agent games. The framework is designed to be **model-agnostic**,
 **algorithm-agnostic**, and **environment-extensible** — swap in any LLM
-backend, any RL algorithm, or any OpenSpiel game.
+backend, any RL algorithm, or any multi-agent game.
 
 Key research questions:
 
-1. **Can LLMs learn game-theoretic reasoning through RL?** We put LLM agents
-   into cooperative and competitive OpenSpiel games and train them with policy
-   gradients — does the model learn to propose better deals, give better hints,
-   and coordinate more effectively?
+1. **Can LLMs learn game-theoretic conventions and reasoning through RL?**
+   We place LLM agents into imperfect-information cooperative games like Hanabi
+   and train them with policy gradients (REINFORCE, GRPO) — does the model learn
+   to give informative hints, coordinate conventions, and prevent disastrous discards?
 
-2. **How does natural-language action selection compare to discrete policies?**
-   Instead of a traditional action-head MLP, our agents read text-rendered game
-   states and select actions via text generation. The policy *is* the language
-   model itself.
+2. **Natural-language action selection vs. discrete heads.**
+   Instead of an auxiliary discrete action head, our agents read natural-language
+   game state prompts and produce actions via autoregressive text generation (optionally
+   preceded by deliberative `<think>...</think>` Chain-of-Thought reasoning).
+   The language model *is* the policy.
 
-3. **Efficient fine-tuning at scale.** With LoRA adapters and quantization, a
-   single GPU can train a multi-billion-parameter model in the RL loop with
-   minimal VRAM overhead.
+3. **Sample-efficient fine-tuning at scale.**
+   With LoRA adapters and 4-bit (NF4) quantization, models from Gemma 2B to Gemma 3 12B
+   can be trained in the RL loop on a single workstation or cluster GPU (e.g. L40S, A100).
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                     TeamGamesRL Pipeline                          │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                    │
-│  ┌───────────────┐   ┌──────────────────┐   ┌──────────────────┐  │
-│  │   OpenSpiel    │   │  State Renderer   │   │   LLM Backend    │  │
-│  │  Environment   │──▶│  (text bridge)    │──▶│  (any model)     │  │
-│  │  (env/)        │   │  (env/)           │   │  (backend/)      │  │
-│  └───────┬───────┘   └──────────────────┘   └───────┬──────────┘  │
-│          │                                           │             │
-│          │◀─────────── action ID ◀──── parse ◀───────┘             │
-│          │                                                         │
-│          ▼                                                         │
-│  ┌───────────────┐                                                 │
-│  │   Trajectory   │──▶ RL Algorithm ──▶ weight update              │
-│  │   Collector    │    (learn/)                                     │
-│  │ (trainer/)     │                                                │
-│  └───────────────┘                                                 │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            TeamGamesRL Pipeline                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐       ┌──────────────────┐     ┌────────────────────┐  │
+│  │   Game Engine   │       │  State Renderer  │     │    LLM Backend     │  │
+│  │ (OpenSpiel/HLE) │──────▶│  (text bridge)   │────▶│ (Gemma 2B/12B LoRA)│  │
+│  │ (env/, env/hanabi)      │  (env/, env/hanabi)    │ (backend/gemma_...)│  │
+│  └────────┬────────┘       └──────────────────┘     └─────────┬──────────┘  │
+│           │                                                   │             │
+│           │◀────────────── action ID ◀──── parse ◀────────────┘             │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐                                                        │
+│  │   Trajectory /  │──────▶ RL Algorithm ──────▶ LoRA parameter update     │
+│  │   GRPO Groups   │        (learn/grpo_sampled)                            │
+│  │ (trainer/, learn)                                                        │
+│  └─────────────────┘                                                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -65,185 +67,143 @@ Key research questions:
 TeamGamesRL/
 ├── backend/                        # Swappable LLM backends
 │   ├── __init__.py
-│   └── gemma_backend.py            # Gemma 2B with LoRA + 4-bit quantization
+│   └── gemma_backend.py            # Gemma 2B/12B with LoRA + 4-bit quantization
 │
 ├── env/                            # Game environments and state rendering
 │   ├── __init__.py
 │   ├── game_config.py              # GameConfig registry (add new games here)
 │   ├── game_env.py                 # Environment + renderer factory functions
-│   └── state_renderers.py          # Text ↔ action bridges per game
+│   ├── state_renderers.py          # Text ↔ action bridges per game
+│   └── hanabi/                     # Dedicated Hanabi environment & bots
+│       ├── __init__.py
+│       ├── hanabi_env.py           # Fast HLE adapter, state serialization & regexes
+│       ├── heuristic_player.py     # SafePlayPlayer & SafeBeliefLookaheadPlayer bots
+│       ├── belief_expert.py        # Bayesian belief tracker over hidden cards
+│       ├── determinize.py          # Determinization / imperfect-info rollouts
+│       └── eval_metrics.py         # Multi-game evaluation metrics collector
+│
+├── data/                           # Demonstration datasets and generators
+│   └── generate_bc_data.py         # Generates expert games for BC warm-start
 │
 ├── learn/                          # RL algorithm implementations
 │   ├── __init__.py
-│   ├── trajectory.py               # Trajectory data classes
+│   ├── trajectory.py               # Trajectory and step data classes
 │   ├── reinforce.py                # REINFORCE + baseline + KL penalty
-│   └── grpo.py                     # GRPO via TRL's GRPOTrainer
+│   ├── grpo.py                     # Minimal TRL GRPO wrapper
+│   ├── grpo_config.py              # Configuration dataclass for sampled GRPO
+│   ├── grpo_sampled.py             # Main multi-turn sampled GRPO runner
+│   ├── action_reward.py            # Immediate & dense rollout reward shaping
+│   └── strategic_actions.py        # Strategic action generation & diversity injection
 │
 ├── trainer/                        # Training orchestration + entry points
 │   ├── __init__.py
-│   ├── rl_trainer.py               # Model-agnostic training loop
-│   └── gemma_rl_trainer.py         # Gemma-specific CLI entry point
+│   ├── rl_trainer.py               # Model-agnostic training loop & batched eval
+│   └── gemma_rl_trainer.py         # Primary CLI entry point for Gemma models
 │
-├── llm_agent.py                    # LLMInterface ABC, MockLLM, GeminiLLM, LLMAgent
+├── scripts/                        # Cluster runner scripts
+│   ├── run_bc.sh                   # SLURM script for Behavioral Cloning (BC)
+│   ├── run_grpo.sh                 # SLURM script for standard GRPO
+│   └── run_reinforce.sh            # SLURM script for REINFORCE
+│
+├── run_hanabi_full.sh              # Full 5-color Hanabi RL SLURM submission script
+├── train_bc.py                     # Supervised Fine-Tuning (SFT / BC) trainer
 ├── train.py                        # Lightweight trainer for mock/API LLM backends
-├── view_episodes.py                # CLI tool to inspect episode logs
-├── run_hanabi.sh                    # SLURM submission script (Tiny Hanabi)
+├── llm_agent.py                    # LLMInterface ABC, MockLLM, GeminiLLM, LLMAgent
+├── view_episodes.py                # CLI tool to inspect episode transcripts
 ├── setup.sh                        # One-command environment bootstrap
 └── requirements.txt                # Python dependencies
 ```
 
 ---
 
-## Extensibility
+## Supported Games
 
-TeamGamesRL is built around four extension points: **backends**, **environments**,
-**renderers**, and **algorithms**. Each can be swapped or extended independently.
+| Game | Engine | Players | Type | Description |
+|---|---|---|---|---|
+| `tiny_hanabi` | OpenSpiel | 2 | Cooperative | Minimal Hanabi (2 colors, 2 cards/hand) — great for fast debugging. |
+| `hanabi` | HLE / OpenSpiel | 2 | Cooperative | Full Hanabi (5 colors, 5 ranks, 50-card deck, 8 info tokens, 3 lives). |
+| `negotiation` | OpenSpiel | 2 | Competitive | Multi-item deal-making — propose splits, send utterances, accept/reject. |
 
-### Adding a New Model Backend
-
-Create a new file in `backend/` that implements the `LLMInterface` ABC from
-`llm_agent.py`:
-
-```python
-# backend/my_model_backend.py
-
-import llm_agent
-
-class MyModelBackend(llm_agent.LLMInterface):
-    """A custom LLM backend."""
-
-    def __init__(self, model_name: str, **kwargs):
-        # Load your model, tokenizer, adapter, etc.
-        self.model = ...
-        self.tokenizer = ...
-        self.device = ...
-
-    def generate(self, prompt: str, temperature: float = 0.8,
-                 max_tokens: int = 64) -> str:
-        """Generate a text completion."""
-        ...
-
-    def generate_with_logprobs(self, prompt: str, temperature: float = 0.8,
-                               max_tokens: int = 64) -> tuple[str, float]:
-        """Generate text and return (response, log_probability)."""
-        ...
-
-    def compute_action_log_prob(self, prompt: str,
-                                action_text: str) -> 'torch.Tensor':
-        """Recompute log-prob with gradient tracking (for RL training)."""
-        ...
-```
-
-Then create a corresponding entry point in `trainer/` (or modify an existing
-one) to instantiate your backend and pass it to `RLTrainer`:
-
-```python
-from backend.my_model_backend import MyModelBackend
-from trainer.rl_trainer import RLTrainer
-
-backend = MyModelBackend(model_name='my-org/my-model')
-trainer = RLTrainer(game_name='tiny_hanabi', backend=backend, lr=1e-4)
-trainer.train_reinforce(config)
-```
-
-### Adding a New Game Environment
-
-1. **Register the game** in `env/game_config.py`:
-
-```python
-MY_GAME_CONFIG = GameConfig(
-    game_name='my_openspiel_game',  # Must match the OpenSpiel game name
-    game_params={'players': 3},     # Game-specific parameters
-    num_players=3,
-)
-
-_GAME_CONFIGS['my_game'] = MY_GAME_CONFIG
-```
-
-2. **Create a renderer** in `env/state_renderers.py` by subclassing
-   `BaseStateRenderer`:
-
-```python
-class MyGameRenderer(BaseStateRenderer):
-
-    def render_state(self, state, player_id, game) -> str:
-        """Convert the game state to a natural-language description."""
-        ...
-
-    def render_legal_actions(self, state, player_id, game):
-        """Return list of (action_id, description) for legal actions."""
-        ...
-
-    def parse_action(self, llm_response, legal_actions_with_desc):
-        """Parse the LLM's text response into an action ID."""
-        ...
-```
-
-3. **Register the renderer** in the `get_renderer()` factory at the bottom of
-   `env/state_renderers.py`.
-
-### Adding a New RL Algorithm
-
-Create a new module in `learn/`. The algorithm should follow one of two
-patterns:
-
-**Pattern A — Updater** (for online, per-episode algorithms like REINFORCE):
-
-```python
-# learn/my_algorithm.py
-
-@dataclasses.dataclass
-class MyAlgorithmConfig:
-    lr: float = 1e-4
-    ...
-
-class MyAlgorithmUpdater:
-    def __init__(self, backend, optimizer, config):
-        ...
-
-    def update(self, trajectories: list[PlayerTrajectory]) -> float:
-        """Compute loss and apply one gradient step. Return loss value."""
-        ...
-
-    def flush(self):
-        """Flush any accumulated state (e.g. gradient accumulation)."""
-        ...
-```
-
-Then add a `train_my_algorithm()` method to `trainer/rl_trainer.py` following
-the pattern of `train_reinforce()`.
-
-**Pattern B — Runner** (for batch algorithms like GRPO that manage their own
-training loop):
-
-```python
-# learn/my_batch_algorithm.py
-
-class MyBatchRunner:
-    def __init__(self, env, renderers, agents, backend, game_config,
-                 evaluate_fn, save_checkpoint_fn, output_dir, config):
-        ...
-
-    def run(self):
-        """Execute the full training procedure."""
-        ...
-```
-
-Then add a `train_my_algorithm()` method to `trainer/rl_trainer.py` that
-instantiates and calls `runner.run()`, following the pattern of `train_grpo()`.
+Any [OpenSpiel game](https://github.com/google-deepmind/open_spiel/blob/master/docs/games.md)
+can be added by registering a `GameConfig` in `env/game_config.py` and writing a
+`StateRenderer` in `env/state_renderers.py`.
 
 ---
 
-## Supported Games
+## Training Workflows
 
-| Game | Players | Type | Description |
-|---|---|---|---|
-| `tiny_hanabi` | 2 | Cooperative | A minimal Hanabi — great for fast iteration and debugging. |
-| `hanabi` | 2 | Cooperative | Full Hanabi — imperfect information, hints, and fireworks. |
-| `negotiation` | 2 | Competitive | Multi-item deal-making — propose splits, send utterances, accept/reject. |
+TeamGamesRL supports two primary training workflows:
 
-Any [OpenSpiel game](https://github.com/google-deepmind/open_spiel/blob/master/docs/games.md)
-can be added by registering a `GameConfig` and writing a `StateRenderer`.
+### 1. Two-Stage Curriculum: Behavioral Cloning (BC) Warm-Start → GRPO RL
+
+For complex games with sparse or delayed rewards like full Hanabi, cold-starting RL
+can spend many passes exploring invalid or uncoordinated actions. We provide a two-stage
+curriculum:
+
+1. **Step 1 — Behavioral Cloning (BC)**: Collect demonstrations from an expert
+   belief-search bot (`SafeBeliefLookaheadPlayer`), then train a LoRA adapter via SFT:
+   ```bash
+   # Generate BC demonstrations and fine-tune Gemma 2B or Gemma 3 12B
+   sbatch scripts/run_bc.sh --model=google/gemma-3-12b-it --epochs=3 --reasoning
+   ```
+2. **Step 2 — GRPO Fine-Tuning**: Initialize RL with the pre-trained BC adapter:
+   ```bash
+   sbatch run_hanabi_full.sh \
+     --initial_lora_checkpoint=checkpoints/bc_google_gemma-3-12b-it_<JOB_ID>/best_adapter \
+     --reasoning \
+     --bot_partner \
+     --bot_type=belief_lookahead
+   ```
+
+### 2. Direct Reinforcement Learning (GRPO or REINFORCE)
+
+Train directly from base model weights using online episode collection:
+
+```bash
+# Submit full Hanabi GRPO on a cluster
+sbatch run_hanabi_full.sh --profile=full --grpo_passes=50 --collect=20
+
+# Run locally or interactively on a GPU
+python3 trainer/gemma_rl_trainer.py \
+  --rl_algorithm=grpo \
+  --game=hanabi \
+  --model_name=google/gemma-3-12b-it \
+  --grpo_passes=25 \
+  --grpo_collect_episodes=20 \
+  --grpo_num_generations=8 \
+  --reward_simulation_mode=dense_chain \
+  --eval_batch_size=4
+```
+
+---
+
+## Key Features & Algorithms
+
+### Group Relative Policy Optimization (GRPO)
+- **Prompt Collection**: Collects multi-turn decision prompts from self-play or bot-partner episodes.
+- **Group Generation (K completions)**: For each pivot state, samples $K$ candidate actions.
+- **Action Diversity & Substitution**: Freely samples completions, parses actions, and replaces duplicate slots with strategic alternatives (`--strategic_action_mode=substitute`) so groups have diverse rewards to differentiate.
+- **Batch-Level Advantage Scaling**: Normalizes advantages across the entire training batch (`--grpo_scale_rewards=batch`) rather than within-group, avoiding amplified gradients on near-zero rollout noise.
+
+### Partner Bots & Self-Play
+- **Self-Play**: LLM vs. LLM training.
+- **Bot Partner Training** (`--bot_partner`): Alternates roles across episodes (P0=LLM / P1=Bot, and P0=Bot / P1=LLM).
+- **Available Bots** (`--bot_type`):
+  - `belief_lookahead` (`SafeBeliefLookaheadPlayer`): Maintains Bayesian belief distributions over hidden cards, performing 1-step lookahead without asymmetric partner assumptions. Ideal partner for inducing self-play coordination.
+  - `safe_play` (`SafePlayPlayer`): Rule-based baseline prioritizing 100% safe plays, urgent saves, and basic discards.
+
+### Deliberative Chain-of-Thought Reasoning (`--reasoning`)
+When enabled, the prompt instructs the model to generate a structured 5-point deliberation inside `<think>...</think>` tags before emitting the final action:
+1. Fireworks & token status summary.
+2. Own hand evaluation (confirmed playable cards vs. unknowns).
+3. Partner hand evaluation (urgent saves vs. play clues).
+4. Discard evaluation (safest discard given discard pile).
+5. Best action selection.
+
+The parser extracts the final action text outside the `<think>` block, while the full token sequence is trained with policy gradients.
+
+### Fast Batched Evaluation Inference (`--eval_batch_size`)
+During periodic evaluation (`--eval_every`), multiple games are stepped simultaneously in lockstep. At each turn, prompt generations for all active agents are batched into a single GPU forward pass, delivering a **~4x speedup** on eval rounds.
 
 ---
 
@@ -256,199 +216,77 @@ cd TeamGamesRL
 source setup.sh
 ```
 
-This creates a `.venv` virtualenv, installs all dependencies, and optionally
-logs you into Hugging Face (required for gated models like Gemma).
+This sets up a `.venv` virtualenv, installs required libraries (`open-spiel`, `hanabi-learning-environment`, `transformers`, `peft`, `bitsandbytes`, `trl`), and configures Hugging Face access.
 
-### 2. Quick test with the mock LLM (no GPU needed)
-
-```bash
-python train.py --game=tiny_hanabi --llm_type=mock --num_episodes=100
-```
-
-This validates the full pipeline using a random-action agent.
-
-### 3. Train with Gemma 2B + LoRA (requires GPU)
+### 2. Quick test with Mock LLM (CPU-friendly)
 
 ```bash
-# REINFORCE
-python trainer/gemma_rl_trainer.py \
-  --rl_algorithm=reinforce \
-  --game=tiny_hanabi \
-  --num_episodes=500 \
-  --lr=1e-4
-
-# GRPO (TRL)
-python trainer/gemma_rl_trainer.py \
-  --rl_algorithm=grpo \
-  --game=tiny_hanabi \
-  --grpo_passes=10 \
-  --grpo_collect_episodes=50
-
-# Full configuration
-python trainer/gemma_rl_trainer.py \
-  --game=hanabi \
-  --model_name=google/gemma-2-2b \
-  --lora_rank=32 \
-  --lora_alpha=64 \
-  --lr=5e-5 \
-  --temperature=0.8 \
-  --num_episodes=2000 \
-  --eval_every=100 \
-  --checkpoint_every=200 \
-  --use_wandb \
-  --output_dir=/tmp/teamgamesrl/hanabi_run1
+python3 train.py --game=tiny_hanabi --llm_type=mock --num_episodes=100
 ```
 
-### 4. Submit via SLURM
+### 3. Run Unit and Smoke Tests
 
 ```bash
-# GRPO (default: tiny_hanabi, 30 passes)
-sbatch scripts/run_grpo.sh tiny_hanabi google/gemma-2-2b 16 3e-5 30 50
-
-# REINFORCE (default: tiny_hanabi, 500 episodes)
-sbatch scripts/run_reinforce.sh tiny_hanabi google/gemma-2-2b 16 1e-4 500
+python3 -m unittest env/hanabi/smoke_test.py
+python3 -m unittest env/hanabi/determinize_test.py
 ```
-
-### 5. Resume from a checkpoint
-
-LoRA checkpoints are saved to `--output_dir` every `--checkpoint_every`
-episodes. To resume, load the adapter from the checkpoint directory
-(HuggingFace PEFT standard format).
 
 ---
 
-## Interpreting Results
+## Configuration & Key Flags
 
-Training produces several output files in `--output_dir`:
-
-### Training Metrics (`results/training_metrics.csv`)
-
-Logged every `--log_every` episodes:
-
-| Column | Description |
-|---|---|
-| `episode` | Episode number |
-| `reward` | Mean reward across all players for this episode |
-| `loss` | RL loss for this episode |
-| `avg_reward` | Rolling average reward over the last `log_every` episodes |
-| `avg_loss` | Rolling average loss |
-| `elapsed_sec` | Wall-clock time since training started |
-
-**What to look for:**
-- **`avg_reward` trending upward** indicates the agents are learning to play
-  better. For cooperative games like Hanabi, all players share the reward, so
-  this reflects team performance.
-- **`avg_loss` decreasing then stabilizing** is normal. Very large or erratic
-  loss values may indicate the learning rate is too high.
-- **Reward plateaus** may indicate the agents have converged, or that
-  exploration (temperature) needs adjustment.
-
-### Evaluation Metrics (`results/eval_metrics.csv`)
-
-Logged every `--eval_every` episodes using greedy decoding (near-zero
-temperature):
-
-| Column | Description |
-|---|---|
-| `eval/mean_reward_pN` | Mean reward for player N across eval episodes |
-| `eval/win_rate_pN` | Win rate for player N |
-
-**What to look for:**
-- **Eval reward > training reward** is expected since eval uses greedy decoding
-  (less exploration noise).
-- **Balanced `win_rate` across players** in competitive games means neither
-  player dominates. Imbalance may indicate one player's policy is
-  over-optimized.
-- **Eval reward diverging from training reward** can indicate overfitting to
-  the training exploration pattern.
-
-### Episode Logs (`episode_log.jsonl`)
-
-Detailed per-step transcripts logged every `--log_episodes_every` episodes.
-Each line is a JSON object containing the full game state, LLM prompts,
-responses, parsed actions, and rewards for every player. Use the viewer:
-
-```bash
-python view_episodes.py --log_file=/tmp/teamgamesrl/episode_log.jsonl
-python view_episodes.py --log_file=/tmp/teamgamesrl/episode_log.jsonl --episode=42
-```
-
-**What to look for:**
-- **Action quality** — Are the agents choosing sensible actions given the game
-  state? Early training should show mostly random-seeming choices; later
-  episodes should show strategic behavior.
-- **Prompt understanding** — Is the LLM parsing the state correctly and
-  responding with valid action text?
-- **Coordination** (cooperative games) — Are players' actions becoming more
-  complementary over time?
-
-### Final Summary (`results/summary.json`)
-
-A JSON snapshot written at the end of training with aggregate statistics:
-
-```json
-{
-  "game": "tiny_hanabi",
-  "num_episodes": 500,
-  "total_time_sec": 1234.5,
-  "final_mean_reward": 7.82,
-  "last_10_mean_reward": 8.45,
-  "player_win_rates": {"player_0": 45.2, "player_1": 42.8},
-  "team_win_rate": 72.4
-}
-```
-
-### Weights & Biases (optional)
-
-Pass `--use_wandb` to stream all training and evaluation metrics to W&B in
-real time. Useful for comparing runs across hyperparameters, games, or models.
-
----
-
-## Key Flags
+### General Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--rl_algorithm` | `grpo` | `reinforce` or `grpo` |
-| `--game` | `tiny_hanabi` | OpenSpiel game to train on |
-| `--model_name` | `google/gemma-2-2b` | HuggingFace model ID |
-| `--num_episodes` | `500` | Total training episodes |
-| `--lr` | `1e-5` | Learning rate |
-| `--lora_rank` | `16` | LoRA decomposition rank |
-| `--lora_alpha` | `32` | LoRA scaling factor |
-| `--use_4bit` | `True` | 4-bit NF4 quantization |
-| `--temperature` | `0.8` | Sampling temperature |
-| `--eval_every` | `50` | Evaluation frequency |
-| `--checkpoint_every` | `100` | Checkpoint frequency |
-| `--kl_coeff` | `0.05` | KL penalty against reference model |
-| `--gradient_accumulation_steps` | `8` | Episodes to accumulate before update |
-| `--use_wandb` | `False` | Enable W&B experiment tracking |
+| `--game` | `tiny_hanabi` | Game identifier (`tiny_hanabi`, `hanabi`, `negotiation`). |
+| `--model_name` | `google/gemma-2-2b` | Hugging Face model identifier (e.g. `google/gemma-3-12b-it`). |
+| `--initial_lora_checkpoint` | `None` | Path to pre-trained LoRA adapter (e.g. from BC warm-start). |
+| `--lora_rank` | `16` | LoRA rank (typical: 16 or 32). |
+| `--lora_alpha` | `32` | LoRA alpha scaling factor (usually $2 \times \text{rank}$). |
+| `--use_4bit` | `True` | Enable 4-bit NF4 quantization for base model. |
+| `--lr` | `3e-5` | Learning rate for LoRA parameters. |
+| `--temperature` | `0.8` | Generation temperature. |
+| `--temperature_anneal_end` | `None` | Anneal temperature toward this value over training passes. |
+| `--eval_every` | `50` | Evaluation frequency (in passes or episodes). |
+| `--num_eval_episodes` | `10` | Number of evaluation episodes per eval round. |
+| `--eval_batch_size` | `4` | Parallel game batch size for greedy evaluation (~4x speedup). |
+| `--use_wandb` | `False` | Enable Weights & Biases logging. |
+| `--output_dir` | `/tmp/teamgamesrl` | Output directory for checkpoints, metrics, and logs. |
 
-**GRPO-specific:**
+### GRPO & Reward Simulation Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--grpo_passes` | `10` | Number of collect → train rounds |
-| `--grpo_collect_episodes` | `50` | Episodes per prompt collection round |
-| `--grpo_num_generations` | `4` | Completions per prompt (group size K) |
-| `--grpo_max_completion_length` | `64` | Max tokens per GRPO completion |
+| `--grpo_passes` | `25` | Number of collect → train rounds. |
+| `--grpo_collect_episodes` | `50` | Episodes collected per training pass. |
+| `--grpo_num_generations` | `8` | Candidate completions sampled per prompt ($K$). |
+| `--grpo_max_completion_length`| `16` | Max tokens per generation (increase to 128+ if `--reasoning` is set). |
+| `--reward_simulation_mode` | `rollout` | `dense_chain`, `rollout`, `random`, or `dense`. |
+| `--reward_blend_weight` | `0.0` | Weight $w \in [0, 1]$ blending game outcome with step reward. |
+| `--reward_survival_exponent` | `0.0` | Convex penalty on lost lives: $(\text{lives} / \text{max\_lives})^E$. |
+| `--reward_turn_discount` | `1.0` | Multiplicative discount $\gamma^T \times \text{score}$ penalizing stalling. |
+| `--reward_policy_turns` | `1` | Turns played by policy before heuristic rollout completes game. |
+| `--grpo_scale_rewards` | `batch` | Advantage normalization: `batch`, `group`, or `none`. |
+| `--bot_partner` | `False` | Partner with a bot during collection and evaluation. |
+| `--bot_type` | `belief_lookahead`| Bot partner: `belief_lookahead` or `safe_play`. |
+| `--reasoning` | `False` | Enable 5-stage deliberative Chain-of-Thought `<think>` prompt. |
+| `--strategic_action_selection`| `False`| Inject diverse strategic actions into candidate groups. |
+| `--strategic_action_mode` | `substitute` | `substitute` duplicate slots or force via `logits`. |
 
 ---
 
-## Dependence on OpenSpiel
+## Output Metrics & Artifacts
 
-TeamGamesRL is built on [OpenSpiel](https://github.com/google-deepmind/open_spiel)
-(≥ 1.5), Google DeepMind's framework for research in games. We depend on it for:
+Training logs several artifacts to `--output_dir`:
 
-- **Game definitions** — cooperative and competitive multi-player games with
-  well-defined state spaces and action encodings.
-- **RL environment wrapper** — `rl_environment.Environment` provides the
-  standard `reset()` / `step()` loop.
-- **Game introspection** — `pyspiel.Game` and `pyspiel.State` for action
-  descriptions and observation strings.
-
-All OpenSpiel imports are from the public `open_spiel` and `pyspiel` packages
-available via `pip install open-spiel`.
+- **`results/training_metrics.csv`**: Logs episode, rewards, loss, rolling averages, and elapsed time.
+- **`results/eval_metrics.csv`**: Logs greedy evaluation metrics across pairings (LLM+LLM, LLM+Bot, Bot+LLM), including mean score, bomb rate, and information token efficiency.
+- **`episode_log.jsonl`**: Step-by-step game transcripts including raw prompt strings, model completions, parsed action IDs, and rewards. Inspect using:
+  ```bash
+  python3 view_episodes.py --log_file=<OUTPUT_DIR>/episode_log.jsonl --episode=10
+  ```
+- **Checkpoints**: Saved to `<OUTPUT_DIR>/checkpoint_pass_*` containing standard Hugging Face PEFT LoRA adapter weights.
 
 ---
 
@@ -456,9 +294,8 @@ available via `pip install open-spiel`.
 
 - **Python 3.11+**
 - **CUDA 12.2** (for GPU training; CPU fallback is supported)
-- **~6 GB VRAM** with 4-bit quantization + LoRA rank 16
-- **Hugging Face account** with access to gated models (e.g.
-  [google/gemma-2-2b](https://huggingface.co/google/gemma-2-2b))
+- **~6 GB VRAM** with 4-bit quantization + LoRA rank 16 (Gemma 2B) or **~24-48 GB VRAM** (Gemma 3 12B)
+- **Hugging Face account** with access to gated models (e.g. `google/gemma-3-12b-it`)
 
 ---
 
