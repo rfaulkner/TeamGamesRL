@@ -2383,7 +2383,20 @@ def run_sampled(runner) -> None:
 
     # ── Step 5: Evaluate ──
     runner._backend.model.eval()
-    eval_metrics = runner._evaluate_fn(runner._config.num_eval_episodes)
+    horizon = (
+        runner._config.get_curriculum_horizon(pass_idx)
+        if runner._config.curriculum_window_size > 0
+        else None
+    )
+    eval_kwargs = {}
+    if horizon is not None:
+      eval_kwargs['eval_llm_max_horizon'] = horizon
+    try:
+      eval_metrics = runner._evaluate_fn(
+          runner._config.num_eval_episodes, **eval_kwargs
+      )
+    except TypeError:
+      eval_metrics = runner._evaluate_fn(runner._config.num_eval_episodes)
     eval_metrics['eval/collection_mean_reward'] = collect_stats['mean_reward']
     logging.info('--- Evaluation after GRPO pass %d ---', pass_idx)
     for k, v in sorted(eval_metrics.items()):

@@ -246,12 +246,15 @@ class RLTrainer:
       self,
       is_evaluation: bool = False,
       bot_player: int | None = None,
+      eval_llm_max_horizon: int | None = None,
   ) -> list[PlayerTrajectory]:
     """Runs a single episode and returns the trajectory.
 
     Args:
       is_evaluation: If True, uses greedy action selection (temp=0.01).
       bot_player: If set, this player is controlled by the partner bot.
+      eval_llm_max_horizon: If set and in evaluation, turns at or beyond this
+        turn index are played by the heuristic bot instead of the LLM.
 
     Returns:
       List of PlayerTrajectory objects, one per player.
@@ -285,7 +288,14 @@ class RLTrainer:
       legal_actions = [a for a, _ in legal_actions_with_desc]
       action_descriptions = [d for _, d in legal_actions_with_desc]
 
-      if bot_player is not None and current_player == bot_player:
+      total_turns_so_far = sum(len(t.steps) for t in trajectories)
+      use_bot = (bot_player is not None and current_player == bot_player) or (
+          is_evaluation
+          and eval_llm_max_horizon is not None
+          and total_turns_so_far >= eval_llm_max_horizon
+      )
+
+      if use_bot:
         if self._bot is None:
           self._bot = self._create_bot()
         if self._bot is not None:
@@ -342,12 +352,15 @@ class RLTrainer:
       self,
       batch_plan: list[tuple[int | None, str]],
       is_evaluation: bool = True,
+      eval_llm_max_horizon: int | None = None,
   ) -> list[tuple[list[PlayerTrajectory], object, str]]:
     """Runs a batch of episodes in lockstep to batch LLM generations.
 
     Args:
       batch_plan: List of (bot_player, mode_label) tuples for this batch.
       is_evaluation: Whether this is evaluation mode.
+      eval_llm_max_horizon: If set and in evaluation, turns at or beyond this
+        turn index are played by the heuristic bot instead of the LLM.
 
     Returns:
       List of (trajectories, final_state, mode_label) tuples.
@@ -393,7 +406,13 @@ class RLTrainer:
 
         while not ts.last():
           cur_player = ts.current_player()
-          if bot_player is not None and cur_player == bot_player:
+          total_turns_so_far = sum(len(t.steps) for t in all_trajectories[idx])
+          use_bot = (bot_player is not None and cur_player == bot_player) or (
+              is_evaluation
+              and eval_llm_max_horizon is not None
+              and total_turns_so_far >= eval_llm_max_horizon
+          )
+          if use_bot:
             state = env._state  # pylint: disable=protected-access
             legal_desc = batch_renderers[idx][cur_player].render_legal_actions(
                 state, cur_player, env.game
@@ -598,7 +617,11 @@ class RLTrainer:
     except IOError as e:
       logging.warning('Failed to write eval episode log: %s', e)
 
-  def evaluate(self, num_episodes: int = 10) -> dict[str, float]:
+  def evaluate(
+      self,
+      num_episodes: int = 10,
+      eval_llm_max_horizon: int | None = None,
+  ) -> dict[str, float]:
     """Evaluates the current policy over multiple episodes.
 
     If bot_partner is True and num_players == 2, splits episodes evenly
@@ -608,6 +631,8 @@ class RLTrainer:
 
     Args:
       num_episodes: Number of evaluation episodes.
+      eval_llm_max_horizon: If set, LLM only generates moves up to this turn,
+        and the heuristic bot plays the remainder of the game to terminal state.
 
     Returns:
       Dictionary of evaluation metrics.
@@ -639,7 +664,11 @@ class RLTrainer:
       ]
       ep_offset = 0
       for chunk in plan_chunks:
-        batch_results = self.run_episodes_batch(chunk, is_evaluation=True)
+        batch_results = self.run_episodes_batch(
+            chunk,
+            is_evaluation=True,
+            eval_llm_max_horizon=eval_llm_max_horizon,
+        )
         for sub_i, (trajectories, state, mode_label) in enumerate(batch_results):
           self._process_eval_episode(
               ep_offset + sub_i,
@@ -656,7 +685,11 @@ class RLTrainer:
         ep_offset += len(chunk)
     else:
       for ep_i, (bot_player, mode_label) in enumerate(eval_plan):
-        trajectories = self.run_episode(is_evaluation=True, bot_player=bot_player)
+        trajectories = self.run_episode(
+            is_evaluation=True,
+            bot_player=bot_player,
+            eval_llm_max_horizon=eval_llm_max_horizon,
+        )
         state = self.env._state  # pylint: disable=protected-access
         self._process_eval_episode(
             ep_i,
