@@ -35,20 +35,16 @@ import abc
 import re
 from typing import List, Optional, Tuple
 
+from env.hanabi.hanabi_env import CARD_KNOWLEDGE_RE as _CARD_KNOWLEDGE_RE
+from env.hanabi.hanabi_env import COLOR_CHARS as _COLOR_LETTERS
+from env.hanabi.hanabi_env import FIREWORKS_RE as _FIREWORKS_RE
+from env.hanabi.hanabi_env import INFO_TOKENS_RE as _INFO_TOKENS_RE
+from env.hanabi.hanabi_env import LIFE_TOKENS_RE as _LIFE_TOKENS_RE
+from env.hanabi.hanabi_env import parse_fireworks
 import numpy as np
 
 # Hanabi constants.
 _MAX_INFO_TOKENS = 8
-_COLOR_LETTERS = ('R', 'Y', 'G', 'B', 'W')
-
-# Precompiled patterns for observation parsing.
-_FIREWORKS_RE = re.compile(r'Fireworks:\s*((?:[RYGBW]\d\s*)+)')
-_LIFE_TOKENS_RE = re.compile(r'Life tokens:\s*(\d+)')
-_INFO_TOKENS_RE = re.compile(r'Info tokens:\s*(\d+)')
-# Matches a single card-knowledge entry, e.g. "XX || RG|12" or "XX || RYGWB12345".
-_CARD_KNOWLEDGE_RE = re.compile(
-    r'XX\s*\|\|\s*(?:[A-Z0-9]+[|])?([RYGBW]+)[|]?([1-5]+)'
-)
 
 
 def create_heuristic_player(
@@ -275,23 +271,7 @@ class SafePlayPlayer(HeuristicPlayer):
 
   @staticmethod
   def _parse_fireworks(obs_string: str) -> dict[str, int]:
-    """Extracts the current firework heights from an observation string.
-
-    Args:
-      obs_string: The raw observation string from OpenSpiel.
-
-    Returns:
-      A dict mapping colour letter (e.g. ``'R'``) to the highest
-      rank played on that firework (0 if empty).
-    """
-    fireworks: dict[str, int] = {c: 0 for c in _COLOR_LETTERS}
-    match = _FIREWORKS_RE.search(obs_string)
-    if match:
-      for token in match.group(1).strip().split():
-        color = token[0]
-        rank = int(token[1:])
-        fireworks[color] = rank
-    return fireworks
+    return parse_fireworks(obs_string)
 
   @staticmethod
   def _parse_info_tokens(obs_string: str) -> int:

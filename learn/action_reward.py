@@ -52,25 +52,19 @@ import re
 from typing import Optional
 
 from absl import logging
+from env.hanabi.hanabi_env import CARD_KNOWLEDGE_RE as _CARD_KNOWLEDGE_RE
+from env.hanabi.hanabi_env import COLOR_CHARS as _COLOR_CHARS
+from env.hanabi.hanabi_env import deserialize_game_and_state
+from env.hanabi.hanabi_env import DISCARD_RE as _DISCARD_RE
+from env.hanabi.hanabi_env import FIREWORKS_RE as _FIREWORKS_RE
+from env.hanabi.hanabi_env import parse_fireworks
+from env.hanabi.hanabi_env import PLAY_RE as _PLAY_RE
+from env.hanabi.hanabi_env import REVEAL_COLOR_RE as _REVEAL_COLOR_RE
+from env.hanabi.hanabi_env import REVEAL_RANK_RE as _REVEAL_RANK_RE
+from env.hanabi.hanabi_env import VISIBLE_CARD_RE as _VISIBLE_CARD_RE
 import numpy as np
 
-
 # -- Constants ----------------------------------------------------------------
-
-_COLOR_CHARS = ('R', 'Y', 'G', 'W', 'B')
-_PLAY_RE = re.compile(r'\(Play (\d+)\)')
-_DISCARD_RE = re.compile(r'\(Discard (\d+)\)')
-_REVEAL_COLOR_RE = re.compile(
-    r'\(Reveal player \+(\d+) color ([RYGWB])\)'
-)
-_REVEAL_RANK_RE = re.compile(
-    r'\(Reveal player \+(\d+) rank (\d+)\)'
-)
-_FIREWORKS_RE = re.compile(r'Fireworks:\s*((?:[RYGWB]\d\s*)+)')
-_CARD_KNOWLEDGE_RE = re.compile(
-    r'XX\s*\|\|\s*(?:[A-Z0-9]+[|])?([RYGWB]+)[|]?([1-5]+)'
-)
-_VISIBLE_CARD_RE = re.compile(r'([RYGWB])(\d)\s*\|\|')
 
 # Maximum ranks per colour in standard Hanabi.
 _MAX_RANK = 5
@@ -357,14 +351,7 @@ def _evaluate_discard(
 
 def _parse_fireworks_from_state(state, player_id: int) -> dict[str, int]:
   """Extract firework heights from the state's observation string."""
-  obs = state.observation_string(player_id)
-  fireworks: dict[str, int] = {c: 0 for c in _COLOR_CHARS}
-  match = _FIREWORKS_RE.search(obs)
-  if match:
-    for token in match.group(1).strip().split():
-      if len(token) >= 2:
-        fireworks[token[0]] = int(token[1:])
-  return fireworks
+  return parse_fireworks(state.observation_string(player_id))
 
 
 def _identify_discarded_card(
@@ -630,12 +617,7 @@ def evaluate_dense_chain(
   """
   # Restore the game state.
   if serialized_state is not None:
-    try:
-      from env.hanabi.hanabi_env import deserialize_game_and_state  # pylint: disable=g-import-not-at-top
-      _, state = deserialize_game_and_state(serialized_state)
-    except (ImportError, Exception):
-      from learn.grpo_sampled import _deserialize_game_and_state  # pylint: disable=g-import-not-at-top
-      _, state = _deserialize_game_and_state(serialized_state)
+    _, state = deserialize_game_and_state(serialized_state)
     runner._env.set_state(state)
   else:
     runner._env.reset()

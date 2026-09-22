@@ -47,12 +47,19 @@ Action Encoding Summary (Negotiation):
       encoded similarly with base num_symbols.
 """
 
+from __future__ import annotations
+
 import abc
 import difflib
 import re
 from typing import Optional
 
-import pyspiel
+try:
+  import pyspiel
+  _SpielError = getattr(pyspiel, 'SpielError', RuntimeError)
+except ImportError:
+  pyspiel = None
+  _SpielError = RuntimeError
 
 
 # Maximum quantity per item type in the negotiation game.
@@ -1498,7 +1505,7 @@ class GenericRenderer(BaseStateRenderer):
     try:
       obs_str = state.observation_string(player_id)
       lines.append(f'Your observation:\n{obs_str}')
-    except (RuntimeError, pyspiel.SpielError):
+    except (RuntimeError, _SpielError):
       lines.append(f'Game state:\n{state}')
 
     if state.current_player() == player_id:

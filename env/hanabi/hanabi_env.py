@@ -43,12 +43,48 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
-from hanabi_learning_environment import pyhanabi
+try:
+  from hanabi_learning_environment import pyhanabi
+except ImportError:
+  pyhanabi = None
 
-# ── Color helpers ──────────────────────────────────────────────────────────
+try:
+  import pyspiel
+except ImportError:
+  pyspiel = None
 
-_COLOR_CHARS = ['R', 'Y', 'G', 'W', 'B']  # matches OpenSpiel ordering
+# ── Hanabi constants and parsing patterns ───────────────────────────────────
+
+COLOR_CHARS = ('R', 'Y', 'G', 'W', 'B')
+_COLOR_CHARS = list(COLOR_CHARS)  # matches OpenSpiel ordering
+
+FIREWORKS_RE = re.compile(r'Fireworks:\s*((?:[RYGWB]\d\s*)+)')
+LIFE_TOKENS_RE = re.compile(r'Life tokens:\s*(\d+)')
+INFO_TOKENS_RE = re.compile(r'Info tokens:\s*(\d+)')
+CARD_KNOWLEDGE_RE = re.compile(
+    r'XX\s*\|\|\s*(?:[A-Z0-9]+[|])?([RYGWB]+)[|]?([1-5]+)'
+)
+VISIBLE_CARD_RE = re.compile(r'([RYGWB])(\d)\s*\|\|')
+PLAY_RE = re.compile(r'\(Play (\d+)\)')
+DISCARD_RE = re.compile(r'\(Discard (\d+)\)')
+REVEAL_COLOR_RE = re.compile(r'\(Reveal player \+(\d+) color ([RYGWB])\)')
+REVEAL_RANK_RE = re.compile(r'\(Reveal player \+(\d+) rank (\d+)\)')
+
+
+def parse_fireworks(obs_string: str) -> dict[str, int]:
+  """Extracts the current firework heights from an observation string."""
+  fireworks = {c: 0 for c in COLOR_CHARS}
+  match = FIREWORKS_RE.search(obs_string)
+  if match:
+    for token in match.group(1).strip().split():
+      if len(token) >= 2 and token[0] in fireworks:
+        try:
+          fireworks[token[0]] = int(token[1:])
+        except ValueError:
+          pass
+  return fireworks
 
 
 def _color_char(color_idx: int) -> str:
@@ -432,42 +468,46 @@ def clear_state_cache() -> None:
   HanabiState._serialize_cache.clear()
 
 
-def serialize_game_and_state(game: HanabiGame, state: HanabiState) -> str:
-  """Serialize a game+state pair for later restoration.
-
-  Stores a clone of the state in an in-memory cache and returns a
-  JSON string containing the cache key.  This avoids the stochastic
-  replay problem in Hanabi where random card deals between player
-  actions make action-replay deserialization non-deterministic.
-  """
-  import uuid  # pylint: disable=g-import-not-at-top
-  state_id = str(uuid.uuid4())
-  _state_cache[state_id] = (game, state.clone())
-  return json.dumps({
-      'adapter': 'hanabi_env',
-      'state_id': state_id,
-      'params': game._params,
-  })
+def serialize_game_and_state(game, state) -> str:
+  """Serialize game+state, dispatching to Hanabi adapter cache or pyspiel."""
+  if isinstance(game, HanabiGame):
+    import uuid  # pylint: disable=g-import-not-at-top
+    state_id = str(uuid.uuid4())
+    _state_cache[state_id] = (game, state.clone())
+    return json.dumps({
+        'adapter': 'hanabi_env',
+        'state_id': state_id,
+        'params': game._params,
+    })
+  if pyspiel is not None:
+    return pyspiel.serialize_game_and_state(game, state)
+  raise ValueError(f'Cannot serialize game of type {type(game)}')
 
 
-def deserialize_game_and_state(data_str: str) -> tuple[HanabiGame, HanabiState]:
-  """Restore a game+state pair from the in-memory cache.
+def deserialize_game_and_state(data_str: str):
+  """Restore game+state, dispatching to Hanabi adapter cache or pyspiel."""
+  try:
+    data = json.loads(data_str)
+  except (ValueError, TypeError):
+    if pyspiel is not None:
+      return pyspiel.deserialize_game_and_state(data_str)
+    raise
 
-  Returns a fresh clone each time so the caller can mutate freely.
-  """
-  data = json.loads(data_str)
-  state_id = data.get('state_id')
-  if state_id and state_id in _state_cache:
-    game, cached_state = _state_cache[state_id]
-    return game, cached_state.clone()
-  # Fallback: create a fresh initial state (loses mid-game position,
-  # but avoids a crash).
-  logging.warning(
-      'Hanabi state cache miss for id=%s — returning fresh initial state.',
-      state_id,
-  )
-  game = HanabiGame(**data['params'])
-  return game, game.new_initial_state()
+  if isinstance(data, dict) and data.get('adapter') == 'hanabi_env':
+    state_id = data.get('state_id')
+    if state_id and state_id in _state_cache:
+      game, cached_state = _state_cache[state_id]
+      return game, cached_state.clone()
+    logging.warning(
+        'Hanabi state cache miss for id=%s — returning fresh initial state.',
+        state_id,
+    )
+    game = HanabiGame(**data['params'])
+    return game, game.new_initial_state()
+
+  if pyspiel is not None:
+    return pyspiel.deserialize_game_and_state(data_str)
+  raise ValueError(f'Unknown serialized state format: {data_str[:50]}...')
 
 
 # ═══════════════════════════════════════════════════════════════════════════

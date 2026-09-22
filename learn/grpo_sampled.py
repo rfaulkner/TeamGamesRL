@@ -41,30 +41,12 @@ except ImportError:
   pyspiel = None  # HLE adapter used for Hanabi instead
 
 
-def _serialize_game_and_state(game, state):
-  """Serialize game+state, dispatching to adapter or pyspiel."""
-  from env.hanabi.hanabi_env import HanabiGame  # pylint: disable=g-import-not-at-top
-  from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
+from env.hanabi.hanabi_env import deserialize_game_and_state
+from env.hanabi.hanabi_env import serialize_game_and_state
 
-  if isinstance(game, HanabiGame):
-    return hanabi_env.serialize_game_and_state(game, state)
-  return pyspiel.serialize_game_and_state(game, state)
-
-
-def _deserialize_game_and_state(data_str):
-  """Deserialize game+state, dispatching to adapter or pyspiel."""
-  import json as _json  # pylint: disable=g-import-not-at-top
-
-  try:
-    data = _json.loads(data_str)
-  except (ValueError, TypeError):
-    # Not JSON — fall through to pyspiel.
-    return pyspiel.deserialize_game_and_state(data_str)
-  if isinstance(data, dict) and data.get('adapter') == 'hanabi_env':
-    from env.hanabi import hanabi_env  # pylint: disable=g-import-not-at-top
-
-    return hanabi_env.deserialize_game_and_state(data_str)
-  return pyspiel.deserialize_game_and_state(data_str)
+# Aliases for internal and external compatibility.
+_serialize_game_and_state = serialize_game_and_state
+_deserialize_game_and_state = deserialize_game_and_state
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -999,11 +981,7 @@ class StrategicActionLogitsProcessor:
       if not legal_actions_desc:
         continue
 
-      try:
-        from env.hanabi.hanabi_env import deserialize_game_and_state  # pylint: disable=g-import-not-at-top
-        _, state = deserialize_game_and_state(ser_state)
-      except (ImportError, Exception):
-        _, state = _deserialize_game_and_state(ser_state)
+      _, state = deserialize_game_and_state(ser_state)
 
       try:
         from learn.strategic_actions import analyze_strategic_actions  # pylint: disable=g-import-not-at-top
@@ -1556,6 +1534,166 @@ def _cleanup_ref_adapter(model, active_adapter: str | None = None) -> None:
     except Exception as e:
       logging.warning("Failed to restore active adapter '%s': %s", active_adapter, e)
 
+def _compute_action_reward(
+    runner,
+    prompt_text: str,
+    action_id: int,
+    parsed: bool,
+    p_id: int,
+    ser_state: str | None,
+    action_history: list[int],
+    pass_idx: int,
+) -> float:
+  """Compute the scalar reward for an action given the runner's simulation config."""
+  if not parsed:
+    return -0.3
+
+  sim_mode = runner._config.reward_simulation_mode
+
+  if sim_mode == 'dense':
+    from learn.action_reward import evaluate_action_quality  # pylint: disable=g-import-not-at-top
+    if ser_state is not None:
+      _, eval_state = deserialize_game_and_state(ser_state)
+    else:
+      runner._env.reset()
+      eval_state = runner._env._state
+      for a in action_history:
+        if eval_state.is_terminal():
+          break
+        eval_state.apply_action(a)
+    return float(evaluate_action_quality(eval_state, action_id, p_id))
+
+  if sim_mode == 'dense_chain':
+    from learn.action_reward import evaluate_dense_chain  # pylint: disable=g-import-not-at-top
+    blend_w = runner._config.reward_blend_weight
+
+    if blend_w >= 1.0:
+      primary_reward = 0.0
+    else:
+      horizon = runner._config.truncated_rollout_horizon or 4
+      discount = getattr(runner._config, 'dense_chain_discount', 0.9)
+      primary_reward = evaluate_dense_chain(
+          runner,
+          action_history,
+          action_id,
+          p_id,
+          serialized_state=ser_state,
+          horizon=horizon,
+          discount=discount,
+          llm_partner_response=runner._config.llm_partner_response,
+      )
+
+    if blend_w > 0:
+      if ser_state is not None:
+        _, blend_state = deserialize_game_and_state(ser_state)
+        runner._env.set_state(blend_state)
+      else:
+        runner._env.reset()
+        blend_state = runner._env._state
+        for a in action_history:
+          if blend_state.is_terminal():
+            break
+          blend_state.apply_action(a)
+        blend_state = runner._env._state
+
+      if not blend_state.is_terminal():
+        blend_state.apply_action(action_id)
+
+      policy_turns = runner._config.reward_policy_turns
+      if runner._config.llm_partner_response and policy_turns < 2:
+        policy_turns = 2
+      if not blend_state.is_terminal():
+        _rollout_policy_turns(runner, blend_state, policy_turns - 1)
+
+      survival_exp = runner._config.reward_survival_exponent
+      lives_after = None
+      if survival_exp > 0 and hasattr(blend_state, 'life_tokens'):
+        lives_after = blend_state.life_tokens()
+
+      group_seed = (
+          _group_rollout_seed(prompt_text, pass_idx)
+          if runner._config.reward_rollout_common_seed
+          else None
+      )
+      game_score_norm = _rollout_value(
+          runner,
+          blend_state,
+          p_id,
+          num_samples=runner._config.reward_rollout_samples,
+          seed=group_seed,
+          turn_discount=runner._config.reward_turn_discount,
+      )
+
+      if lives_after is not None:
+        max_lives = 3
+        game_obj = getattr(runner._env, 'game', None)
+        params = getattr(game_obj, '_params', None)
+        if isinstance(params, dict):
+          max_lives = params.get('max_life_tokens', 3)
+        life_fraction = max(lives_after, 0) / max(max_lives, 1)
+        if game_score_norm >= 0:
+          game_score_norm *= life_fraction ** survival_exp
+        else:
+          game_score_norm -= (1.0 - life_fraction) * 0.3
+
+      return float((1 - blend_w) * primary_reward + blend_w * game_score_norm)
+
+    return float(primary_reward)
+
+  if (
+      runner._config.reward_num_simulations > 1
+      and runner._config.reward_variance_penalty > 0
+  ):
+    sim_rewards = [
+        simulate_from_state(runner, action_history, action_id, p_id, ser_state)
+        for _ in range(runner._config.reward_num_simulations)
+    ]
+    mean_r = float(np.mean(sim_rewards))
+    std_r = float(np.std(sim_rewards))
+    return float(mean_r - runner._config.reward_variance_penalty * std_r)
+
+  return float(simulate_from_state(runner, action_history, action_id, p_id, ser_state))
+
+
+def _log_group_records(group_records: list[dict], group_counter: list[int]) -> None:
+  """Log per-group reward distributions and advantage statistics."""
+  groups = {}
+  for rec in group_records:
+    groups.setdefault(rec['prompt'], []).append(rec)
+  for recs in groups.values():
+    group_counter[0] += 1
+    vals = np.asarray([r['reward'] for r in recs], dtype=np.float64)
+    mean_r = float(vals.mean())
+    std_r = float(vals.std())
+    gid = group_counter[0]
+    logging.info(
+        '[GRPO group #%d] P%d | n=%d distinct_actions=%d | '
+        'reward mean=%+.4f std=%.4f min=%+.4f max=%+.4f%s',
+        gid,
+        recs[0]['player'],
+        len(recs),
+        len({r['action'] for r in recs}),
+        mean_r,
+        std_r,
+        float(vals.min()),
+        float(vals.max()),
+        '  *** DEGENERATE: std=0, zero gradient ***' if std_r < 1e-6 else '',
+    )
+    for slot, rec in enumerate(recs):
+      adv = rec['reward'] - mean_r
+      logging.info(
+          '[GRPO group #%d]   [%d] a=%-3s %-15s r=%+.4f adv=%+.4f '
+          'z=%+.4f | %r',
+          gid,
+          slot,
+          rec['action'],
+          rec['status'],
+          rec['reward'],
+          adv,
+          adv / (std_r + 1e-4),
+          rec['text'],
+      )
+
 
 def _train_grpo_on_prompts(
     runner,
@@ -1715,163 +1853,16 @@ def _train_grpo_on_prompts(
               k,
           )
 
-      sim_mode = runner._config.reward_simulation_mode
-
-      if sim_mode == 'dense':
-        # Dense per-action reward: evaluate the immediate quality of
-        # the chosen action without any forward simulation.
-        from learn.action_reward import evaluate_action_quality  # pylint: disable=g-import-not-at-top
-
-        if not parsed:
-          reward = -0.3  # Parse failure penalty.
-        else:
-          # Restore the state to evaluate the action.
-          if ser_state is not None:
-            _, eval_state = _deserialize_game_and_state(ser_state)
-          else:
-            runner._env.reset()
-            eval_state = runner._env._state
-            for a in action_history:
-              if eval_state.is_terminal():
-                break
-              eval_state.apply_action(a)
-          reward = evaluate_action_quality(eval_state, action_id, p_id)
-
-      elif sim_mode == 'dense_chain':
-        # Dense rewards over a short heuristic continuation,
-        # optionally blended with a heuristic rollout game score
-        # and/or using an LLM partner response.
-        from learn.action_reward import evaluate_dense_chain  # pylint: disable=g-import-not-at-top
-
-        if not parsed:
-          reward = -0.3  # Parse failure penalty.
-        else:
-          blend_w = runner._config.reward_blend_weight
-
-          # ── Dense per-action chain term ──
-          # At blend_w >= 1.0 the dense term is multiplied by zero, so
-          # skip it entirely: evaluate_dense_chain runs a horizon-length
-          # heuristic continuation and is the expensive half of this
-          # branch.  This makes w=1.0 a genuine pure-rollout objective.
-          if blend_w >= 1.0:
-            primary_reward = 0.0
-          else:
-            horizon = runner._config.truncated_rollout_horizon or 4
-            discount = getattr(runner._config, 'dense_chain_discount', 0.9)
-            primary_reward = evaluate_dense_chain(
-                runner,
-                action_history,
-                action_id,
-                p_id,
-                serialized_state=ser_state,
-                horizon=horizon,
-                discount=discount,
-                llm_partner_response=(runner._config.llm_partner_response),
-            )
-
-          # ── Blend with heuristic rollout game score ──
-          if blend_w > 0:
-            # Restore state, apply action, optionally get LLM partner
-            # response, then heuristic rollout to terminal.
-            if ser_state is not None:
-              _, blend_state = _deserialize_game_and_state(ser_state)
-              runner._env.set_state(blend_state)
-            else:
-              runner._env.reset()
-              blend_state = runner._env._state
-              for a in action_history:
-                if blend_state.is_terminal():
-                  break
-                blend_state.apply_action(a)
-              blend_state = runner._env._state
-
-            if not blend_state.is_terminal():
-              blend_state.apply_action(action_id)
-
-            # ── Policy continuation ──
-            # The candidate action is turn 1 of the policy segment; play
-            # turns 2..m from the frozen policy, alternating players, then
-            # hand over to the heuristic.  Odd m ends the segment on the
-            # acting player, so it has seen and responded to one partner
-            # move -- the shortest rollout in which a hint can actually pay
-            # off.  The legacy llm_partner_response flag is exactly m=2.
-            policy_turns = runner._config.reward_policy_turns
-            if runner._config.llm_partner_response and policy_turns < 2:
-              policy_turns = 2
-            if not blend_state.is_terminal():
-              _rollout_policy_turns(runner, blend_state, policy_turns - 1)
-
-            # Lives remaining after the whole policy segment.  Capturing
-            # them here rather than immediately after the candidate action
-            # is deliberate: life tokens only ever decrease, so this is the
-            # minimum over the segment, and every move in the segment is
-            # the policy's own.  Capturing earlier would make a bomb at
-            # turn 3 invisible, reinstating exactly the blindness this
-            # factor exists to remove.  At m=1 the two are identical.
-            survival_exp = runner._config.reward_survival_exponent
-            lives_after = None
-            if survival_exp > 0 and hasattr(blend_state, 'life_tokens'):
-              lives_after = blend_state.life_tokens()
-
-            # Common random numbers: every completion in this group
-            # shares one prompt, hence one seed, so the heuristic
-            # partner's coin flips are common-mode across the candidate
-            # actions GRPO compares against each other.
-            group_seed = (
-                _group_rollout_seed(prompt_text, pass_idx)
-                if runner._config.reward_rollout_common_seed
-                else None
-            )
-            game_score_norm = _rollout_value(
-                runner,
-                blend_state,
-                p_id,
-                num_samples=runner._config.reward_rollout_samples,
-                seed=group_seed,
-                turn_discount=runner._config.reward_turn_discount,
-            )
-
-            # ── Convex survival factor ──
-            # SafePlayPlayer never loses a life (it plays only cards it
-            # KNOWS are playable), so the rollout score is provably
-            # invariant to lives remaining: 3->2 and 2->1 both move it by
-            # exactly 0.0000.  The reward is therefore blind to the first
-            # two bombs and dumps the whole penalty on the third.  This
-            # restores the missing gradient.
-            if lives_after is not None:
-              max_lives = 3
-              game_obj = getattr(runner._env, 'game', None)
-              params = getattr(game_obj, '_params', None)
-              if isinstance(params, dict):
-                max_lives = params.get('max_life_tokens', 3)
-              life_fraction = max(lives_after, 0) / max(max_lives, 1)
-              if game_score_norm >= 0:
-                game_score_norm *= life_fraction ** survival_exp
-              else:
-                # When negative (stall penalty), losing lives increases the penalty monotonically
-                game_score_norm -= (1.0 - life_fraction) * 0.3
-
-            reward = (1 - blend_w) * primary_reward + blend_w * game_score_norm
-          else:
-            reward = primary_reward
-
-      elif (
-          runner._config.reward_num_simulations > 1
-          and runner._config.reward_variance_penalty > 0
-      ):
-        sim_rewards = [
-            simulate_from_state(
-                runner, action_history, action_id, p_id, ser_state
-            )
-            for _ in range(runner._config.reward_num_simulations)
-        ]
-        mean_r = float(np.mean(sim_rewards))
-        std_r = float(np.std(sim_rewards))
-        reward = mean_r - runner._config.reward_variance_penalty * std_r
-      else:
-        reward = simulate_from_state(
-            runner, action_history, action_id, p_id, ser_state
-        )
+      reward = _compute_action_reward(
+          runner=runner,
+          prompt_text=prompt_text,
+          action_id=action_id,
+          parsed=parsed,
+          p_id=p_id,
+          ser_state=ser_state,
+          action_history=action_history,
+          pass_idx=pass_idx,
+      )
 
       reward_tensor = torch.tensor(float(reward))
       rewards.append(reward_tensor)
@@ -1906,58 +1897,7 @@ def _train_grpo_on_prompts(
           100.0 * cache_hits / len(rewards),
       )
 
-    # ── Per-group reward / z-score dump ──
-    # One GRPO group == one prompt == one game state, and the K completions
-    # in it are K candidate actions.  TRL ALWAYS subtracts the group mean;
-    # only the denominator depends on ``grpo_scale_rewards`` ('group' ->
-    # group std, 'batch' -> batch std, 'none' -> 1).  The z-score logged
-    # here is the 'group' normalisation, (r - mean) / (std + 1e-4), which
-    # is the exact advantage under scale_rewards='group' and is
-    # proportional to it under 'batch'.
-    #
-    # The point of this dump is diagnostic: a group whose rewards are all
-    # equal has std=0, every advantage is 0, and the group contributes NO
-    # gradient no matter how many tokens it cost to generate.  Counting
-    # those lines tells us directly how much of a pass was wasted.
-    groups = {}
-    for rec in group_records:
-      groups.setdefault(rec['prompt'], []).append(rec)
-    for recs in groups.values():
-      group_counter[0] += 1
-      vals = np.asarray([r['reward'] for r in recs], dtype=np.float64)
-      mean_r = float(vals.mean())
-      std_r = float(vals.std())
-      gid = group_counter[0]
-      logging.info(
-          '[GRPO group #%d] P%d | n=%d distinct_actions=%d | '
-          'reward mean=%+.4f std=%.4f min=%+.4f max=%+.4f%s',
-          gid,
-          recs[0]['player'],
-          len(recs),
-          len({r['action'] for r in recs}),
-          mean_r,
-          std_r,
-          float(vals.min()),
-          float(vals.max()),
-          '  *** DEGENERATE: std=0, zero gradient ***'
-          if std_r < 1e-6
-          else '',
-      )
-      for slot, rec in enumerate(recs):
-        adv = rec['reward'] - mean_r
-        logging.info(
-            '[GRPO group #%d]   [%d] a=%-3s %-15s r=%+.4f adv=%+.4f '
-            'z=%+.4f | %r',
-            gid,
-            slot,
-            rec['action'],
-            rec['status'],
-            rec['reward'],
-            adv,
-            adv / (std_r + 1e-4),
-            rec['text'],
-        )
-
+    _log_group_records(group_records, group_counter)
     return rewards
 
   # Build output directory.

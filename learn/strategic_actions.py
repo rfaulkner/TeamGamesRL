@@ -54,25 +54,15 @@ except ImportError:
   import logging
 
 
-# -- Card knowledge regex (matches player's own hand in HLE observations) -----
-_CARD_KNOWLEDGE_RE = re.compile(
-    r'XX\s*\|\|\s*(?:[A-Z0-9]+[|])?([RYGWB]+)[|]?([1-5]+)'
-)
-
-# -- Fireworks regex ----------------------------------------------------------
-_FIREWORKS_RE = re.compile(r'Fireworks:\s*((?:[RYGWB]\d\s*)+)')
-
-# -- Action string patterns ---------------------------------------------------
-_PLAY_RE = re.compile(r'\(Play (\d+)\)')
-_DISCARD_RE = re.compile(r'\(Discard (\d+)\)')
-_REVEAL_COLOR_RE = re.compile(r'\(Reveal player \+(\d+) color ([RYGWB])\)')
-_REVEAL_RANK_RE = re.compile(r'\(Reveal player \+(\d+) rank (\d+)\)')
-
-# -- Partner hand regex (visible cards in another player's hand) ---------------
-# Matches "R2 || ..." format (actual card visible, not XX)
-_VISIBLE_CARD_RE = re.compile(r'([RYGWB])(\d)\s*\|\|')
-
-_COLOR_CHARS = ('R', 'Y', 'G', 'W', 'B')
+from env.hanabi.hanabi_env import CARD_KNOWLEDGE_RE as _CARD_KNOWLEDGE_RE
+from env.hanabi.hanabi_env import COLOR_CHARS as _COLOR_CHARS
+from env.hanabi.hanabi_env import DISCARD_RE as _DISCARD_RE
+from env.hanabi.hanabi_env import FIREWORKS_RE as _FIREWORKS_RE
+from env.hanabi.hanabi_env import parse_fireworks
+from env.hanabi.hanabi_env import PLAY_RE as _PLAY_RE
+from env.hanabi.hanabi_env import REVEAL_COLOR_RE as _REVEAL_COLOR_RE
+from env.hanabi.hanabi_env import REVEAL_RANK_RE as _REVEAL_RANK_RE
+from env.hanabi.hanabi_env import VISIBLE_CARD_RE as _VISIBLE_CARD_RE
 
 
 @dataclasses.dataclass
@@ -121,22 +111,8 @@ class StrategicActionPlan:
 
 
 def _parse_fireworks(obs_string: str) -> dict[str, int]:
-  """Extract firework heights from an observation string.
-
-  Args:
-    obs_string: Raw observation string from ``state.observation_string()``.
-
-  Returns:
-    A dict mapping colour letter (e.g. ``'R'``) to the highest rank
-    played on that firework (0 if empty).
-  """
-  fireworks: dict[str, int] = {c: 0 for c in _COLOR_CHARS}
-  match = _FIREWORKS_RE.search(obs_string)
-  if match:
-    for token in match.group(1).strip().split():
-      if len(token) >= 2:
-        fireworks[token[0]] = int(token[1:])
-  return fireworks
+  """Extract firework heights from an observation string."""
+  return parse_fireworks(obs_string)
 
 
 def _parse_card_knowledge(obs_string: str) -> list[tuple[str, str]]:

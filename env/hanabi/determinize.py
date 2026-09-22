@@ -61,9 +61,12 @@ import collections
 import random
 from typing import Any, Optional
 
-from hanabi_learning_environment import pyhanabi
-
-_MT = pyhanabi.HanabiMoveType
+try:
+  from hanabi_learning_environment import pyhanabi
+  _MT = pyhanabi.HanabiMoveType
+except ImportError:
+  pyhanabi = None
+  _MT = None
 
 # Number of random games used to collect all distinct deal moves.  Six is
 # typically enough for a standard 5x5 deck; the loop is bounded anyway.

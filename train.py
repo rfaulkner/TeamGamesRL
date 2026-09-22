@@ -46,22 +46,20 @@ Usage:
   python train.py --game=negotiation --llm_type=mock --temperature=0.8
 """
 
-import dataclasses
 import os
 import time
 
 from absl import app
 from absl import flags
 from absl import logging
-import numpy as np
-
-from open_spiel.python import rl_environment
-
 from env import game_env
 from env import state_renderers
-from env.game_config import GameConfig
 from env.game_config import _GAME_CONFIGS
+from env.game_config import GameConfig
+from learn.trajectory import Trajectory
 import llm_agent
+import numpy as np
+from open_spiel.python import rl_environment
 
 FLAGS = flags.FLAGS
 
@@ -95,42 +93,6 @@ flags.DEFINE_integer(
 
 
 
-
-# ============================================================================
-# Trajectory Data
-# ============================================================================
-
-
-@dataclasses.dataclass
-class Trajectory:
-  """Stores the trajectory data for a single player within one episode.
-
-  A trajectory records the sequence of observations, actions, and
-  associated log-probabilities for one player, along with the final
-  reward received at the end of the episode.
-
-  Attributes:
-    player_id: Integer ID of the player this trajectory belongs to.
-    states: List of text prompts (rendered game states) seen by the
-      player at each decision point.
-    actions: List of integer action IDs chosen by the player.
-    action_texts: List of human-readable text descriptions of the
-      actions taken.
-    log_probs: List of log-probabilities assigned by the LLM to each
-      chosen action.
-    reward: The episode return (final reward) for this player.
-  """
-  player_id: int
-  states: list[str] = dataclasses.field(default_factory=list)
-  actions: list[int] = dataclasses.field(default_factory=list)
-  action_texts: list[str] = dataclasses.field(default_factory=list)
-  log_probs: list[float] = dataclasses.field(default_factory=list)
-  reward: float = 0.0
-
-  @property
-  def num_steps(self) -> int:
-    """Returns the number of decision steps in this trajectory."""
-    return len(self.actions)
 
 
 # ============================================================================
