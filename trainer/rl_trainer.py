@@ -89,6 +89,7 @@ class RLTrainer:
       experiment_config: dict | None = None,
       bot_partner: bool = False,
       reasoning: bool = False,
+      eval_batch_size: int = 4,
   ):
     """Initializes the RLTrainer.
 
@@ -117,6 +118,8 @@ class RLTrainer:
           also embedded in the final ``summary.json``.
       bot_partner: Whether to partner with SafePlayPlayer during collection
           and evaluation.
+      reasoning: Whether to use chain-of-thought reasoning prompts.
+      eval_batch_size: Number of evaluation episodes to run concurrently in lockstep.
 
     Raises:
       ValueError: If game_name is not recognized.
@@ -137,6 +140,8 @@ class RLTrainer:
     self.wandb_config = wandb_config or {}
     self.backend = backend
     self.bot_partner = bot_partner
+    self.eval_batch_size = eval_batch_size
+    self.max_history_turns = max_history_turns
     self._bot = None
 
     # ── OpenSpiel environment ──
@@ -307,7 +312,6 @@ class RLTrainer:
               game_action_text=action_text,
           )
       )
-
       time_step = self.env.step([action_id])
 
     # Assign rewards.
@@ -317,12 +321,277 @@ class RLTrainer:
 
     return trajectories
 
+  def run_episodes_batch(
+      self,
+      batch_plan: list[tuple[int | None, str]],
+      is_evaluation: bool = True,
+  ) -> list[tuple[list[PlayerTrajectory], object, str]]:
+    """Runs a batch of episodes in lockstep to batch LLM generations.
+
+    Args:
+      batch_plan: List of (bot_player, mode_label) tuples for this batch.
+      is_evaluation: Whether this is evaluation mode.
+
+    Returns:
+      List of (trajectories, final_state, mode_label) tuples.
+    """
+    num_players = self.game_config.num_players
+    batch_size = len(batch_plan)
+
+    envs = [game_env.create_env(self.game_config) for _ in range(batch_size)]
+    batch_renderers = [
+        [
+            game_env.create_renderer(
+                self.game_config,
+                max_history_turns=getattr(self, 'max_history_turns', 20),
+            )
+            for _ in range(num_players)
+        ]
+        for _ in range(batch_size)
+    ]
+    time_steps = [env.reset() for env in envs]
+    all_trajectories = [
+        [PlayerTrajectory(player_id=p) for p in range(num_players)]
+        for _ in range(batch_size)
+    ]
+
+    if self._bot is None:
+      try:
+        from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+        self._bot = SafePlayPlayer(seed=42)
+      except ImportError:
+        self._bot = None
+
+    eval_temp = 0.2 if self.reasoning else 0.01
+    max_tokens = 200 if self.reasoning else 64
+    temp = eval_temp if is_evaluation else self.temperature
+
+    active_indices = list(range(batch_size))
+
+    while active_indices:
+      # Advance bot turns until every active game needs the LLM (or terminates).
+      llm_pending: list[int] = []
+      still_active: list[int] = []
+
+      for idx in active_indices:
+        env = envs[idx]
+        ts = time_steps[idx]
+        bot_player, _ = batch_plan[idx]
+
+        while not ts.last():
+          cur_player = ts.current_player()
+          if bot_player is not None and cur_player == bot_player:
+            state = env._state  # pylint: disable=protected-access
+            legal_desc = batch_renderers[idx][cur_player].render_legal_actions(
+                state, cur_player, env.game
+            )
+            legal_actions = [a for a, _ in legal_desc]
+            if self._bot is not None:
+              action_id = self._bot.select_action(state, cur_player, env.game)
+            else:
+              action_id = int(np.random.choice(legal_actions))
+
+            action_text = state.action_to_string(cur_player, action_id)
+            all_trajectories[idx][cur_player].steps.append(
+                RLTrajectoryStep(
+                    prompt='',
+                    action_text=action_text,
+                    action_id=action_id,
+                    log_prob=0.0,
+                    state_text=batch_renderers[idx][cur_player].render_state(
+                        state, cur_player, env.game
+                    ),
+                    llm_response=action_text,
+                    game_action_text=action_text,
+                )
+            )
+            ts = env.step([action_id])
+            time_steps[idx] = ts
+          else:
+            break
+
+        if ts.last():
+          if ts.rewards is not None:
+            for p in range(num_players):
+              all_trajectories[idx][p].reward = ts.rewards[p]
+        else:
+          still_active.append(idx)
+          llm_pending.append(idx)
+
+      if not still_active:
+        break
+
+      # Build prompts for all games currently waiting on an LLM decision.
+      prompts: list[str] = []
+      step_metadata: list[tuple[int, int, str, list[tuple[int, str]]]] = []
+
+      for idx in llm_pending:
+        env = envs[idx]
+        ts = time_steps[idx]
+        cur_player = ts.current_player()
+        state = env._state  # pylint: disable=protected-access
+        state_text = batch_renderers[idx][cur_player].render_state(
+            state, cur_player, env.game
+        )
+        legal_desc = batch_renderers[idx][cur_player].render_legal_actions(
+            state, cur_player, env.game
+        )
+        legal_actions = [a for a, _ in legal_desc]
+        action_descriptions = [d for _, d in legal_desc]
+        prompt = self.agents[cur_player]._build_prompt(
+            state_text, legal_actions, action_descriptions
+        )
+        prompts.append(prompt)
+        step_metadata.append((idx, cur_player, state_text, legal_desc))
+
+      # Run one batched generation across all pending prompts on the GPU.
+      if hasattr(self.backend, 'generate_batch'):
+        responses = self.backend.generate_batch(
+            prompts, temperature=temp, max_tokens=max_tokens
+        )
+      else:
+        responses = [
+            self.backend.generate(p, temperature=temp, max_tokens=max_tokens)
+            for p in prompts
+        ]
+
+      # Step each environment with the generated response.
+      next_active: list[int] = []
+      for (idx, cur_player, state_text, legal_desc), response in zip(
+          step_metadata, responses
+      ):
+        env = envs[idx]
+        state = env._state  # pylint: disable=protected-access
+        action_id = batch_renderers[idx][cur_player].parse_action(
+            response, legal_desc
+        )
+        legal_actions = [a for a, _ in legal_desc]
+        if action_id is None:
+          action_id = int(np.random.choice(legal_actions))
+
+        action_text = state.action_to_string(cur_player, action_id)
+        all_trajectories[idx][cur_player].steps.append(
+            RLTrajectoryStep(
+                prompt=prompts[step_metadata.index((idx, cur_player, state_text, legal_desc))],
+                action_text=response.strip() if response else '',
+                action_id=action_id,
+                log_prob=0.0,
+                state_text=state_text,
+                llm_response=response if response else '',
+                game_action_text=action_text,
+            )
+        )
+        ts = env.step([action_id])
+        time_steps[idx] = ts
+
+        if ts.last():
+          if ts.rewards is not None:
+            for p in range(num_players):
+              all_trajectories[idx][p].reward = ts.rewards[p]
+        else:
+          next_active.append(idx)
+
+      active_indices = next_active
+
+    return [
+        (all_trajectories[i], envs[i]._state, batch_plan[i][1])
+        for i in range(batch_size)
+    ]
+
+  def _process_eval_episode(
+      self,
+      ep_i: int,
+      total_episodes: int,
+      trajectories: list[PlayerTrajectory],
+      state: object,
+      mode_label: str,
+      all_rewards: list[list[float]],
+      wins: np.ndarray,
+      action_counts: list[dict[int, int]],
+      mode_rewards: dict[str, list[float]],
+      num_players: int,
+  ) -> None:
+    """Processes, logs, and accumulates metrics for one evaluated episode."""
+    rewards = [t.reward for t in trajectories]
+    mean_r = float(np.mean(rewards))
+    mode_rewards.setdefault(mode_label, []).append(mean_r)
+
+    for p in range(num_players):
+      all_rewards[p].append(rewards[p])
+      for step in trajectories[p].steps:
+        a_id = step.action_id
+        action_counts[p][a_id] = action_counts[p].get(a_id, 0) + 1
+
+    max_r = max(rewards)
+    winners = [p for p in range(num_players) if rewards[p] == max_r]
+    if len(winners) == 1:
+      wins[winners[0]] += 1
+
+    actions_summary = []
+    for t in trajectories:
+      steps_summary = ','.join(
+          s.game_action_text or f'a{s.action_id}' for s in t.steps
+      )
+      actions_summary.append(f'P{t.player_id}:[{steps_summary}]')
+
+    cards_str = ''
+    if hasattr(state, 'history') and callable(state.history):
+      history = state.history()
+      if len(history) >= num_players:
+        cards = [history[p] for p in range(num_players)]
+        cards_str = ' | cards=' + ','.join(str(c) for c in cards)
+
+    logging.info(
+        '  [eval %d/%d] (%s) reward=%.1f%s | %s',
+        ep_i + 1,
+        total_episodes,
+        mode_label,
+        mean_r,
+        cards_str,
+        ' | '.join(actions_summary),
+    )
+
+    if self.log_episodes_every > 0:
+      self._log_episode(ep_i + 1, trajectories, 0.0, is_evaluation=True)
+
+    eval_log_path = os.path.join(self.results_dir, 'eval_episodes.jsonl')
+    eval_record = {
+        'eval_episode': ep_i + 1,
+        'mode': mode_label,
+        'game': self.game_name,
+        'mean_reward': mean_r,
+        'players': [],
+    }
+    for traj in trajectories:
+      p_data = {
+          'player_id': traj.player_id,
+          'reward': traj.reward,
+          'steps': [
+              {
+                  'state_text': s.state_text,
+                  'prompt': s.prompt,
+                  'llm_response': s.llm_response,
+                  'game_action': s.game_action_text,
+                  'action_id': s.action_id,
+                  'log_prob': s.log_prob,
+              }
+              for s in traj.steps
+          ],
+      }
+      eval_record['players'].append(p_data)
+    try:
+      with open(eval_log_path, 'a') as f:
+        f.write(json.dumps(eval_record) + '\n')
+    except IOError as e:
+      logging.warning('Failed to write eval episode log: %s', e)
+
   def evaluate(self, num_episodes: int = 10) -> dict[str, float]:
     """Evaluates the current policy over multiple episodes.
 
     If bot_partner is True and num_players == 2, splits episodes evenly
     across three conditions: P0=LLM vs P1=Bot, P0=Bot vs P1=LLM, and
-    pure self-play (P0=LLM vs P1=LLM).
+    pure self-play (P0=LLM vs P1=LLM). Batches episodes in lockstep when
+    eval_batch_size > 1 for faster inference.
 
     Args:
       num_episodes: Number of evaluation episodes.
@@ -350,84 +619,44 @@ class RLTrainer:
 
     mode_rewards: dict[str, list[float]] = {}
 
-    for ep_i, (bot_player, mode_label) in enumerate(eval_plan):
-      trajectories = self.run_episode(is_evaluation=True, bot_player=bot_player)
-      rewards = [t.reward for t in trajectories]
-      mean_r = float(np.mean(rewards))
-      mode_rewards.setdefault(mode_label, []).append(mean_r)
-
-      for p in range(num_players):
-        all_rewards[p].append(rewards[p])
-        for step in trajectories[p].steps:
-          a_id = step.action_id
-          action_counts[p][a_id] = action_counts[p].get(a_id, 0) + 1
-
-      max_r = max(rewards)
-      winners = [p for p in range(num_players) if rewards[p] == max_r]
-      if len(winners) == 1:
-        wins[winners[0]] += 1
-
-      # Format per-episode action string.
-      actions_summary = []
-      for t in trajectories:
-        steps_summary = ','.join(
-            s.game_action_text or f'a{s.action_id}' for s in t.steps
+    if self.eval_batch_size > 1 and hasattr(self.backend, 'generate_batch'):
+      plan_chunks = [
+          eval_plan[i : i + self.eval_batch_size]
+          for i in range(0, len(eval_plan), self.eval_batch_size)
+      ]
+      ep_offset = 0
+      for chunk in plan_chunks:
+        batch_results = self.run_episodes_batch(chunk, is_evaluation=True)
+        for sub_i, (trajectories, state, mode_label) in enumerate(batch_results):
+          self._process_eval_episode(
+              ep_offset + sub_i,
+              len(eval_plan),
+              trajectories,
+              state,
+              mode_label,
+              all_rewards,
+              wins,
+              action_counts,
+              mode_rewards,
+              num_players,
+          )
+        ep_offset += len(chunk)
+    else:
+      for ep_i, (bot_player, mode_label) in enumerate(eval_plan):
+        trajectories = self.run_episode(is_evaluation=True, bot_player=bot_player)
+        state = self.env._state  # pylint: disable=protected-access
+        self._process_eval_episode(
+            ep_i,
+            len(eval_plan),
+            trajectories,
+            state,
+            mode_label,
+            all_rewards,
+            wins,
+            action_counts,
+            mode_rewards,
+            num_players,
         )
-        actions_summary.append(f'P{t.player_id}:[{steps_summary}]')
-
-      state = self.env._state  # pylint: disable=protected-access
-      cards_str = ''
-      if hasattr(state, 'history') and callable(state.history):
-        history = state.history()
-        if len(history) >= num_players:
-          cards = [history[p] for p in range(num_players)]
-          cards_str = ' | cards=' + ','.join(str(c) for c in cards)
-
-      logging.info(
-          '  [eval %d/%d] (%s) reward=%.1f%s | %s',
-          ep_i + 1,
-          len(eval_plan),
-          mode_label,
-          mean_r,
-          cards_str,
-          ' | '.join(actions_summary),
-      )
-
-      # Log full transcript to episode_log.jsonl.
-      if self.log_episodes_every > 0:
-        self._log_episode(ep_i + 1, trajectories, 0.0, is_evaluation=True)
-
-      # Log full eval play results to results/eval_episodes.jsonl
-      eval_log_path = os.path.join(self.results_dir, 'eval_episodes.jsonl')
-      eval_record = {
-          'eval_episode': ep_i + 1,
-          'mode': mode_label,
-          'game': self.game_name,
-          'mean_reward': mean_r,
-          'players': [],
-      }
-      for traj in trajectories:
-        p_data = {
-            'player_id': traj.player_id,
-            'reward': traj.reward,
-            'steps': [
-                {
-                    'state_text': s.state_text,
-                    'prompt': s.prompt,
-                    'llm_response': s.llm_response,
-                    'game_action': s.game_action_text,
-                    'action_id': s.action_id,
-                    'log_prob': s.log_prob,
-                }
-                for s in traj.steps
-            ],
-        }
-        eval_record['players'].append(p_data)
-      try:
-        with open(eval_log_path, 'a') as f:
-          f.write(json.dumps(eval_record) + '\n')
-      except IOError as e:
-        logging.warning('Failed to write eval episode log: %s', e)
 
     # Log action distribution summary across eval episodes.
     for p in range(num_players):

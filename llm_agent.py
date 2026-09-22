@@ -143,6 +143,30 @@ class LLMInterface(abc.ABC):
     text = self.generate(prompt, temperature=temperature, max_tokens=max_tokens)
     return text, 0.0
 
+  def generate_batch(
+      self,
+      prompts: list[str],
+      temperature: float = 0.7,
+      max_tokens: int = 256,
+  ) -> list[str]:
+    """Generate text for a list of prompts.
+
+    The default implementation calls `generate` sequentially. Subclasses
+    should override this with vectorized batch generation on GPU.
+
+    Args:
+      prompts: List of input prompt strings.
+      temperature: Sampling temperature.
+      max_tokens: Maximum number of tokens to generate.
+
+    Returns:
+      List of generated text strings.
+    """
+    return [
+        self.generate(p, temperature=temperature, max_tokens=max_tokens)
+        for p in prompts
+    ]
+
 
 class MockLLM(LLMInterface):
   """A mock LLM backend for testing without a real model.

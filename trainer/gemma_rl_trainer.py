@@ -63,6 +63,12 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'num_eval_episodes', 10, 'Number of episodes per evaluation round.'
 )
+flags.DEFINE_integer(
+    'eval_batch_size',
+    4,
+    'Batch size for parallel evaluation episodes. Running multiple evaluation '
+    'games in lockstep batches GPU generations for ~4x faster evaluation.',
+)
 flags.DEFINE_float(
     'temperature', 0.8, 'Sampling temperature for LLM action selection.'
 )
@@ -547,6 +553,7 @@ def main(argv: list[str]) -> None:
       experiment_config=experiment_config,
       bot_partner=FLAGS.bot_partner,
       reasoning=FLAGS.reasoning,
+      eval_batch_size=FLAGS.eval_batch_size,
   )
 
   # ── Train ──

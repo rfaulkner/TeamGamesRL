@@ -297,6 +297,59 @@ class GemmaLLMBackend(llm_agent.LLMInterface):
     new_tokens = output_ids[0, inputs['input_ids'].shape[1] :]
     return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
+  def generate_batch(
+      self,
+      prompts: list[str],
+      temperature: float = 0.7,
+      max_tokens: int = 64,
+  ) -> list[str]:
+    """Generate text for a batch of prompts using GPU tensor batching.
+
+    Args:
+      prompts: List of input prompt strings.
+      temperature: Sampling temperature.
+      max_tokens: Maximum new tokens to generate.
+
+    Returns:
+      List of generated text strings (response only, prompt stripped).
+    """
+    if not prompts:
+      return []
+
+    # Causal LM generation with padding requires left-side padding.
+    prev_padding_side = self.tokenizer.padding_side
+    self.tokenizer.padding_side = 'left'
+
+    try:
+      inputs = self.tokenizer(
+          prompts,
+          return_tensors='pt',
+          padding=True,
+          truncation=True,
+          max_length=self._max_seq_len,
+      ).to(self.model.device)
+
+      with torch.no_grad():
+        output_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=max(temperature, 1e-3) if temperature > 0 else 1.0,
+            do_sample=temperature > 0,
+            top_p=0.9 if temperature > 0 else 1.0,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+
+      input_len = inputs['input_ids'].shape[1]
+      responses = []
+      for i in range(len(prompts)):
+        new_tokens = output_ids[i, input_len:]
+        responses.append(
+            self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        )
+      return responses
+    finally:
+      self.tokenizer.padding_side = prev_padding_side
+
   def generate_with_logprobs(
       self,
       prompt: str,
