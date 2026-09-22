@@ -638,14 +638,22 @@ def evaluate_dense_chain(
   state.apply_action(chosen_action)
 
   # Continue with heuristic player for `horizon` turns.
-  try:
-    from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-    heuristic = SafePlayPlayer()
-  except ImportError:
-    # No heuristic available -- return just the immediate reward.
-    return total_reward
-
+  bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
+  heuristic = None
   game = getattr(runner._env, 'game', None)
+  if bot_type == 'belief_lookahead':
+    try:
+      from env.hanabi.belief_expert import SafeBeliefLookaheadPlayer  # pylint: disable=g-import-not-at-top
+      heuristic = SafeBeliefLookaheadPlayer(game, n_worlds=1, seed=42)
+    except Exception:
+      heuristic = None
+  if heuristic is None:
+    try:
+      from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+      heuristic = SafePlayPlayer(seed=42)
+    except ImportError:
+      # No heuristic available -- return just the immediate reward.
+      return total_reward
   gamma = discount
   first_continuation = True
   for _ in range(horizon):

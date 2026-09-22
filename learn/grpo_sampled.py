@@ -92,7 +92,10 @@ def collect_game_prompts(
       # Alternating roles: odd episodes -> P1 is bot; even episodes -> P0 is bot.
       bot_player = 1 if ep % 2 == 1 else 0
 
+    max_horizon = getattr(runner._config, 'get_curriculum_horizon', lambda p: 1000)(pass_idx)
     while not time_step.last():
+      if len(action_history) >= max_horizon:
+        break
       current_player = time_step.current_player()
       state = runner._env._state  # pylint: disable=protected-access
 
@@ -180,6 +183,7 @@ def collect_game_prompts(
             'legal_actions': legal_actions,
             'legal_actions_desc': legal_actions_with_desc,
             'state_text': state_text,
+            'turn_index': len(action_history),
             'serialized_state': _serialize_game_and_state(
                 runner._env.game, state
             ),
@@ -2252,10 +2256,66 @@ def run_sampled(runner) -> None:
       logging.warning('No prompts collected in pass %d, skipping.', pass_idx)
       continue
 
-    # ── Step 2–3: Train (per-player or combined) ──
+    # ── Step 2–3: Train (per-player or combined) with Curriculum Window Sampling ──
     total_pass_loss = 0.0
     total_pass_reward = 0.0
     num_train_steps = 0
+
+    # Curriculum window calculation:
+    window_size = getattr(runner._config, 'curriculum_window_size', 0)
+    if window_size > 0:
+      start_turn, end_turn = runner._config.get_curriculum_active_window(pass_idx)
+      replay_ratio = getattr(runner._config, 'curriculum_replay_ratio', 0.30)
+      logging.info(
+          '[curriculum] Pass %d: active window turns [%d, %d), max horizon %d, replay ratio %.2f',
+          pass_idx,
+          start_turn,
+          end_turn,
+          end_turn,
+          replay_ratio,
+      )
+    else:
+      start_turn, end_turn = 0, 1000
+      replay_ratio = 0.0
+
+    def _sample_curriculum_prompts(entries: list[dict]) -> list[str]:
+      """Selects unique prompts balancing active window and replay history."""
+      if window_size <= 0 or not entries:
+        return list({e['prompt'] for e in entries})
+
+      active_entries = [
+          e for e in entries if start_turn <= e.get('turn_index', 0) < end_turn
+      ]
+      replay_entries = [
+          e for e in entries if e.get('turn_index', 0) < start_turn
+      ]
+
+      active_prompts = list({e['prompt'] for e in active_entries})
+      replay_prompts = list({e['prompt'] for e in replay_entries})
+
+      if not replay_prompts or start_turn == 0:
+        return active_prompts or list({e['prompt'] for e in entries})
+
+      # Allocate 70% active window, 30% replay
+      total_target = max(len(active_prompts) + len(replay_prompts), 1)
+      n_replay = max(1, int(total_target * replay_ratio))
+      n_active = max(1, total_target - n_replay)
+
+      selected_active = list(np.random.choice(
+          active_prompts, size=min(len(active_prompts), n_active), replace=False
+      )) if active_prompts else []
+      selected_replay = list(np.random.choice(
+          replay_prompts, size=min(len(replay_prompts), n_replay), replace=False
+      )) if replay_prompts else []
+
+      selected = list(set(selected_active + selected_replay))
+      logging.info(
+          '[curriculum] Sampled %d prompts (%d active window, %d replay)',
+          len(selected),
+          len(selected_active),
+          len(selected_replay),
+      )
+      return selected
 
     if runner._config.per_player_updates:
       player_groups: dict[int, list[dict]] = {}
@@ -2267,7 +2327,7 @@ def run_sampled(runner) -> None:
 
       for pid in sorted(player_groups.keys()):
         group_entries = player_groups[pid]
-        unique_prompts = list({e['prompt'] for e in group_entries})
+        unique_prompts = _sample_curriculum_prompts(group_entries)
         if not unique_prompts:
           continue
         logging.info(
@@ -2283,7 +2343,7 @@ def run_sampled(runner) -> None:
         total_pass_reward += p_reward
         num_train_steps += 1
     else:
-      unique_prompts = list({e['prompt'] for e in prompt_entries})
+      unique_prompts = _sample_curriculum_prompts(prompt_entries)
       logging.info(
           'Pass %d: %d unique prompts from %d total.',
           pass_idx,

@@ -527,3 +527,52 @@ class GRPOConfig:
   reasoning: bool = False
   """If True, prompt the LLM to think inside <think>...</think> before acting."""
 
+  # Sliding Window Curriculum settings.
+  curriculum_window_size: int = 4
+  """Window size (turns) for each phase of sliding-window curriculum.
+
+  With curriculum_window_size=4 and curriculum_passes_per_phase=2:
+  Phase 1 (passes 0-1):  turns 1-4
+  Phase 2 (passes 2-3):  turns 5-8
+  Phase 3 (passes 4-5):  turns 9-12, etc.
+  Set to 0 to disable curriculum (train on full episodes from start).
+  """
+
+  curriculum_passes_per_phase: int = 2
+  """Number of GRPO passes to spend on each phase before advancing horizon."""
+
+  curriculum_max_horizon: int = 30
+  """Maximum turn horizon for curriculum training.
+
+  Once reached, collection and training cover up to this turn (or full game).
+  """
+
+  curriculum_replay_ratio: float = 0.30
+  """Fraction of training decision points sampled from earlier phases [0, H-W).
+
+  The remaining (1 - curriculum_replay_ratio) are sampled from the active
+  frontier window [H-W, H). Prevents catastrophic forgetting of early moves.
+  """
+
+  curriculum_boundary_rollout_turns: int = 4
+  """Continuation turns played by SafeBeliefLookaheadPlayer at the horizon boundary.
+
+  Prevents myopic token dumping at the end of the window by testing state viability.
+  """
+
+  def get_curriculum_horizon(self, pass_idx: int) -> int:
+    """Returns the maximum turn horizon for the given pass index."""
+    if self.curriculum_window_size <= 0:
+      return 1000  # Effectively full game
+    phase = (pass_idx // max(1, self.curriculum_passes_per_phase)) + 1
+    horizon = phase * self.curriculum_window_size
+    if self.curriculum_max_horizon > 0:
+      horizon = min(horizon, self.curriculum_max_horizon)
+    return horizon
+
+  def get_curriculum_active_window(self, pass_idx: int) -> tuple[int, int]:
+    """Returns (start_turn, end_turn) of the active curriculum window for pass_idx."""
+    horizon = self.get_curriculum_horizon(pass_idx)
+    start_turn = max(0, horizon - self.curriculum_window_size)
+    return start_turn, horizon
+

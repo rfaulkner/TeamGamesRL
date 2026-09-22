@@ -424,6 +424,31 @@ flags.DEFINE_bool(
     'Prompt the LLM to think step-by-step inside <think>...</think> before '
     'selecting an action (Chain of Thought single-pass).',
 )
+flags.DEFINE_integer(
+    'curriculum_window_size',
+    4,
+    'Window size in turns for sliding-window curriculum. Set to 0 to disable.',
+)
+flags.DEFINE_integer(
+    'curriculum_passes_per_phase',
+    2,
+    'Number of GRPO passes per curriculum phase before advancing horizon.',
+)
+flags.DEFINE_integer(
+    'curriculum_max_horizon',
+    30,
+    'Maximum turn horizon for curriculum training.',
+)
+flags.DEFINE_float(
+    'curriculum_replay_ratio',
+    0.30,
+    'Fraction of decision points sampled from earlier curriculum phases.',
+)
+flags.DEFINE_integer(
+    'curriculum_boundary_rollout_turns',
+    4,
+    'Turns played by SafeBeliefLookaheadPlayer at the horizon boundary.',
+)
 # ============================================================================
 # Entry point
 # ============================================================================
@@ -614,6 +639,11 @@ def main(argv: list[str]) -> None:
         bot_partner=FLAGS.bot_partner,
         bot_type=FLAGS.bot_type,
         reasoning=FLAGS.reasoning,
+        curriculum_window_size=FLAGS.curriculum_window_size,
+        curriculum_passes_per_phase=FLAGS.curriculum_passes_per_phase,
+        curriculum_max_horizon=FLAGS.curriculum_max_horizon,
+        curriculum_replay_ratio=FLAGS.curriculum_replay_ratio,
+        curriculum_boundary_rollout_turns=FLAGS.curriculum_boundary_rollout_turns,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This

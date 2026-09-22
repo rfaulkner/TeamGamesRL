@@ -76,6 +76,11 @@ BOT_PARTNER="false"
 BOT_TYPE="belief_lookahead"
 REASONING="false"
 EVAL_BATCH_SIZE=4
+CURRICULUM_WINDOW_SIZE=4
+CURRICULUM_PASSES_PER_PHASE=2
+CURRICULUM_MAX_HORIZON=30
+CURRICULUM_REPLAY_RATIO="0.30"
+CURRICULUM_BOUNDARY_ROLLOUT_TURNS=4
 # ── 1. Determine profile first ───────────────────────────────────────────────
 
 PROFILE="full"
@@ -144,6 +149,11 @@ for arg in "$@"; do
     --reasoning) REASONING="true" ;;
     --reasoning=*) REASONING="${arg#*=}" ;;
     --eval_batch_size=*) EVAL_BATCH_SIZE="${arg#*=}" ;;
+    --curriculum_window_size=*) CURRICULUM_WINDOW_SIZE="${arg#*=}" ;;
+    --curriculum_passes_per_phase=*) CURRICULUM_PASSES_PER_PHASE="${arg#*=}" ;;
+    --curriculum_max_horizon=*) CURRICULUM_MAX_HORIZON="${arg#*=}" ;;
+    --curriculum_replay_ratio=*) CURRICULUM_REPLAY_RATIO="${arg#*=}" ;;
+    --curriculum_boundary_rollout_turns=*) CURRICULUM_BOUNDARY_ROLLOUT_TURNS="${arg#*=}" ;;
     --initial_lora_checkpoint=*|--warm_start_adapter=*)
       EXTRA_FLAGS="${EXTRA_FLAGS} --initial_lora_checkpoint=${arg#*=}" ;;
     --help|-h)
@@ -269,6 +279,11 @@ python3 trainer/gemma_rl_trainer.py \
   --bot_type="${BOT_TYPE}" \
   --reasoning="${REASONING}" \
   --eval_batch_size="${EVAL_BATCH_SIZE}" \
+  --curriculum_window_size="${CURRICULUM_WINDOW_SIZE}" \
+  --curriculum_passes_per_phase="${CURRICULUM_PASSES_PER_PHASE}" \
+  --curriculum_max_horizon="${CURRICULUM_MAX_HORIZON}" \
+  --curriculum_replay_ratio="${CURRICULUM_REPLAY_RATIO}" \
+  --curriculum_boundary_rollout_turns="${CURRICULUM_BOUNDARY_ROLLOUT_TURNS}" \
   --max_seq_len="${MAX_SEQ_LEN}" \
   --use_4bit \
   --output_dir="${output_dir}" \
