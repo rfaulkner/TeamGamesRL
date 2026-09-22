@@ -680,12 +680,21 @@ def _heuristic_rollout_score(
   # Across-group level differences (late states have fewer turns left, so
   # larger gamma**turns) do not matter: TRL subtracts the group mean, and a
   # group is one prompt, hence one game state.
-  try:
-    from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-
-    heuristic = SafePlayPlayer(seed=seed)
-  except ImportError:
-    heuristic = None
+  bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
+  heuristic = None
+  game = getattr(runner._env, 'game', None)
+  if bot_type == 'belief_lookahead':
+    try:
+      from env.hanabi.belief_expert import SafeBeliefLookaheadPlayer  # pylint: disable=g-import-not-at-top
+      heuristic = SafeBeliefLookaheadPlayer(game, n_worlds=1, seed=seed or 42)
+    except Exception:
+      heuristic = None
+  if heuristic is None:
+    try:
+      from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+      heuristic = SafePlayPlayer(seed=seed)
+    except ImportError:
+      heuristic = None
 
   rng = np.random.RandomState(seed) if seed is not None else np.random
 
