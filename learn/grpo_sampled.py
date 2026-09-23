@@ -619,6 +619,11 @@ def _rollout_policy_turns(runner, state, num_turns: int) -> int:
       action = _sample_policy_action(runner, state)
       if action is None:
         break
+      legal = state.legal_actions(state.current_player())
+      if action not in legal:
+        action = int(np.random.choice(legal)) if legal else None
+      if action is None:
+        break
       state.apply_action(action)
       played += 1
   return played
@@ -708,10 +713,12 @@ def _heuristic_rollout_score(
       break
     if heuristic is not None:
       action = heuristic.select_action(state, player, game)
-      if action is None:
-        action = int(rng.choice(legal))
+      if action is None or action not in legal:
+        action = int(rng.choice(legal)) if legal else None
     else:
-      action = int(rng.choice(legal))
+      action = int(rng.choice(legal)) if legal else None
+    if action is None:
+      break
     state.apply_action(action)
     turns += 1
 
@@ -1557,6 +1564,7 @@ def _compute_action_reward(
     action_history: list[int],
     pass_idx: int,
     partner_action: int | None = None,
+    post_action_state=None,
 ) -> float:
   """Compute the scalar reward for an action given the runner's simulation config."""
   if not parsed:
@@ -1596,12 +1604,24 @@ def _compute_action_reward(
           discount=discount,
           llm_partner_response=runner._config.llm_partner_response,
           partner_action=partner_action,
+          post_action_state=post_action_state.clone()
+          if post_action_state is not None and hasattr(post_action_state, 'clone')
+          else None,
       )
 
     if blend_w > 0:
-      if ser_state is not None:
+      if post_action_state is not None and hasattr(post_action_state, 'clone'):
+        blend_state = post_action_state.clone()
+        runner._env.set_state(blend_state)
+      elif ser_state is not None:
         _, blend_state = deserialize_game_and_state(ser_state)
         runner._env.set_state(blend_state)
+        if not blend_state.is_terminal():
+          legal0 = blend_state.legal_actions(blend_state.current_player())
+          if action_id in legal0:
+            blend_state.apply_action(action_id)
+          elif legal0:
+            blend_state.apply_action(int(np.random.choice(legal0)))
       else:
         runner._env.reset()
         blend_state = runner._env._state
@@ -1610,18 +1630,25 @@ def _compute_action_reward(
             break
           blend_state.apply_action(a)
         blend_state = runner._env._state
-
-      if not blend_state.is_terminal():
-        blend_state.apply_action(action_id)
+        if not blend_state.is_terminal():
+          legal0 = blend_state.legal_actions(blend_state.current_player())
+          if action_id in legal0:
+            blend_state.apply_action(action_id)
+          elif legal0:
+            blend_state.apply_action(int(np.random.choice(legal0)))
 
       policy_turns = runner._config.reward_policy_turns
       if runner._config.llm_partner_response and policy_turns < 2:
         policy_turns = 2
       if not blend_state.is_terminal():
+        current_p = blend_state.current_player()
+        legal = blend_state.legal_actions(current_p)
         if partner_action is not None and policy_turns >= 2:
-          blend_state.apply_action(partner_action)
-          if policy_turns > 2 and not blend_state.is_terminal():
-            _rollout_policy_turns(runner, blend_state, policy_turns - 2)
+          act = partner_action if partner_action in legal else (int(np.random.choice(legal)) if legal else None)
+          if act is not None:
+            blend_state.apply_action(act)
+            if policy_turns > 2 and not blend_state.is_terminal():
+              _rollout_policy_turns(runner, blend_state, policy_turns - 2)
         else:
           _rollout_policy_turns(runner, blend_state, policy_turns - 1)
 
@@ -1747,8 +1774,8 @@ def _train_grpo_on_prompts(
     group_records = []  # one dict per completion, for the group/z-score dump
     _action_type_tracker = {}  # prompt_text -> {play, discard, hint, total}
     cache_hits = 0
-    # ── Batch pre-sample LLM partner actions for all unique queries ──
     partner_actions_by_key = {}
+    post_states_by_key = {}
     if runner._config.llm_partner_response:
       needed_queries = {}
       for i, completion in enumerate(completions):
@@ -1799,7 +1826,14 @@ def _train_grpo_on_prompts(
             step_state = runner._env._state
 
           if not step_state.is_terminal():
-            step_state.apply_action(action_id)
+            legal0 = step_state.legal_actions(step_state.current_player())
+            if action_id in legal0:
+              step_state.apply_action(action_id)
+            elif legal0:
+              step_state.apply_action(int(np.random.choice(legal0)))
+
+          if hasattr(step_state, 'clone'):
+            post_states_by_key[key] = step_state.clone()
 
           if step_state.is_terminal():
             partner_actions_by_key[key] = None
@@ -1851,9 +1885,9 @@ def _train_grpo_on_prompts(
             descs = batch_legal_descs[k_idx]
             pid = batch_partner_ids[k_idx]
             p_act = runner._renderers[pid].parse_action(resp, descs)
-            if p_act is None:
-              legals = [a for a, _ in descs]
-              p_act = int(np.random.choice(legals)) if legals else 0
+            legals = [a for a, _ in descs]
+            if p_act is None or p_act not in legals:
+              p_act = int(np.random.choice(legals)) if legals else None
             partner_actions_by_key[key] = p_act
 
     for i, completion in enumerate(completions):
@@ -1992,6 +2026,7 @@ def _train_grpo_on_prompts(
           action_history=action_history,
           pass_idx=pass_idx,
           partner_action=partner_actions_by_key.get(cache_key, None),
+          post_action_state=post_states_by_key.get(cache_key, None),
       )
 
       reward_tensor = torch.tensor(float(reward))

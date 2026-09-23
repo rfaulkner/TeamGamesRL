@@ -578,6 +578,7 @@ def evaluate_dense_chain(
     discount: float = 0.9,
     llm_partner_response: bool = False,
     partner_action: Optional[int] = None,
+    post_action_state=None,
 ) -> float:
   """Evaluate a chosen action plus a short heuristic continuation.
 
@@ -614,11 +615,13 @@ def evaluate_dense_chain(
         continuation turn (the partner's immediate response).
     partner_action: Pre-computed action ID for the partner's immediate
         continuation turn. If given, avoids sampling an LLM action.
+    post_action_state: Optional pre-advanced game state after chosen_action
+        has been applied. Reusing this state avoids card dealing divergence.
 
   Returns:
     The total discounted dense reward.
   """
-  # Restore the game state.
+  # Restore the game state for initial action evaluation.
   if serialized_state is not None:
     _, state = deserialize_game_and_state(serialized_state)
     runner._env.set_state(state)
@@ -637,8 +640,16 @@ def evaluate_dense_chain(
   # Compute dense reward for the chosen action.
   total_reward = evaluate_action_quality(state, chosen_action, target_player)
 
-  # Apply the chosen action.
-  state.apply_action(chosen_action)
+  # Advance state: reuse cloned post_action_state if provided, else apply chosen_action.
+  if post_action_state is not None and hasattr(post_action_state, 'clone'):
+    state = post_action_state.clone()
+    runner._env.set_state(state)
+  else:
+    legal0 = state.legal_actions(state.current_player())
+    if chosen_action in legal0:
+      state.apply_action(chosen_action)
+    elif legal0:
+      state.apply_action(int(np.random.choice(legal0)))
 
   # Continue with heuristic player for `horizon` turns.
   bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
@@ -677,13 +688,17 @@ def evaluate_dense_chain(
         from learn.grpo_sampled import _sample_llm_partner_action  # pylint: disable=g-import-not-at-top
         h_action = _sample_llm_partner_action(runner, state)
       if h_action is None or h_action not in legal:
-        h_action = int(np.random.choice(legal))
+        h_action = int(np.random.choice(legal)) if legal else None
+      if h_action is None:
+        break
     else:
       first_continuation = False
       # Heuristic selects the next action.
       h_action = heuristic.select_action(state, current_player, game)
+      if h_action is None or h_action not in legal:
+        h_action = int(np.random.choice(legal)) if legal else None
       if h_action is None:
-        h_action = int(np.random.choice(legal))
+        break
 
     # Compute dense reward for this continuation action.
     step_reward = evaluate_action_quality(
