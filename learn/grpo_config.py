@@ -564,7 +564,8 @@ class GRPOConfig:
     """Returns the maximum turn horizon for the given pass index."""
     if self.curriculum_window_size <= 0:
       return 1000  # Effectively full game
-    phase = (pass_idx // max(1, self.curriculum_passes_per_phase)) + 1
+    # pass_idx is 1-indexed (pass 1, 2, ...).
+    phase = ((pass_idx - 1) // max(1, self.curriculum_passes_per_phase)) + 1
     horizon = phase * self.curriculum_window_size
     if self.curriculum_max_horizon > 0:
       horizon = min(horizon, self.curriculum_max_horizon)
