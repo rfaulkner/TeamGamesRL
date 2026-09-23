@@ -577,6 +577,7 @@ def evaluate_dense_chain(
     horizon: int = 4,
     discount: float = 0.9,
     llm_partner_response: bool = False,
+    partner_action: Optional[int] = None,
 ) -> float:
   """Evaluate a chosen action plus a short heuristic continuation.
 
@@ -595,10 +596,10 @@ def evaluate_dense_chain(
   where r_0 is the dense reward for ``chosen_action`` and r_1..r_h
   are the dense rewards for the heuristic player's subsequent moves.
 
-  When ``llm_partner_response`` is True, the first continuation
-  turn (the partner's response to the chosen action) uses the
-  frozen LLM policy instead of SafePlayPlayer.  This captures
-  whether the partner can actually exploit hints or play setups.
+  When ``partner_action`` is provided, it is directly used for the
+  first continuation turn. Otherwise, when ``llm_partner_response`` is
+  True, the first continuation turn (the partner's response) is sampled
+  from the frozen LLM policy.
 
   Args:
     runner: The ``GRPORunner`` instance (for environment and config).
@@ -611,6 +612,8 @@ def evaluate_dense_chain(
     discount: Discount factor gamma for future action rewards.
     llm_partner_response: If True, use frozen LLM policy for the first
         continuation turn (the partner's immediate response).
+    partner_action: Pre-computed action ID for the partner's immediate
+        continuation turn. If given, avoids sampling an LLM action.
 
   Returns:
     The total discounted dense reward.
@@ -664,13 +667,16 @@ def evaluate_dense_chain(
     if not legal:
       break
 
-    # For the first continuation turn, optionally use the LLM
-    # (the partner's response to our action).
-    if first_continuation and llm_partner_response:
+    # For the first continuation turn, optionally use the precomputed
+    # or sampled LLM partner action.
+    if first_continuation and (partner_action is not None or llm_partner_response):
       first_continuation = False
-      from learn.grpo_sampled import _sample_llm_partner_action  # pylint: disable=g-import-not-at-top
-      h_action = _sample_llm_partner_action(runner, state)
-      if h_action is None:
+      if partner_action is not None:
+        h_action = partner_action
+      else:
+        from learn.grpo_sampled import _sample_llm_partner_action  # pylint: disable=g-import-not-at-top
+        h_action = _sample_llm_partner_action(runner, state)
+      if h_action is None or h_action not in legal:
         h_action = int(np.random.choice(legal))
     else:
       first_continuation = False

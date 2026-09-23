@@ -1556,6 +1556,7 @@ def _compute_action_reward(
     ser_state: str | None,
     action_history: list[int],
     pass_idx: int,
+    partner_action: int | None = None,
 ) -> float:
   """Compute the scalar reward for an action given the runner's simulation config."""
   if not parsed:
@@ -1594,6 +1595,7 @@ def _compute_action_reward(
           horizon=horizon,
           discount=discount,
           llm_partner_response=runner._config.llm_partner_response,
+          partner_action=partner_action,
       )
 
     if blend_w > 0:
@@ -1616,7 +1618,12 @@ def _compute_action_reward(
       if runner._config.llm_partner_response and policy_turns < 2:
         policy_turns = 2
       if not blend_state.is_terminal():
-        _rollout_policy_turns(runner, blend_state, policy_turns - 1)
+        if partner_action is not None and policy_turns >= 2:
+          blend_state.apply_action(partner_action)
+          if policy_turns > 2 and not blend_state.is_terminal():
+            _rollout_policy_turns(runner, blend_state, policy_turns - 2)
+        else:
+          _rollout_policy_turns(runner, blend_state, policy_turns - 1)
 
       survival_exp = runner._config.reward_survival_exponent
       lives_after = None
@@ -1740,6 +1747,115 @@ def _train_grpo_on_prompts(
     group_records = []  # one dict per completion, for the group/z-score dump
     _action_type_tracker = {}  # prompt_text -> {play, discard, hint, total}
     cache_hits = 0
+    # ── Batch pre-sample LLM partner actions for all unique queries ──
+    partner_actions_by_key = {}
+    if runner._config.llm_partner_response:
+      needed_queries = {}
+      for i, completion in enumerate(completions):
+        prompt_text = (
+            prompts[i] if prompts is not None and i < len(prompts) else ''
+        )
+        metadata = runner._prompt_metadata.get(prompt_text, {})
+        legal_actions_desc = metadata.get('legal_actions_desc', [])
+        p_id = metadata.get('player_id', 0)
+        ser_state = metadata.get('serialized_state', None)
+        action_history = metadata.get('action_history', [])
+
+        if hasattr(completion, 'text'):
+          comp_text = completion.text
+        elif isinstance(completion, list):
+          comp_text = runner._backend.tokenizer.decode(
+              completion, skip_special_tokens=True
+          )
+        else:
+          comp_text = str(completion)
+
+        action_id = runner._renderers[p_id].parse_action(
+            comp_text, legal_actions_desc
+        )
+        if action_id is not None:
+          cache_key = (prompt_text, action_id)
+          if cache_key not in needed_queries:
+            needed_queries[cache_key] = (
+                ser_state, action_history, action_id, p_id
+            )
+
+      if needed_queries:
+        batch_keys = []
+        batch_prompts = []
+        batch_legal_descs = []
+        batch_partner_ids = []
+
+        for key, (ser_state, action_history, action_id, p_id) in needed_queries.items():
+          if ser_state is not None:
+            _, step_state = _deserialize_game_and_state(ser_state)
+          else:
+            runner._env.reset()
+            step_state = runner._env._state
+            for a in action_history:
+              if step_state.is_terminal():
+                break
+              step_state.apply_action(a)
+            step_state = runner._env._state
+
+          if not step_state.is_terminal():
+            step_state.apply_action(action_id)
+
+          if step_state.is_terminal():
+            partner_actions_by_key[key] = None
+            continue
+
+          partner_id = step_state.current_player()
+          legal = step_state.legal_actions(partner_id)
+          if not legal:
+            partner_actions_by_key[key] = None
+            continue
+
+          state_text = runner._renderers[partner_id].render_state(
+              step_state, partner_id, runner._env.game
+          )
+          legal_actions_with_desc = runner._renderers[
+              partner_id
+          ].render_legal_actions(step_state, partner_id, runner._env.game)
+          legal_actions = [a for a, _ in legal_actions_with_desc]
+          action_descriptions = [d for _, d in legal_actions_with_desc]
+
+          partner_prompt = runner._agents[partner_id]._build_prompt(
+              state_text, legal_actions, action_descriptions
+          )
+          batch_keys.append(key)
+          batch_prompts.append(partner_prompt)
+          batch_legal_descs.append(legal_actions_with_desc)
+          batch_partner_ids.append(partner_id)
+
+        if batch_prompts:
+          with _frozen_lora_active(runner):
+            if hasattr(runner._backend, 'generate_batch'):
+              responses = runner._backend.generate_batch(
+                  batch_prompts,
+                  temperature=runner._current_temperature,
+                  max_tokens=runner._config.max_completion_length,
+              )
+            else:
+              responses = [
+                  runner._backend.generate(
+                      p,
+                      temperature=runner._current_temperature,
+                      max_tokens=runner._config.max_completion_length,
+                  )
+                  for p in batch_prompts
+              ]
+
+          for k_idx, key in enumerate(batch_keys):
+            resp = responses[k_idx]
+            descs = batch_legal_descs[k_idx]
+            pid = batch_partner_ids[k_idx]
+            p_act = runner._renderers[pid].parse_action(resp, descs)
+            if p_act is None:
+              legals = [a for a, _ in descs]
+              p_act = int(np.random.choice(legals)) if legals else 0
+            partner_actions_by_key[key] = p_act
+
     for i, completion in enumerate(completions):
       prompt_text = (
           prompts[i] if prompts is not None and i < len(prompts) else ''
@@ -1875,6 +1991,7 @@ def _train_grpo_on_prompts(
           ser_state=ser_state,
           action_history=action_history,
           pass_idx=pass_idx,
+          partner_action=partner_actions_by_key.get(cache_key, None),
       )
 
       reward_tensor = torch.tensor(float(reward))
