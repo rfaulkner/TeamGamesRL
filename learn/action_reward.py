@@ -48,7 +48,6 @@ For chained dense evaluation over a short rollout::
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from absl import logging
@@ -265,17 +264,13 @@ def _evaluate_discard(
 ) -> float:
   """Evaluate a Discard action by checking the card's strategic value.
 
-  Uses the game state to determine:
-    - Is the card already played (dead)? -> safe discard.
-    - Is it the last copy of a still-needed card? -> critical loss.
-    - Is it currently playable? -> wasted opportunity.
-    - Was it hinted and potentially playable? -> penalise wasting hints.
-    - Otherwise: routine discard.
-
-  The knowledge-aware penalties address the *hint-then-discard* degenerate
-  loop: if the team invested information tokens to hint a card and the
-  player discards it anyway, the penalty is much harsher than discarding
-  an unhinted card.
+  Uses the game state and player observation to determine:
+    - Is the card already played (dead)? -> safe discard (+0.35 + token bonus).
+    - Was it hinted and known playable? -> severe penalty (-0.8).
+    - Was it hinted and the last copy? -> critical loss (-0.6).
+    - Was it unhinted? -> routine discard to regain clues (+0.15 to +0.30),
+      with token scarcity bonus. The player cannot see unhinted cards,
+      so unhinted discards are not heavily penalized for hidden playable status.
 
   Args:
     state: The pre-action state.
@@ -284,69 +279,74 @@ def _evaluate_discard(
     card_pos: The card's position in hand (0-indexed).
 
   Returns:
-    A reward in [-1.0, +0.3].
+    A reward in [-0.8, +0.5].
   """
-  # We need to know the actual card being discarded.
-  # The acting player can't see their own cards, but the *state* knows.
-  # We clone and inspect the discard pile to identify the card.
+  info_tokens = state.information_tokens()
+  # Regaining info tokens is more valuable when the team is clue-starved.
+  if info_tokens <= 2:
+    token_bonus = 0.15
+  elif info_tokens <= 5:
+    token_bonus = 0.05
+  else:
+    token_bonus = 0.0
+
   fireworks = _parse_fireworks_from_state(state, player_id)
 
   sim = state.clone()
   sim.apply_action(action_id)
 
   # ── Knowledge-aware penalty ──
-  # Check if the player had hints about this card and whether those
-  # hints indicate the card could be playable.
   obs_str = state.observation_string(player_id)
   card_knowledge = _CARD_KNOWLEDGE_RE.findall(obs_str)
   is_hinted, playable_frac = _card_playability_from_knowledge(
       card_knowledge, card_pos, fireworks
   )
 
-  # Identify the discarded card by diffing the observation.
-  # After a discard, the card appears in the discard pile.
   discarded_card = _identify_discarded_card(state, sim, player_id)
   if discarded_card is None:
-    # Can't determine the card -- give a small positive reward
-    # (discarding regains an info token, which has some value).
-    return 0.05
+    return 0.10 + token_bonus
 
   card_color, card_rank = discarded_card
 
   # Case 1: Card is already played (rank <= firework height).
   fw_height = fireworks.get(card_color, 0)
   if card_rank <= fw_height:
-    return 0.3  # Dead card -- excellent discard (even if hinted).
+    return 0.35 + token_bonus  # Dead card -- excellent safe discard.
 
-  # Case 2: Card is currently playable (rank == firework height + 1).
-  if card_rank == fw_height + 1:
-    if is_hinted and playable_frac >= 0.5:
+  # Case 2: Card was HINTED (player had information about this card).
+  if is_hinted:
+    if playable_frac >= 0.5:
       # Player had strong hints suggesting playability -- severe penalty.
-      return -1.0
-    return -0.7  # Discarding a playable card without good hints.
+      return -0.8
+    remaining = _count_remaining_copies(
+        state, sim, card_color, card_rank, player_id
+    )
+    if remaining == 0:
+      # Hinted last copy -- team invested info tokens, critical loss.
+      return -0.6
+    if playable_frac > 0:
+      # Hinted with playable potential.
+      return -0.25
+    # Hinted, but known not playable right now.
+    return 0.10 + token_bonus
 
-  # Case 3: Card is the last copy of a still-needed card.
+  # Case 3: Card was UNHINTED (player had no knowledge of this card).
+  # In Hanabi, players must discard unhinted cards to regain info tokens.
+  # Do not severely penalize the player for hidden state they cannot observe.
   remaining = _count_remaining_copies(
       state, sim, card_color, card_rank, player_id
   )
   if remaining == 0:
-    # This was the last copy and we just discarded it.
-    if is_hinted:
-      return -0.8  # Hinted last copy -- team invested info tokens.
-    return -0.5  # Permanently reduces maximum achievable score.
+    # Unhinted last copy lost. Unfortunate, but player had no information.
+    return -0.15 if info_tokens > 2 else -0.05
 
-  # Case 4: Hinted card with playable potential (not yet playable,
-  # but knowledge suggests it could be useful soon).
-  if is_hinted and playable_frac > 0:
-    return -0.3  # Wasting a partially-useful hinted card.
+  if card_rank == fw_height + 1:
+    # Unhinted card happened to be currently playable.
+    # When tokens are low (<= 2), discard was necessary to unblock the team.
+    return 0.10 if info_tokens <= 2 else 0.0
 
-  # Case 5: Hinted card with no playable potential.
-  if is_hinted:
-    return 0.0  # Neutral -- hinted but not useful right now.
-
-  # Case 6: Unhinted card with other copies remaining.
-  # Mildly positive -- regains info token, not critical.
-  return 0.1
+  # Routine unhinted discard with remaining copies.
+  return 0.15 + token_bonus
 
 
 def _parse_fireworks_from_state(state, player_id: int) -> dict[str, int]:
