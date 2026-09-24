@@ -81,7 +81,8 @@ REASONING="false"
 EVAL_BATCH_SIZE=8
 CURRICULUM_WINDOW_SIZE=4
 CURRICULUM_PASSES_PER_PHASE=2
-CURRICULUM_MAX_HORIZON=30
+CURRICULUM_MAX_HORIZON=0
+CURRICULUM_MAX_LOOKBACK=0
 CURRICULUM_REPLAY_RATIO="0.30"
 TRUNCATED_ROLLOUT_HORIZON=""
 # ── 1. Determine profile first ───────────────────────────────────────────────
@@ -155,6 +156,7 @@ for arg in "$@"; do
     --curriculum_window_size=*) CURRICULUM_WINDOW_SIZE="${arg#*=}" ;;
     --curriculum_passes_per_phase=*) CURRICULUM_PASSES_PER_PHASE="${arg#*=}" ;;
     --curriculum_max_horizon=*) CURRICULUM_MAX_HORIZON="${arg#*=}" ;;
+    --curriculum_max_lookback=*) CURRICULUM_MAX_LOOKBACK="${arg#*=}" ;;
     --curriculum_replay_ratio=*) CURRICULUM_REPLAY_RATIO="${arg#*=}" ;;
     --truncated_rollout_horizon=*|--grpo_truncated_rollout_horizon=*)
       TRUNCATED_ROLLOUT_HORIZON="${arg#*=}" ;;
@@ -256,6 +258,7 @@ echo " [Curriculum]"
 echo "  Curriculum Window Size:      ${CURRICULUM_WINDOW_SIZE}"
 echo "  Passes Per Phase:            ${CURRICULUM_PASSES_PER_PHASE}"
 echo "  Curriculum Max Horizon:      ${CURRICULUM_MAX_HORIZON}"
+echo "  Curriculum Max Lookback:     ${CURRICULUM_MAX_LOOKBACK}"
 echo "  Curriculum Replay Ratio:     ${CURRICULUM_REPLAY_RATIO}"
 echo ""
 echo " [Extra Flags / Overrides]"
@@ -335,6 +338,7 @@ python3 trainer/gemma_rl_trainer.py \
   --curriculum_window_size="${CURRICULUM_WINDOW_SIZE}" \
   --curriculum_passes_per_phase="${CURRICULUM_PASSES_PER_PHASE}" \
   --curriculum_max_horizon="${CURRICULUM_MAX_HORIZON}" \
+  --curriculum_max_lookback="${CURRICULUM_MAX_LOOKBACK}" \
   --curriculum_replay_ratio="${CURRICULUM_REPLAY_RATIO}" \
   ${TRUNCATED_FLAG} \
   --max_seq_len="${MAX_SEQ_LEN}" \

@@ -660,6 +660,20 @@ class RLTrainer:
     else:
       eval_plan = [(None, 'Self-Play')] * num_episodes
 
+    if eval_llm_max_horizon is not None:
+      logging.info(
+          '[evaluate] Running %d episodes: LLM plays turns [0, %d); heuristic'
+          ' bot plays turns [%d, terminal).',
+          len(eval_plan),
+          eval_llm_max_horizon,
+          eval_llm_max_horizon,
+      )
+    else:
+      logging.info(
+          '[evaluate] Running %d episodes: LLM plays all turns (no horizon handover).',
+          len(eval_plan),
+      )
+
     mode_rewards: dict[str, list[float]] = {}
 
     if self.eval_batch_size > 1 and hasattr(self.backend, 'generate_batch'):

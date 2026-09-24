@@ -438,8 +438,13 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer(
     'curriculum_max_horizon',
-    30,
-    'Maximum turn horizon for curriculum training.',
+    0,
+    'Maximum turn horizon for curriculum training (0 = uncapped, train to end of game).',
+)
+flags.DEFINE_integer(
+    'curriculum_max_lookback',
+    0,
+    'Maximum turn lookback distance from active window for replay sampling (0 = unlimited).',
 )
 flags.DEFINE_float(
     'curriculum_replay_ratio',
@@ -575,6 +580,7 @@ def _print_experiment_configuration(
           'curriculum_window_size',
           'curriculum_passes_per_phase',
           'curriculum_max_horizon',
+          'curriculum_max_lookback',
           'curriculum_replay_ratio',
       ]),
       ('REINFORCE (if active)', [
@@ -727,6 +733,7 @@ def main(argv: list[str]) -> None:
         curriculum_window_size=FLAGS.curriculum_window_size,
         curriculum_passes_per_phase=FLAGS.curriculum_passes_per_phase,
         curriculum_max_horizon=FLAGS.curriculum_max_horizon,
+        curriculum_max_lookback=FLAGS.curriculum_max_lookback,
         curriculum_replay_ratio=FLAGS.curriculum_replay_ratio,
     )
     # ── Tiny Hanabi-specific tuning ──

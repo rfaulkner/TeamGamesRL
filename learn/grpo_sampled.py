@@ -82,6 +82,29 @@ def collect_game_prompts(
   num_players = runner._game_config.num_players
   ep_rewards = []
 
+  max_horizon = getattr(
+      runner._config, 'get_curriculum_horizon', lambda p: 1000
+  )(pass_idx)
+  window_size = getattr(runner._config, 'curriculum_window_size', 0)
+  if window_size > 0:
+    start_turn, end_turn = runner._config.get_curriculum_active_window(pass_idx)
+    logging.info(
+        '[curriculum collection] Pass %d: collecting %d episodes up to horizon'
+        ' turn %d (active window: turns [%d, %d))',
+        pass_idx,
+        num_episodes,
+        max_horizon,
+        start_turn,
+        end_turn,
+    )
+  else:
+    logging.info(
+        '[curriculum collection] Pass %d: collecting %d episodes to game'
+        ' completion (no curriculum)',
+        pass_idx,
+        num_episodes,
+    )
+
   for ep in range(1, num_episodes + 1):
     time_step = runner._env.reset()
     action_history = []
@@ -92,7 +115,6 @@ def collect_game_prompts(
       # Alternating roles: odd episodes -> P1 is bot; even episodes -> P0 is bot.
       bot_player = 1 if ep % 2 == 1 else 0
 
-    max_horizon = getattr(runner._config, 'get_curriculum_horizon', lambda p: 1000)(pass_idx)
     while not time_step.last():
       if len(action_history) >= max_horizon:
         break
@@ -184,6 +206,7 @@ def collect_game_prompts(
             'legal_actions_desc': legal_actions_with_desc,
             'state_text': state_text,
             'turn_index': len(action_history),
+            'episode': ep,
             'serialized_state': _serialize_game_and_state(
                 runner._env.game, state
             ),
@@ -2377,6 +2400,50 @@ def run_sampled(runner) -> None:
         if param.requires_grad
     }
 
+    curriculum_ws = getattr(runner._config, 'curriculum_window_size', 0)
+    if curriculum_ws > 0:
+      c_phase = (
+          (pass_idx - 1) // max(1, runner._config.curriculum_passes_per_phase)
+      ) + 1
+      c_start, c_end = runner._config.get_curriculum_active_window(pass_idx)
+      c_max_lb = getattr(runner._config, 'curriculum_max_lookback', 0)
+      c_lb_start = max(0, c_start - c_max_lb) if c_max_lb > 0 else 0
+      c_max_h = getattr(runner._config, 'curriculum_max_horizon', 0)
+      c_max_h_str = (
+          f'{c_max_h}' if c_max_h > 0 else '0 (uncapped, train to end of game)'
+      )
+      logging.info(
+          '=== Pass %d/%d (Curriculum Phase %d) ===\n'
+          '  Curriculum Window: turns [%d, %d) (size %d, %d passes/phase)\n'
+          '  Lookback Window:   turns [%d, %d) (max lookback: %s, replay'
+          ' ratio: %.2f)\n'
+          '  Max Horizon:       %s (collection horizon: turn %d)\n'
+          '  Eval Handover:     turn %d (LLM plays [0, %d), bot plays [%d,'
+          ' terminal))',
+          pass_idx,
+          runner._config.passes,
+          c_phase,
+          c_start,
+          c_end,
+          curriculum_ws,
+          runner._config.curriculum_passes_per_phase,
+          c_lb_start,
+          c_start,
+          f'{c_max_lb} turns' if c_max_lb > 0 else 'unlimited [0, start_turn)',
+          runner._config.curriculum_replay_ratio,
+          c_max_h_str,
+          c_end,
+          c_end,
+          c_end,
+          c_end,
+      )
+    else:
+      logging.info(
+          '=== Pass %d/%d (No Curriculum: full episodes) ===',
+          pass_idx,
+          runner._config.passes,
+      )
+
     # ── Step 1: Collect prompts ──
     runner._backend.model.eval()
     prompt_entries, collect_stats = collect_game_prompts(
@@ -2425,56 +2492,149 @@ def run_sampled(runner) -> None:
     # Curriculum window calculation:
     window_size = getattr(runner._config, 'curriculum_window_size', 0)
     if window_size > 0:
-      start_turn, end_turn = runner._config.get_curriculum_active_window(pass_idx)
+      start_turn, end_turn = runner._config.get_curriculum_active_window(
+          pass_idx
+      )
       replay_ratio = getattr(runner._config, 'curriculum_replay_ratio', 0.30)
+      max_lookback = getattr(runner._config, 'curriculum_max_lookback', 0)
+      lookback_start = (
+          max(0, start_turn - max_lookback) if max_lookback > 0 else 0
+      )
       logging.info(
-          '[curriculum] Pass %d: active window turns [%d, %d), max horizon %d, replay ratio %.2f',
+          '[curriculum] Pass %d: active window turns [%d, %d), lookback [%d,'
+          ' %d) (max lookback: %s), replay ratio %.2f',
           pass_idx,
           start_turn,
           end_turn,
-          end_turn,
+          lookback_start,
+          start_turn,
+          f'{max_lookback} turns' if max_lookback > 0 else 'unlimited',
           replay_ratio,
       )
     else:
       start_turn, end_turn = 0, 1000
       replay_ratio = 0.0
+      max_lookback = 0
 
     def _sample_curriculum_prompts(entries: list[dict]) -> list[str]:
       """Selects unique prompts balancing active window and replay history."""
       if window_size <= 0 or not entries:
         return list({e['prompt'] for e in entries})
 
+      all_prompts = list({e['prompt'] for e in entries})
+      max_game_length = max(
+          (e.get('turn_index', 0) + 1 for e in entries), default=0
+      )
+      lookback_s = max(0, start_turn - max_lookback) if max_lookback > 0 else 0
+
       active_entries = [
           e for e in entries if start_turn <= e.get('turn_index', 0) < end_turn
       ]
       replay_entries = [
-          e for e in entries if e.get('turn_index', 0) < start_turn
+          e
+          for e in entries
+          if lookback_s <= e.get('turn_index', 0) < start_turn
       ]
 
       active_prompts = list({e['prompt'] for e in active_entries})
       replay_prompts = list({e['prompt'] for e in replay_entries})
 
-      if not replay_prompts or start_turn == 0:
-        return active_prompts or list({e['prompt'] for e in entries})
+      # Budget calculation:
+      num_episodes = getattr(runner._config, 'collect_episodes', 1)
+      if getattr(runner._config, 'per_player_updates', False):
+        num_players = getattr(runner._env, 'num_players', 2)
+        active_target = max(
+            1, int(round((window_size * num_episodes) / num_players))
+        )
+      else:
+        active_target = max(1, window_size * num_episodes)
 
-      # Allocate 70% active window, 30% replay
-      total_target = max(len(active_prompts) + len(replay_prompts), 1)
-      n_replay = max(1, int(total_target * replay_ratio))
-      n_active = max(1, total_target - n_replay)
+      clamped_ratio = min(max(0.0, replay_ratio), 0.99)
+      max_updates = (
+          int(round(active_target / (1.0 - clamped_ratio)))
+          if clamped_ratio < 1.0
+          else active_target * 2
+      )
+      lookback_target = max(0, max_updates - active_target)
 
-      selected_active = list(np.random.choice(
-          active_prompts, size=min(len(active_prompts), n_active), replace=False
-      )) if active_prompts else []
-      selected_replay = list(np.random.choice(
-          replay_prompts, size=min(len(replay_prompts), n_replay), replace=False
-      )) if replay_prompts else []
+      # ── Case 1: Active window completely falls out of collected episodes ──
+      max_horizon_cfg = getattr(runner._config, 'curriculum_max_horizon', 0)
+      is_completely_out = max_horizon_cfg <= 0 and (
+          start_turn >= max_game_length or not active_prompts
+      )
+      if is_completely_out:
+        n_sample = min(len(all_prompts), max_updates)
+        selected = (
+            list(np.random.choice(all_prompts, size=n_sample, replace=False))
+            if all_prompts
+            else []
+        )
+        logging.info(
+            '[curriculum] Pass %d: active window [%d, %d) completely out of'
+            ' collected episodes (game max turn %d). Curriculum completed!'
+            ' Uniformly sampling %d prompts across all turns (budget: %d = %d'
+            ' active + %d lookback).',
+            pass_idx,
+            start_turn,
+            end_turn,
+            max_game_length,
+            len(selected),
+            max_updates,
+            active_target,
+            lookback_target,
+        )
+        return selected
 
-      selected = list(set(selected_active + selected_replay))
+      # ── Case 2: Active window partially or fully within collected episodes ──
+      # 1. Sample from active window (up to active_target)
+      n_active = min(len(active_prompts), active_target)
+      selected_active = (
+          list(np.random.choice(active_prompts, size=n_active, replace=False))
+          if n_active > 0
+          else []
+      )
+
+      # 2. Sample from lookback / replay window (up to lookback_target)
+      if start_turn > 0 and replay_prompts and lookback_target > 0:
+        avail_replay = list(set(replay_prompts) - set(selected_active))
+        n_replay = min(len(avail_replay), lookback_target)
+        selected_replay = (
+            list(np.random.choice(avail_replay, size=n_replay, replace=False))
+            if n_replay > 0
+            else []
+        )
+      else:
+        selected_replay = []
+
+      selected_so_far = set(selected_active + selected_replay)
+
+      # 3. If active window is partially out (or pool has shortfall),
+      # distribute missed points back across any decision points in collected episodes uniformly.
+      target_total = min(len(all_prompts), max_updates)
+      shortfall = target_total - len(selected_so_far)
+      extra_prompts = []
+      if shortfall > 0:
+        remaining_pool = list(set(all_prompts) - selected_so_far)
+        n_extra = min(len(remaining_pool), shortfall)
+        if n_extra > 0:
+          extra_prompts = list(
+              np.random.choice(remaining_pool, size=n_extra, replace=False)
+          )
+
+      selected = list(selected_so_far | set(extra_prompts))
       logging.info(
-          '[curriculum] Sampled %d prompts (%d active window, %d replay)',
+          '[curriculum] Sampled %d prompts (%d active [%d, %d), %d replay'
+          ' [%d, %d), %d redistributed uniformly from missed turns; target'
+          ' budget: %d)',
           len(selected),
           len(selected_active),
+          start_turn,
+          end_turn,
           len(selected_replay),
+          lookback_s,
+          start_turn,
+          len(extra_prompts),
+          max_updates,
       )
       return selected
 
@@ -2543,6 +2703,21 @@ def run_sampled(runner) -> None:
     eval_kwargs = {}
     if horizon is not None:
       eval_kwargs['eval_llm_max_horizon'] = horizon
+      logging.info(
+          '[curriculum evaluation] Pass %d: evaluating %d episodes. LLM plays'
+          ' turns [0, %d); heuristic bot plays remainder [%d, terminal).',
+          pass_idx,
+          runner._config.num_eval_episodes,
+          horizon,
+          horizon,
+      )
+    else:
+      logging.info(
+          '[curriculum evaluation] Pass %d: evaluating %d episodes with LLM'
+          ' for all turns (no curriculum horizon limit).',
+          pass_idx,
+          runner._config.num_eval_episodes,
+      )
     try:
       eval_metrics = runner._evaluate_fn(
           runner._config.num_eval_episodes, **eval_kwargs

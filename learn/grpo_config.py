@@ -541,10 +541,18 @@ class GRPOConfig:
   curriculum_passes_per_phase: int = 2
   """Number of GRPO passes to spend on each phase before advancing horizon."""
 
-  curriculum_max_horizon: int = 30
-  """Maximum turn horizon for curriculum training.
+  curriculum_max_horizon: int = 0
+  """Maximum turn horizon for curriculum training (0 = uncapped, train to end of game).
 
   Once reached, collection and training cover up to this turn (or full game).
+  """
+
+  curriculum_max_lookback: int = 0
+  """Maximum turn lookback distance from the active window for replay sampling.
+
+  If > 0, replay decision points are only sampled from turns in
+  [max(0, start_turn - curriculum_max_lookback), start_turn).
+  If 0 (default), replay points can be sampled from all earlier turns [0, start_turn).
   """
 
   curriculum_replay_ratio: float = 0.30
