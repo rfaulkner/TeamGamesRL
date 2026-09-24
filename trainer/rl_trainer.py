@@ -201,6 +201,11 @@ class RLTrainer:
       with open(config_path, 'w') as f:
         json.dump(self._experiment_config, f, indent=2)
       logging.info('Experiment config written to %s', config_path)
+      print(
+          f'Experiment config ({len(self._experiment_config)} parameters)'
+          f' written to {config_path}',
+          flush=True,
+      )
 
     # Initialize training metrics CSV.
     self._train_csv_path = os.path.join(

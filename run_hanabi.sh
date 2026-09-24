@@ -35,6 +35,9 @@
 
 set -euo pipefail
 
+# Save original CLI invocation for logging in .out file
+CLI_ARGS=("$@")
+
 # ── Parse arguments with defaults ────────────────────────────────────────────
 
 GAME="tiny_hanabi"
@@ -90,22 +93,25 @@ source .venv/bin/activate
 
 # ── Print run info ───────────────────────────────────────────────────────────
 
-echo "============================================"
-echo " Hanabi RL — SLURM Job ${SLURM_JOB_ID}"
-echo "============================================"
-echo "  Game:         ${GAME}"
-echo "  Model:        ${MODEL_ID}"
-echo "  LoRA rank:    ${LORA_RANK}"
-echo "  LR:           ${LR}"
-echo "  Episodes:     ${NUM_EPISODES}"
-echo "  GRPO Passes:  ${GRPO_PASSES}"
-echo "  Max Seq Len:  ${MAX_SEQ_LEN}"
-echo "  Output dir:   ${output_dir}"
-echo "  Node:         $(hostname)"
-echo "  GPUs:         ${CUDA_VISIBLE_DEVICES:-N/A}"
-echo "  Python:       $(which python3)"
-echo "  PyTorch CUDA: $(python3 -c 'import torch; print(torch.cuda.is_available())')"
-echo "============================================"
+echo "=============================================================================="
+echo " Hanabi RL — SLURM Job ${SLURM_JOB_ID:-N/A} (${SLURM_JOB_NAME:-hanabi-rl})"
+echo " Started:      $(date)"
+echo " Node:         $(hostname)"
+echo " GPUs:         ${CUDA_VISIBLE_DEVICES:-N/A}"
+echo " Invocation:   $0 ${CLI_ARGS[*]:-<none>}"
+echo "=============================================================================="
+echo "  Game:                        ${GAME}"
+echo "  Model:                       ${MODEL_ID}"
+echo "  LoRA rank:                   ${LORA_RANK} (alpha=$((LORA_RANK * 2)))"
+echo "  Learning Rate (LR):          ${LR}"
+echo "  Episodes:                    ${NUM_EPISODES}"
+echo "  GRPO Passes:                 ${GRPO_PASSES}"
+echo "  Max Seq Len:                 ${MAX_SEQ_LEN}"
+echo "  Extra Flags:                 ${EXTRA_FLAGS:-<none>}"
+echo "  Output Dir:                  ${output_dir}"
+echo "  Python:                      $(which python3)"
+echo "  PyTorch CUDA:                $(python3 -c 'import torch; print(torch.cuda.is_available())')"
+echo "=============================================================================="
 
 # ── Create output directories ────────────────────────────────────────────────
 
@@ -126,6 +132,7 @@ mkdir -p slurm/output
 
 # ── Run training ─────────────────────────────────────────────────────────────
 
+echo "Launching training process: python3 trainer/gemma_rl_trainer.py ..."
 python3 trainer/gemma_rl_trainer.py \
   --rl_algorithm=grpo \
   --game="${GAME}" \

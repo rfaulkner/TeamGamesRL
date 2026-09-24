@@ -27,6 +27,8 @@ Usage:
 """
 
 import dataclasses
+import sys
+from typing import Any
 
 from absl import app
 from absl import flags
@@ -450,8 +452,163 @@ flags.DEFINE_integer(
     'Turns played by SafeBeliefLookaheadPlayer at the horizon boundary.',
 )
 # ============================================================================
-# Entry point
+# Entry point & Configuration Logging
 # ============================================================================
+
+
+def _get_experiment_flags() -> tuple[dict[str, Any], dict[str, Any]]:
+  """Extracts all module flags and explicitly set CLI flags.
+
+  Returns:
+    (all_flags, explicit_flags) dictionaries mapping flag name to value.
+  """
+  all_flags = {}
+  explicit_flags = {}
+  for mod, flag_list in FLAGS.flags_by_module_dict().items():
+    if mod in (__name__, '__main__', sys.argv[0]) or 'gemma_rl_trainer' in str(mod):
+      for f in flag_list:
+        all_flags[f.name] = f.value
+        if f.present:
+          explicit_flags[f.name] = f.value
+
+  # Fallback: if empty for any reason, collect all non-internal absl flags
+  if not all_flags:
+    for name in FLAGS:
+      if not name.startswith(
+          ('log', 'run_with', 'pdb', 'test', 'xml', 'help', 'undefok', 'profile_file')
+      ):
+        f = FLAGS[name]
+        all_flags[name] = f.value
+        if f.present:
+          explicit_flags[name] = f.value
+
+  return all_flags, explicit_flags
+
+
+def _print_experiment_configuration(
+    all_flags: dict[str, Any], explicit_flags: dict[str, Any]
+) -> None:
+  """Prints structured flags and parameters to stdout (captured in .out log)."""
+  print('=' * 80, flush=True)
+  print(' TeamGamesRL — Run Configuration & Hyperparameters', flush=True)
+  print('=' * 80, flush=True)
+
+  if explicit_flags:
+    print(' [CLI Overrides / Explicitly Set Flags]', flush=True)
+    for name in sorted(explicit_flags.keys()):
+      print(f'   --{name}={explicit_flags[name]}', flush=True)
+    print('', flush=True)
+
+  categories = [
+      ('Game & Model', [
+          'game',
+          'model_name',
+          'use_4bit',
+          'max_seq_len',
+          'lora_rank',
+          'lora_alpha',
+          'lora_dropout',
+          'initial_lora_checkpoint',
+          'seed',
+      ]),
+      ('Training & Schedule', [
+          'rl_algorithm',
+          'lr',
+          'num_episodes',
+          'max_grad_norm',
+          'kl_coeff',
+          'eval_every',
+          'num_eval_episodes',
+          'eval_batch_size',
+          'checkpoint_every',
+          'log_every',
+          'log_episodes_every',
+          'max_history_turns',
+          'output_dir',
+          'use_wandb',
+          'wandb_project',
+      ]),
+      ('Sampling & Exploration', [
+          'temperature',
+          'temperature_anneal_end',
+          'temperature_floor',
+          'epsilon',
+          'epsilon_anneal_end',
+      ]),
+      ('GRPO Configuration', [
+          'grpo_passes',
+          'grpo_collect_episodes',
+          'grpo_num_generations',
+          'grpo_train_epochs',
+          'grpo_max_completion_length',
+          'grpo_scale_rewards',
+          'grpo_exhaustive_groups',
+          'grpo_optimistic_alpha',
+          'grpo_optimistic_alpha_min',
+          'grpo_signal_entropy_coeff',
+          'grpo_phased_training',
+          'grpo_phase1_passes',
+          'grpo_phase2_passes',
+          'grpo_phase3_passes',
+          'grpo_convergence_patience',
+          'grpo_convergence_min_delta',
+          'grpo_pivot_decisions_per_episode',
+          'grpo_decision_priority_sampling',
+          'grpo_truncated_rollout_horizon',
+      ]),
+      ('Reward Simulation', [
+          'reward_simulation_mode',
+          'dense_chain_discount',
+          'reward_blend_weight',
+          'reward_rollout_samples',
+          'reward_rollout_common_seed',
+          'reward_survival_exponent',
+          'reward_turn_discount',
+          'reward_policy_turns',
+      ]),
+      ('Strategy, Diversity & Partner', [
+          'bot_partner',
+          'bot_type',
+          'llm_partner_response',
+          'reasoning',
+          'constrained_action_types',
+          'strategic_action_selection',
+          'strategic_action_mode',
+          'strategic_action_forced_ratio',
+      ]),
+      ('Curriculum', [
+          'curriculum_window_size',
+          'curriculum_passes_per_phase',
+          'curriculum_max_horizon',
+          'curriculum_replay_ratio',
+          'curriculum_boundary_rollout_turns',
+      ]),
+      ('REINFORCE (if active)', [
+          'gradient_accumulation_steps',
+          'baseline_window_size',
+      ]),
+  ]
+
+  printed_flags = set()
+  for cat_name, flag_names in categories:
+    cat_items = [(f, all_flags[f]) for f in flag_names if f in all_flags]
+    if cat_items:
+      print(f' [{cat_name}]', flush=True)
+      for fname, fval in cat_items:
+        printed_flags.add(fname)
+        present_mark = ' (explicit)' if fname in explicit_flags else ''
+        print(f'   {fname:<36} = {fval}{present_mark}', flush=True)
+      print('', flush=True)
+
+  remaining = [f for f in sorted(all_flags.keys()) if f not in printed_flags]
+  if remaining:
+    print(' [Other Flags]', flush=True)
+    for fname in remaining:
+      present_mark = ' (explicit)' if fname in explicit_flags else ''
+      print(f'   {fname:<36} = {all_flags[fname]}{present_mark}', flush=True)
+    print('', flush=True)
+
+  print('=' * 80, flush=True)
 
 
 def main(argv: list[str]) -> None:
@@ -460,6 +617,9 @@ def main(argv: list[str]) -> None:
 
   np.random.seed(FLAGS.seed)
   torch.manual_seed(FLAGS.seed)
+
+  all_flags, explicit_flags = _get_experiment_flags()
+  _print_experiment_configuration(all_flags, explicit_flags)
 
   logging.info('=== TeamGamesRL — Gemma 2B RL Training ===')
   logging.info('Game: %s', FLAGS.game)
@@ -491,76 +651,7 @@ def main(argv: list[str]) -> None:
   )
 
   # ── Build full experiment config for reproducibility ──
-  experiment_config = {
-      # Model configuration.
-      'model_name': FLAGS.model_name,
-      'use_4bit': FLAGS.use_4bit,
-      'max_seq_len': FLAGS.max_seq_len,
-      'lora_rank': FLAGS.lora_rank,
-      'lora_alpha': FLAGS.lora_alpha,
-      'lora_dropout': FLAGS.lora_dropout,
-      # Training configuration.
-      'rl_algorithm': FLAGS.rl_algorithm,
-      'game': FLAGS.game,
-      'num_episodes': FLAGS.num_episodes,
-      'lr': FLAGS.lr,
-      'temperature': FLAGS.temperature,
-      'max_grad_norm': FLAGS.max_grad_norm,
-      'kl_coeff': FLAGS.kl_coeff,
-      'seed': FLAGS.seed,
-      # Evaluation & logging.
-      'eval_every': FLAGS.eval_every,
-      'num_eval_episodes': FLAGS.num_eval_episodes,
-      'log_every': FLAGS.log_every,
-      'checkpoint_every': FLAGS.checkpoint_every,
-      'log_episodes_every': FLAGS.log_episodes_every,
-      'max_history_turns': FLAGS.max_history_turns,
-      # GRPO-specific configuration.
-      'grpo_passes': FLAGS.grpo_passes,
-      'grpo_collect_episodes': FLAGS.grpo_collect_episodes,
-      'grpo_num_generations': FLAGS.grpo_num_generations,
-      'grpo_train_epochs': FLAGS.grpo_train_epochs,
-      'grpo_max_completion_length': FLAGS.grpo_max_completion_length,
-      'grpo_exhaustive_groups': FLAGS.grpo_exhaustive_groups,
-      'grpo_optimistic_alpha': FLAGS.grpo_optimistic_alpha,
-      'grpo_optimistic_alpha_min': FLAGS.grpo_optimistic_alpha_min,
-      'grpo_signal_entropy_coeff': FLAGS.grpo_signal_entropy_coeff,
-      'grpo_phased_training': FLAGS.grpo_phased_training,
-      'grpo_phase1_passes': FLAGS.grpo_phase1_passes,
-      'grpo_phase2_passes': FLAGS.grpo_phase2_passes,
-      'grpo_phase3_passes': FLAGS.grpo_phase3_passes,
-      'grpo_convergence_patience': FLAGS.grpo_convergence_patience,
-      'grpo_convergence_min_delta': FLAGS.grpo_convergence_min_delta,
-      'grpo_pivot_decisions_per_episode': (
-          FLAGS.grpo_pivot_decisions_per_episode
-      ),
-      'grpo_decision_priority_sampling': (
-          FLAGS.grpo_decision_priority_sampling
-      ),
-      'grpo_truncated_rollout_horizon': FLAGS.grpo_truncated_rollout_horizon,
-      'reward_simulation_mode': FLAGS.reward_simulation_mode,
-      'dense_chain_discount': FLAGS.dense_chain_discount,
-      'reward_blend_weight': FLAGS.reward_blend_weight,
-      'reward_rollout_samples': FLAGS.reward_rollout_samples,
-      'reward_rollout_common_seed': FLAGS.reward_rollout_common_seed,
-      'reward_survival_exponent': FLAGS.reward_survival_exponent,
-      'reward_turn_discount': FLAGS.reward_turn_discount,
-      'reward_policy_turns': FLAGS.reward_policy_turns,
-      'grpo_scale_rewards': FLAGS.grpo_scale_rewards,
-      'constrained_action_types': FLAGS.constrained_action_types,
-      'strategic_action_selection': FLAGS.strategic_action_selection,
-      'strategic_action_mode': FLAGS.strategic_action_mode,
-      'strategic_action_forced_ratio': FLAGS.strategic_action_forced_ratio,
-      'llm_partner_response': FLAGS.llm_partner_response,
-      'bot_partner': FLAGS.bot_partner,
-      'bot_type': FLAGS.bot_type,
-      # REINFORCE-specific configuration.
-      'gradient_accumulation_steps': FLAGS.gradient_accumulation_steps,
-      'baseline_window_size': FLAGS.baseline_window_size,
-      # Infrastructure.
-      'output_dir': FLAGS.output_dir,
-      'use_wandb': FLAGS.use_wandb,
-  }
+  experiment_config = dict(all_flags)
 
   # ── Build trainer ──
   from trainer.rl_trainer import RLTrainer  # pylint: disable=g-import-not-at-top
@@ -684,17 +775,21 @@ def main(argv: list[str]) -> None:
           optimistic_reward_alpha_min=use_alpha_min,
           signal_entropy_coeff=use_entropy,
       )
-      logging.info(
+      override_msg = (
           'Applied Tiny Hanabi-specific GRPO overrides: passes=%d, '
           'exhaustive_groups=%s, alpha=[%.2f -> %.2f], '
-          'signal_entropy_coeff=%.3f, phased_training=%s',
-          grpo_config.passes,
-          grpo_config.exhaustive_groups,
-          grpo_config.optimistic_reward_alpha,
-          grpo_config.optimistic_reward_alpha_min,
-          grpo_config.signal_entropy_coeff,
-          grpo_config.phased_training,
+          'signal_entropy_coeff=%.3f, phased_training=%s'
+          % (
+              grpo_config.passes,
+              grpo_config.exhaustive_groups,
+              grpo_config.optimistic_reward_alpha,
+              grpo_config.optimistic_reward_alpha_min,
+              grpo_config.signal_entropy_coeff,
+              grpo_config.phased_training,
+          )
       )
+      logging.info(override_msg)
+      print(f'[CONFIG OVERRIDE] {override_msg}', flush=True)
       if grpo_config.phased_training:
         logging.info(
             '  Phased training: phase1=%d, phase2=%d, phase3=%d, '

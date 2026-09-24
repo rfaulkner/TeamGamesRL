@@ -44,6 +44,9 @@
 
 set -euo pipefail
 
+# Save original CLI invocation for logging in .out file
+CLI_ARGS=("$@")
+
 # ── Parse arguments with defaults ────────────────────────────────────────────
 
 GAME="hanabi"
@@ -196,26 +199,69 @@ pip install --quiet hanabi-learning-environment 2>/dev/null || true
 
 # ── Print run info ───────────────────────────────────────────────────────────
 
-echo "============================================"
-echo " Full Hanabi RL — SLURM Job ${SLURM_JOB_ID}"
-echo "============================================"
-echo "  Game:         ${GAME}"
-echo "  Model:        ${MODEL_ID}"
-echo "  LoRA rank:    ${LORA_RANK}"
-echo "  LR:           ${LR}"
-echo "  GRPO Passes:  ${GRPO_PASSES}"
-echo "  Collect eps:  ${COLLECT_EPISODES}"
-echo "  Generations:  ${NUM_GENERATIONS}"
-echo "  Max Seq Len:  ${MAX_SEQ_LEN}"
-echo "  Temperature:  ${TEMPERATURE} -> ${TEMPERATURE_ANNEAL_END}"
-echo "  Reward mode:  ${REWARD_MODE}"
-echo "  Profile:      ${PROFILE}"
-echo "  Output dir:   ${output_dir}"
-echo "  Node:         $(hostname)"
-echo "  GPUs:         ${CUDA_VISIBLE_DEVICES:-N/A}"
-echo "  Python:       $(which python3)"
-echo "  PyTorch CUDA: $(python3 -c 'import torch; print(torch.cuda.is_available())')"
-echo "============================================"
+echo "=============================================================================="
+echo " Full Hanabi RL — SLURM Job ${SLURM_JOB_ID:-N/A} (${SLURM_JOB_NAME:-hanabi-full-rl})"
+echo " Started:      $(date)"
+echo " Node:         $(hostname)"
+echo " GPUs:         ${CUDA_VISIBLE_DEVICES:-N/A}"
+echo " Invocation:   $0 ${CLI_ARGS[*]:-<none>}"
+echo "=============================================================================="
+echo " [Profile & Setup]"
+echo "  Profile:                     ${PROFILE}"
+echo "  Game:                        ${GAME}"
+echo "  Model:                       ${MODEL_ID}"
+echo "  LoRA rank:                   ${LORA_RANK} (alpha=$((LORA_RANK * 2)))"
+echo "  Max Seq Len:                 ${MAX_SEQ_LEN}"
+echo "  Max Completion Len:          ${MAX_COMPLETION_LENGTH}"
+echo "  4-bit Quantization:          true"
+echo "  Output Dir:                  ${output_dir}"
+echo ""
+echo " [Training & Schedule]"
+echo "  Learning Rate (LR):          ${LR}"
+echo "  GRPO Passes:                 ${GRPO_PASSES}"
+echo "  Collect Episodes/Pass:       ${COLLECT_EPISODES}"
+echo "  Completions/Group (K):       ${NUM_GENERATIONS}"
+echo "  Eval Every:                  50 passes"
+echo "  Num Eval Episodes:           ${NUM_EVAL_EPISODES}"
+echo "  Eval Batch Size:             ${EVAL_BATCH_SIZE}"
+echo "  Checkpoint Every:            25 passes"
+echo "  Log / Log Episodes Every:    5 passes"
+echo ""
+echo " [Sampling & Exploration]"
+echo "  Temperature:                 ${TEMPERATURE} (anneal end: ${TEMPERATURE_ANNEAL_END:-none}, floor: ${TEMPERATURE_FLOOR:-none})"
+echo "  Epsilon:                     ${EPSILON} (anneal end: ${EPSILON_ANNEAL_END:-none})"
+echo ""
+echo " [Reward & Simulation]"
+echo "  Reward Mode:                 ${REWARD_MODE}"
+echo "  Reward Blend Weight:         ${REWARD_BLEND_WEIGHT}"
+echo "  Reward Rollout Samples:      ${REWARD_ROLLOUT_SAMPLES}"
+echo "  Reward Rollout Common Seed:  ${REWARD_ROLLOUT_COMMON_SEED}"
+echo "  Reward Survival Exponent:    ${REWARD_SURVIVAL_EXPONENT}"
+echo "  Reward Turn Discount:        ${REWARD_TURN_DISCOUNT}"
+echo "  Reward Policy Turns:         ${REWARD_POLICY_TURNS}"
+echo "  GRPO Scale Rewards:          ${GRPO_SCALE_REWARDS}"
+echo ""
+echo " [Partner, Strategy & Reasoning]"
+echo "  Bot Partner:                 ${BOT_PARTNER} (type: ${BOT_TYPE})"
+echo "  LLM Partner Response:        ${LLM_PARTNER_RESPONSE}"
+echo "  Constrained Action Types:    ${CONSTRAINED_ACTION_TYPES}"
+echo "  Strategic Action Selection:  ${STRATEGIC_ACTION_SELECTION}"
+echo "  Strategic Action Mode:       ${STRATEGIC_ACTION_MODE}"
+echo "  Strategic Action Forced:     ${STRATEGIC_ACTION_FORCED_RATIO}"
+echo "  Reasoning (<think>):         ${REASONING}"
+echo ""
+echo " [Curriculum]"
+echo "  Curriculum Window Size:      ${CURRICULUM_WINDOW_SIZE}"
+echo "  Passes Per Phase:            ${CURRICULUM_PASSES_PER_PHASE}"
+echo "  Curriculum Max Horizon:      ${CURRICULUM_MAX_HORIZON}"
+echo "  Curriculum Replay Ratio:     ${CURRICULUM_REPLAY_RATIO}"
+echo "  Boundary Rollout Turns:      ${CURRICULUM_BOUNDARY_ROLLOUT_TURNS}"
+echo ""
+echo " [Extra Flags / Overrides]"
+echo "  Extra Flags:                 ${EXTRA_FLAGS:-<none>}"
+echo "  Python:                      $(which python3)"
+echo "  PyTorch CUDA:                $(python3 -c 'import torch; print(torch.cuda.is_available())')"
+echo "=============================================================================="
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 
@@ -244,6 +290,7 @@ fi
 
 # ── Run training ─────────────────────────────────────────────────────────────
 
+echo "Launching training process: python3 trainer/gemma_rl_trainer.py ..."
 python3 trainer/gemma_rl_trainer.py \
   --rl_algorithm=grpo \
   --game="${GAME}" \
