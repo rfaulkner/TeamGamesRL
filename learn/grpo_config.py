@@ -554,12 +554,6 @@ class GRPOConfig:
   frontier window [H-W, H). Prevents catastrophic forgetting of early moves.
   """
 
-  curriculum_boundary_rollout_turns: int = 4
-  """Continuation turns played by SafeBeliefLookaheadPlayer at the horizon boundary.
-
-  Prevents myopic token dumping at the end of the window by testing state viability.
-  """
-
   def get_curriculum_horizon(self, pass_idx: int) -> int:
     """Returns the maximum turn horizon for the given pass index."""
     if self.curriculum_window_size <= 0:

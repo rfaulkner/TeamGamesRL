@@ -83,7 +83,7 @@ CURRICULUM_WINDOW_SIZE=4
 CURRICULUM_PASSES_PER_PHASE=2
 CURRICULUM_MAX_HORIZON=30
 CURRICULUM_REPLAY_RATIO="0.30"
-CURRICULUM_BOUNDARY_ROLLOUT_TURNS=4
+TRUNCATED_ROLLOUT_HORIZON=""
 # ── 1. Determine profile first ───────────────────────────────────────────────
 
 PROFILE="full"
@@ -156,7 +156,8 @@ for arg in "$@"; do
     --curriculum_passes_per_phase=*) CURRICULUM_PASSES_PER_PHASE="${arg#*=}" ;;
     --curriculum_max_horizon=*) CURRICULUM_MAX_HORIZON="${arg#*=}" ;;
     --curriculum_replay_ratio=*) CURRICULUM_REPLAY_RATIO="${arg#*=}" ;;
-    --curriculum_boundary_rollout_turns=*) CURRICULUM_BOUNDARY_ROLLOUT_TURNS="${arg#*=}" ;;
+    --truncated_rollout_horizon=*|--grpo_truncated_rollout_horizon=*)
+      TRUNCATED_ROLLOUT_HORIZON="${arg#*=}" ;;
     --initial_lora_checkpoint=*|--warm_start_adapter=*)
       EXTRA_FLAGS="${EXTRA_FLAGS} --initial_lora_checkpoint=${arg#*=}" ;;
     --help|-h)
@@ -239,6 +240,7 @@ echo "  Reward Rollout Common Seed:  ${REWARD_ROLLOUT_COMMON_SEED}"
 echo "  Reward Survival Exponent:    ${REWARD_SURVIVAL_EXPONENT}"
 echo "  Reward Turn Discount:        ${REWARD_TURN_DISCOUNT}"
 echo "  Reward Policy Turns:         ${REWARD_POLICY_TURNS}"
+echo "  Truncated Rollout Horizon:   ${TRUNCATED_ROLLOUT_HORIZON:-default (4)}"
 echo "  GRPO Scale Rewards:          ${GRPO_SCALE_REWARDS}"
 echo ""
 echo " [Partner, Strategy & Reasoning]"
@@ -255,7 +257,6 @@ echo "  Curriculum Window Size:      ${CURRICULUM_WINDOW_SIZE}"
 echo "  Passes Per Phase:            ${CURRICULUM_PASSES_PER_PHASE}"
 echo "  Curriculum Max Horizon:      ${CURRICULUM_MAX_HORIZON}"
 echo "  Curriculum Replay Ratio:     ${CURRICULUM_REPLAY_RATIO}"
-echo "  Boundary Rollout Turns:      ${CURRICULUM_BOUNDARY_ROLLOUT_TURNS}"
 echo ""
 echo " [Extra Flags / Overrides]"
 echo "  Extra Flags:                 ${EXTRA_FLAGS:-<none>}"
@@ -286,6 +287,11 @@ if [ -n "${TEMPERATURE_ANNEAL_END}" ] && [ "${TEMPERATURE_ANNEAL_END}" != "none"
 fi
 if [ -n "${TEMPERATURE_FLOOR}" ] && [ "${TEMPERATURE_FLOOR}" != "none" ]; then
   ANNEAL_FLAGS="${ANNEAL_FLAGS} --temperature_floor=${TEMPERATURE_FLOOR}"
+fi
+
+TRUNCATED_FLAG=""
+if [ -n "${TRUNCATED_ROLLOUT_HORIZON}" ]; then
+  TRUNCATED_FLAG="--grpo_truncated_rollout_horizon=${TRUNCATED_ROLLOUT_HORIZON}"
 fi
 
 # ── Run training ─────────────────────────────────────────────────────────────
@@ -330,7 +336,7 @@ python3 trainer/gemma_rl_trainer.py \
   --curriculum_passes_per_phase="${CURRICULUM_PASSES_PER_PHASE}" \
   --curriculum_max_horizon="${CURRICULUM_MAX_HORIZON}" \
   --curriculum_replay_ratio="${CURRICULUM_REPLAY_RATIO}" \
-  --curriculum_boundary_rollout_turns="${CURRICULUM_BOUNDARY_ROLLOUT_TURNS}" \
+  ${TRUNCATED_FLAG} \
   --max_seq_len="${MAX_SEQ_LEN}" \
   --use_4bit \
   --output_dir="${output_dir}" \

@@ -446,11 +446,6 @@ flags.DEFINE_float(
     0.30,
     'Fraction of decision points sampled from earlier curriculum phases.',
 )
-flags.DEFINE_integer(
-    'curriculum_boundary_rollout_turns',
-    4,
-    'Turns played by SafeBeliefLookaheadPlayer at the horizon boundary.',
-)
 # ============================================================================
 # Entry point & Configuration Logging
 # ============================================================================
@@ -581,7 +576,6 @@ def _print_experiment_configuration(
           'curriculum_passes_per_phase',
           'curriculum_max_horizon',
           'curriculum_replay_ratio',
-          'curriculum_boundary_rollout_turns',
       ]),
       ('REINFORCE (if active)', [
           'gradient_accumulation_steps',
@@ -734,7 +728,6 @@ def main(argv: list[str]) -> None:
         curriculum_passes_per_phase=FLAGS.curriculum_passes_per_phase,
         curriculum_max_horizon=FLAGS.curriculum_max_horizon,
         curriculum_replay_ratio=FLAGS.curriculum_replay_ratio,
-        curriculum_boundary_rollout_turns=FLAGS.curriculum_boundary_rollout_turns,
     )
     # ── Tiny Hanabi-specific tuning ──
     # For tiny_hanabi, enable exhaustive-group GRPO by default.  This
