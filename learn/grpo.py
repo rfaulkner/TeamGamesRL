@@ -140,6 +140,7 @@ class GRPORunner:
     self._current_temperature: float = config.temperature
     self._current_epsilon: float = config.epsilon
     self._frozen_lora_state: dict | None = None
+    self._curriculum_graduated: bool = False
 
   def run(self) -> None:
     """Run GRPO training, dispatching to the appropriate variant.

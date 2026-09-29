@@ -82,15 +82,24 @@ def collect_game_prompts(
   num_players = runner._game_config.num_players
   ep_rewards = []
 
-  max_horizon = getattr(
-      runner._config, 'get_curriculum_horizon', lambda p: 1000
-  )(pass_idx)
+  is_graduated = getattr(runner, '_curriculum_graduated', False)
   window_size = getattr(runner._config, 'curriculum_window_size', 0)
-  if window_size > 0:
+  if is_graduated:
+    max_horizon = 1000
+    logging.info(
+        '[curriculum collection] Pass %d: Curriculum graduated! Collecting'
+        ' %d episodes to game completion (full fine-tuning mode)',
+        pass_idx,
+        num_episodes,
+    )
+  elif window_size > 0:
+    max_horizon = getattr(
+        runner._config, 'get_curriculum_horizon', lambda p: 1000
+    )(pass_idx)
     start_turn, end_turn = runner._config.get_curriculum_active_window(pass_idx)
     logging.info(
-        '[curriculum collection] Pass %d: collecting %d episodes up to horizon'
-        ' turn %d (active window: turns [%d, %d))',
+        '[curriculum collection] Pass %d: collecting %d episodes up to'
+        ' horizon turn %d (active window: turns [%d, %d))',
         pass_idx,
         num_episodes,
         max_horizon,
@@ -98,6 +107,7 @@ def collect_game_prompts(
         end_turn,
     )
   else:
+    max_horizon = 1000
     logging.info(
         '[curriculum collection] Pass %d: collecting %d episodes to game'
         ' completion (no curriculum)',
@@ -112,7 +122,7 @@ def collect_game_prompts(
 
     bot_player = None
     if getattr(runner._config, 'bot_partner', False) and num_players == 2:
-      # Alternating roles: odd episodes -> P1 is bot; even episodes -> P0 is bot.
+      # Alternating roles: odd ep -> P1 is bot; even ep -> P0 is bot.
       bot_player = 1 if ep % 2 == 1 else 0
 
     while not time_step.last():
@@ -2401,7 +2411,17 @@ def run_sampled(runner) -> None:
     }
 
     curriculum_ws = getattr(runner._config, 'curriculum_window_size', 0)
-    if curriculum_ws > 0:
+    is_graduated = getattr(runner, '_curriculum_graduated', False)
+    if is_graduated:
+      logging.info(
+          '=== Pass %d/%d (Curriculum Graduated: Full Fine-Tuning across all turns) ===\n'
+          '  Curriculum Window: Frozen (graduated to full-game fine-tuning)\n'
+          '  Sampling:          All unique decision points across collected episodes\n'
+          '  Collection & Eval: Full episodes (no horizon truncation/handover)',
+          pass_idx,
+          runner._config.passes,
+      )
+    elif curriculum_ws > 0:
       c_phase = (
           (pass_idx - 1) // max(1, runner._config.curriculum_passes_per_phase)
       ) + 1
@@ -2490,8 +2510,43 @@ def run_sampled(runner) -> None:
     num_train_steps = 0
 
     # Curriculum window calculation:
+    # Curriculum window calculation and graduation check:
     window_size = getattr(runner._config, 'curriculum_window_size', 0)
-    if window_size > 0:
+    if window_size > 0 and not getattr(runner, '_curriculum_graduated', False):
+      start_turn, end_turn = runner._config.get_curriculum_active_window(
+          pass_idx
+      )
+      max_horizon_cfg = getattr(runner._config, 'curriculum_max_horizon', 0)
+      max_game_length = max(
+          (e.get('turn_index', 0) + 1 for e in prompt_entries), default=0
+      )
+      active_count = sum(
+          1 for e in prompt_entries if start_turn <= e.get('turn_index', 0) < end_turn
+      )
+      reached_max_h = max_horizon_cfg > 0 and end_turn >= max_horizon_cfg
+      reached_natural_end = max_horizon_cfg <= 0 and (
+          start_turn >= max_game_length or active_count == 0
+      )
+      if reached_max_h or reached_natural_end:
+        runner._curriculum_graduated = True
+        logging.info(
+            '[curriculum] Pass %d: Reached end of curriculum horizon '
+            '(window=[%d, %d), max_turns_played=%d, active_prompts=%d). '
+            'Graduating curriculum! Stopping horizon advancement and switching '
+            'to full fine-tuning across all turns.',
+            pass_idx,
+            start_turn,
+            end_turn,
+            max_game_length,
+            active_count,
+        )
+
+    is_graduated = getattr(runner, '_curriculum_graduated', False)
+    if is_graduated or window_size <= 0:
+      start_turn, end_turn = 0, 1000
+      replay_ratio = 0.0
+      max_lookback = 0
+    else:
       start_turn, end_turn = runner._config.get_curriculum_active_window(
           pass_idx
       )
@@ -2511,15 +2566,23 @@ def run_sampled(runner) -> None:
           f'{max_lookback} turns' if max_lookback > 0 else 'unlimited',
           replay_ratio,
       )
-    else:
-      start_turn, end_turn = 0, 1000
-      replay_ratio = 0.0
-      max_lookback = 0
 
     def _sample_curriculum_prompts(entries: list[dict]) -> list[str]:
       """Selects unique prompts balancing active window and replay history."""
-      if window_size <= 0 or not entries:
-        return list({e['prompt'] for e in entries})
+      if (
+          getattr(runner, '_curriculum_graduated', False)
+          or window_size <= 0
+          or not entries
+      ):
+        all_unique = list({e['prompt'] for e in entries})
+        logging.info(
+            '[curriculum] Pass %d: Full fine-tuning mode. Optimizing all %d'
+            ' unique prompts across all turns (%d total entries).',
+            pass_idx,
+            len(all_unique),
+            len(entries),
+        )
+        return all_unique
 
       all_prompts = list({e['prompt'] for e in entries})
       max_game_length = max(
@@ -2563,27 +2626,20 @@ def run_sampled(runner) -> None:
           start_turn >= max_game_length or not active_prompts
       )
       if is_completely_out:
-        n_sample = min(len(all_prompts), max_updates)
-        selected = (
-            list(np.random.choice(all_prompts, size=n_sample, replace=False))
-            if all_prompts
-            else []
-        )
+        runner._curriculum_graduated = True
+        all_unique = list({e['prompt'] for e in entries})
         logging.info(
             '[curriculum] Pass %d: active window [%d, %d) completely out of'
-            ' collected episodes (game max turn %d). Curriculum completed!'
-            ' Uniformly sampling %d prompts across all turns (budget: %d = %d'
-            ' active + %d lookback).',
+            ' collected episodes (game max turn %d). Graduating curriculum to'
+            ' full fine-tuning! Optimizing all %d unique prompts across all'
+            ' turns.',
             pass_idx,
             start_turn,
             end_turn,
             max_game_length,
-            len(selected),
-            max_updates,
-            active_target,
-            lookback_target,
+            len(all_unique),
         )
-        return selected
+        return all_unique
 
       # ── Case 2: Active window partially or fully within collected episodes ──
       # 1. Sample from active window (up to active_target)
@@ -2696,9 +2752,10 @@ def run_sampled(runner) -> None:
     # ── Step 5: Evaluate ──
     runner._backend.model.eval()
     horizon = (
-        runner._config.get_curriculum_horizon(pass_idx)
-        if runner._config.curriculum_window_size > 0
-        else None
+        None
+        if getattr(runner, '_curriculum_graduated', False)
+        or runner._config.curriculum_window_size <= 0
+        else runner._config.get_curriculum_horizon(pass_idx)
     )
     eval_kwargs = {}
     if horizon is not None:
