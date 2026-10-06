@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """GRPO configuration dataclass.
 
 Centralises every hyperparameter for the three GRPO variants (sampled,
@@ -31,6 +17,11 @@ class GRPOConfig:
     collect_episodes: Number of episodes to play for collecting game state
       prompts before each GRPO training pass. Only used when
       ``exhaustive_groups`` is False.
+    collect_batch_size: Batch size for parallel game collection episodes during
+      GRPO rollout.
+    prompt_batch_size: Number of unique prompts to generate completions for in
+      parallel during GRPO training.
+    train_batch_size: Maximum batch size for TRL GRPOTrainer backward passes.
     train_epochs: Number of training epochs per GRPO pass.
     passes: Number of collect-then-train passes for GRPO.
     max_completion_length: Maximum completion length for GRPO generation.
@@ -85,8 +76,13 @@ class GRPOConfig:
 
   num_generations: int = 8
   collect_episodes: int = 50
+  collect_batch_size: int = 16
+  prompt_batch_size: int = 40
+  train_batch_size: int = 4
   train_epochs: int = 1
   passes: int = 25
+  initial_pass: int = 1
+  max_seq_len: int = 2048
   max_completion_length: int = 16
   lr: float = 3e-5
   kl_coeff: float = 0.05
@@ -94,6 +90,48 @@ class GRPOConfig:
   gradient_accumulation_steps: int = 1
   temperature: float = 1.2
   num_eval_episodes: int = 10
+  eval_full_episodes: int = 32
+  """Episodes of *full self-play* evaluation (LLM plays every turn, no bot
+  hand-off) run after every pass (see ``eval_mode``).
+
+  This is the number that answers "is the tuned policy better at the whole
+  game?", independent of the curriculum horizon.  Costs roughly one full
+  game of generations per episode (~60-70 LLM turns for 2-player Hanabi).
+  Set to 0 to disable.
+  """
+  eval_mode: str = 'full'
+  """Which per-pass evaluation(s) to run after each GRPO pass.
+
+  * ``'full'`` (default) -- only the fixed-deal full self-play eval
+    (``eval_full/*``, ``eval_full_episodes`` games, LLM plays every turn).
+  * ``'bot_guided'`` -- only the curriculum eval (``eval/*``,
+    ``num_eval_episodes`` games): the LLM plays turns ``[0, horizon)`` and
+    the heuristic bot (SafePlayPlayer) finishes the game.
+  * ``'both'`` -- run both (the historical behaviour).
+
+  The bot-guided eval costs ``num_eval_episodes`` extra games per pass and
+  only measures play up to the curriculum horizon, hence it is off by
+  default.  ``eval/collection_mean_reward`` and the pass-0 baselines
+  (``eval_bot_baseline``) are unaffected by this setting.
+  """
+  eval_seed: int = 10_000
+  """Base seed for fixed-deal evaluation.
+
+  Eval episode ``i`` is dealt with seed ``eval_seed + i`` for both the
+  curriculum eval and the full self-play eval, so every pass is scored on the
+  *same* deals (paired comparison -- far tighter than fresh random deals).
+  Negative disables seeding (fresh random deals every pass).
+  """
+  eval_bot_baseline: bool = True
+  """Run the one-off reference baselines on the fixed deals before pass 1.
+
+  Two baselines are evaluated once and logged at ``episode=0``:
+  ``eval_full/*`` -- the initial (e.g. BC) adapter in full self-play, and
+  ``eval_bot/*`` -- the heuristic bot in both seats for every turn.  The
+  former anchors "did RL improve over the starting point?", the latter sizes
+  the gap to the hand-off bot.  Results are cached in
+  ``results/eval_baselines.json`` so resumed runs do not repeat them.
+  """
   per_player_updates: bool = True
   temperature_anneal_end: float | None = 0.7
   temperature_floor: float = 0.5
@@ -220,26 +258,6 @@ class GRPOConfig:
   ``r_0 + gamma*r_1 + gamma^2*r_2 + ...``  Higher values (closer to 1.0)
   weight future actions more equally; lower values focus on the
   immediate action.
-  """
-
-  epsilon: float = 0.3
-  """Epsilon-greedy exploration rate during game collection.
-
-  During ``collect_game_prompts``, with probability ``epsilon`` the
-  agent selects a uniformly random legal action instead of the LLM's
-  chosen action.  This prevents the model from collapsing onto a single
-  dominant action type (e.g. always playing cards in Hanabi, which leads
-  to rapid game-overs and very short training episodes).
-
-  The prompt and state are still recorded for GRPO training regardless
-  of whether the action was model-chosen or random.  Set to 0.0 to
-  disable exploration.
-  """
-
-  epsilon_anneal_end: float | None = 0.0
-  """If set, linearly anneal epsilon from ``epsilon`` to this value over
-  the course of training passes.  Defaults to 0.0 (full exploration early,
-  pure policy at the end).  Set to ``None`` for constant epsilon.
   """
 
   reward_blend_weight: float = 0.0
@@ -524,6 +542,9 @@ class GRPOConfig:
   bot_type: str = 'belief_lookahead'
   """Bot partner type: 'belief_lookahead' (SafeBeliefLookaheadPlayer) or 'safe_play'."""
 
+  checkpoint_interval_minutes: float = 10.0
+  """Interval in minutes for periodic interim checkpointing and decision-point cache flushing."""
+
   reasoning: bool = False
   """If True, prompt the LLM to think inside <think>...</think> before acting."""
 
@@ -547,12 +568,12 @@ class GRPOConfig:
   Once reached, collection and training cover up to this turn (or full game).
   """
 
-  curriculum_max_lookback: int = 0
+  curriculum_max_lookback: int = -1
   """Maximum turn lookback distance from the active window for replay sampling.
 
-  If > 0, replay decision points are only sampled from turns in
-  [max(0, start_turn - curriculum_max_lookback), start_turn).
-  If 0 (default), replay points can be sampled from all earlier turns [0, start_turn).
+  -1: replay points are sampled from all earlier turns [0, start_turn).
+   0: no replay (active window only).
+   N: replay points are sampled from [max(0, start_turn - N), start_turn).
   """
 
   curriculum_replay_ratio: float = 0.30

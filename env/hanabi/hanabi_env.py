@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """OpenSpiel-compatible adapter for the Hanabi Learning Environment (HLE).
 
 This module provides ``HanabiState``, ``HanabiGame``, and
@@ -244,6 +230,11 @@ class HanabiState:
     lands on a player node or terminal.
     """
     move = self._game._hle_game.get_move(action_id)
+    if not self._hle_state.move_is_legal(move):
+      raise ValueError(
+          f'Illegal Hanabi move {move} (action_id={action_id}) for player'
+          f' {self.current_player()}'
+      )
     self._hle_state.apply_move(move)
     self._action_history.append(action_id)
     # Advance past chance nodes (card dealing after play/discard).
@@ -282,19 +273,39 @@ class HanabiState:
   # ── Serialization ──────────────────────────────────────────────────────
 
   def serialize(self) -> str:
-    """Serialize the state — stores a clone in an in-memory cache."""
+    """Serialize the state — stores a clone in an in-memory cache plus full move history."""
     import uuid as _uuid  # pylint: disable=g-import-not-at-top
+    from env.hanabi import determinize as _det  # pylint: disable=g-import-not-at-top
     state_id = str(_uuid.uuid4())
     HanabiState._serialize_cache[state_id] = self.clone()
-    return json.dumps({'state_id': state_id})
+    history = [list(t) for t in _det.Determinizer._history_tuples(self._hle_state)]
+    return json.dumps({
+        'state_id': state_id,
+        'history': history,
+        'action_history': list(self._action_history),
+    })
 
   @classmethod
   def deserialize(cls, game: HanabiGame, data_str: str) -> HanabiState:
-    """Restore a state from its serialized form (cache lookup)."""
+    """Restore a state from its serialized form (cache lookup or move-history replay)."""
     data = json.loads(data_str)
     state_id = data.get('state_id')
     if state_id and state_id in cls._serialize_cache:
       return cls._serialize_cache[state_id].clone()
+    history = data.get('history')
+    if history is not None:
+      from env.hanabi import determinize as _det  # pylint: disable=g-import-not-at-top
+      det = getattr(game, '_determinizer', None)
+      if det is None:
+        det = _det.Determinizer(game)
+        game._determinizer = det
+      hle_state = det._replay([tuple(x) for x in history])
+      if hle_state is not None:
+        restored = HanabiState(game, hle_state)
+        restored._action_history = list(data.get('action_history', []))
+        if state_id:
+          cls._serialize_cache[state_id] = restored.clone()
+        return restored
     logging.warning('HanabiState cache miss for id=%s', state_id)
     return game.new_initial_state()
 
@@ -326,8 +337,27 @@ class HanabiGame:
       max_information_tokens: int = 8,
       max_life_tokens: int = 3,
       random_start_player: bool = False,
+      seed: int | None = None,
   ) -> None:
-    # Store constructor-compatible keys for serialization round-trip.
+    """Creates a Hanabi game.
+
+    Args:
+      players: Number of players.
+      colors: Number of card colours.
+      ranks: Number of card ranks.
+      hand_size: Cards per hand.
+      max_information_tokens: Starting hint tokens.
+      max_life_tokens: Starting life tokens.
+      random_start_player: Whether HLE picks the starting player at random.
+      seed: Optional HLE RNG seed.  When set, the initial deal *and* the
+        order of every subsequent draw are fixed, so two games built with the
+        same seed see identical cards regardless of the actions played.  This
+        is what makes fixed-deal (paired) evaluation possible.  ``None`` keeps
+        HLE's default behaviour (a fresh random seed per game object).
+    """
+    # Store constructor-compatible keys for serialization round-trip.  The
+    # seed is intentionally excluded: deserialized games replay explicit
+    # chance outcomes from the history and never consult the RNG.
     self._params = {
         'players': players,
         'colors': colors,
@@ -337,10 +367,18 @@ class HanabiGame:
         'max_life_tokens': max_life_tokens,
         'random_start_player': random_start_player,
     }
+    self._seed = seed
     # HLE expects the key 'rank' (not 'ranks').
     hle_params = dict(self._params)
     hle_params['rank'] = hle_params.pop('ranks')
+    if seed is not None:
+      hle_params['seed'] = int(seed)
     self._hle_game = pyhanabi.HanabiGame(hle_params)
+
+  @property
+  def seed(self) -> int | None:
+    """The HLE RNG seed this game was built with (``None`` if unseeded)."""
+    return self._seed
 
   def num_players(self) -> int:
     return self._params['players']
@@ -460,6 +498,7 @@ class HanabiEnvironment:
 # actions produces illegal moves because different cards were dealt.
 # Instead we clone states in memory and look them up by UUID.
 _state_cache: dict[str, tuple[HanabiGame, HanabiState]] = {}
+_determinizer_cache: dict[tuple, tuple[HanabiGame, object]] = {}
 
 
 def clear_state_cache() -> None:
@@ -472,12 +511,16 @@ def serialize_game_and_state(game, state) -> str:
   """Serialize game+state, dispatching to Hanabi adapter cache or pyspiel."""
   if isinstance(game, HanabiGame):
     import uuid  # pylint: disable=g-import-not-at-top
+    from env.hanabi import determinize as _det  # pylint: disable=g-import-not-at-top
     state_id = str(uuid.uuid4())
     _state_cache[state_id] = (game, state.clone())
+    history = [list(t) for t in _det.Determinizer._history_tuples(state._hle_state)]
     return json.dumps({
         'adapter': 'hanabi_env',
         'state_id': state_id,
         'params': game._params,
+        'history': history,
+        'action_history': list(state._action_history),
     })
   if pyspiel is not None:
     return pyspiel.serialize_game_and_state(game, state)
@@ -498,11 +541,26 @@ def deserialize_game_and_state(data_str: str):
     if state_id and state_id in _state_cache:
       game, cached_state = _state_cache[state_id]
       return game, cached_state.clone()
+    params = data.get('params', {})
+    param_key = tuple(sorted(params.items()))
+    if param_key not in _determinizer_cache:
+      from env.hanabi import determinize as _det  # pylint: disable=g-import-not-at-top
+      g = HanabiGame(**params)
+      _determinizer_cache[param_key] = (g, _det.Determinizer(g))
+    game, det = _determinizer_cache[param_key]
+    history = data.get('history')
+    if history is not None:
+      hle_state = det._replay([tuple(x) for x in history])
+      if hle_state is not None:
+        restored = HanabiState(game, hle_state)
+        restored._action_history = list(data.get('action_history', []))
+        if state_id:
+          _state_cache[state_id] = (game, restored.clone())
+        return game, restored
     logging.warning(
         'Hanabi state cache miss for id=%s — returning fresh initial state.',
         state_id,
     )
-    game = HanabiGame(**data['params'])
     return game, game.new_initial_state()
 
   if pyspiel is not None:

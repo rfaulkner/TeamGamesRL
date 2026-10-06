@@ -1,16 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Main training loop for multi-agent LLM RL on OpenSpiel games.
 
 This module implements a REINFORCE-based training loop where LLM agents play
@@ -59,7 +46,13 @@ from env.game_config import GameConfig
 from learn.trajectory import Trajectory
 import llm_agent
 import numpy as np
-from open_spiel.python import rl_environment
+try:
+  from open_spiel.python import rl_environment
+except ImportError:
+  try:
+    from third_party.open_spiel.python import rl_environment
+  except ImportError:
+    from google3.third_party.open_spiel.python import rl_environment
 
 FLAGS = flags.FLAGS
 

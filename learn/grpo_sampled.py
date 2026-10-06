@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Sampled (TRL-based) GRPO runner.
 
 This module implements the *sampled* GRPO variant that collects prompts
@@ -22,9 +8,11 @@ All public functions accept a ``runner`` parameter — the ``GRPORunner``
 instance that holds shared state (env, backend, config, callbacks).
 """
 
+from collections.abc import Mapping
 import contextlib
 import copy
 import dataclasses
+import json
 import os
 import time
 import zlib
@@ -41,6 +29,7 @@ except ImportError:
   pyspiel = None  # HLE adapter used for Hanabi instead
 
 
+from env import game_env
 from env.hanabi.hanabi_env import deserialize_game_and_state
 from env.hanabi.hanabi_env import serialize_game_and_state
 
@@ -59,9 +48,10 @@ def collect_game_prompts(
     num_episodes: int,
     pass_idx: int = 1,
     start_time: float = 0.0,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
   """Collect game-state prompts by playing episodes with LLM agents.
 
+  Batches episode rollouts in lockstep to utilize GPU tensor parallelism.
   Plays ``num_episodes`` games and records the prompts shown to each
   player at each decision point, along with the action history and
   player index needed to simulate game completion for reward
@@ -74,13 +64,22 @@ def collect_game_prompts(
     start_time: Training start timestamp for elapsed time calculation.
 
   Returns:
-    A list of prompt-entry dicts with keys: ``prompt``, ``player_id``,
-    ``action_history``, ``legal_actions``, ``legal_actions_desc``,
-    ``state_text``, ``serialized_state``.
+    A tuple of ``(all_prompts, collect_stats)`` where ``all_prompts`` is a
+    list of prompt-entry dicts and ``collect_stats`` contains summary metrics.
   """
   all_prompts = []
   num_players = runner._game_config.num_players
   ep_rewards = []
+
+  if num_episodes <= 0:
+    return all_prompts, {
+        'mean_reward': 0.0,
+        'min_reward': 0.0,
+        'max_reward': 0.0,
+        'std_reward': 0.0,
+        'num_episodes': 0,
+        'num_prompts': 0,
+    }
 
   is_graduated = getattr(runner, '_curriculum_graduated', False)
   window_size = getattr(runner._config, 'curriculum_window_size', 0)
@@ -115,156 +114,234 @@ def collect_game_prompts(
         num_episodes,
     )
 
-  for ep in range(1, num_episodes + 1):
-    time_step = runner._env.reset()
-    action_history = []
-    trajectories = [PlayerTrajectory(player_id=p) for p in range(num_players)]
+  target_batch_size = (
+      getattr(runner._config, 'collect_batch_size', None) or num_episodes
+  )
+  logging.info(
+      '[collection] Batched collection active: batch_size=%d for %d episodes',
+      target_batch_size,
+      num_episodes,
+  )
 
-    bot_player = None
-    if getattr(runner._config, 'bot_partner', False) and num_players == 2:
-      # Alternating roles: odd ep -> P1 is bot; even ep -> P0 is bot.
-      bot_player = 1 if ep % 2 == 1 else 0
+  bot_partner_enabled = (
+      getattr(runner._config, 'bot_partner', False) and num_players == 2
+  )
+  if bot_partner_enabled:
+    if not hasattr(runner, '_heuristic_bot') or runner._heuristic_bot is None:
+      bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
+      if bot_type == 'belief_lookahead':
+        try:
+          from env.hanabi.belief_expert import SafeBeliefLookaheadPlayer  # pylint: disable=g-import-not-at-top
+          runner._heuristic_bot = SafeBeliefLookaheadPlayer(
+              runner._env.game, n_worlds=1, seed=42
+          )
+        except Exception as e:
+          logging.warning(
+              'Failed to load SafeBeliefLookaheadPlayer: %s, falling back to SafePlayPlayer', e
+          )
+          try:
+            from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+            runner._heuristic_bot = SafePlayPlayer(seed=42)
+          except ImportError:
+            runner._heuristic_bot = None
+      else:
+        try:
+          from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
+          runner._heuristic_bot = SafePlayPlayer(seed=42)
+        except ImportError:
+          runner._heuristic_bot = None
 
-    while not time_step.last():
-      if len(action_history) >= max_horizon:
-        break
-      current_player = time_step.current_player()
-      state = runner._env._state  # pylint: disable=protected-access
+  episodes_collected = 0
+  while episodes_collected < num_episodes:
+    batch_episodes = min(target_batch_size, num_episodes - episodes_collected)
+    global_ep_ids = [
+        episodes_collected + b + 1 for b in range(batch_episodes)
+    ]
 
-      state_text = runner._renderers[current_player].render_state(
-          state, current_player, runner._env.game
-      )
-      legal_actions_with_desc = runner._renderers[
-          current_player
-      ].render_legal_actions(state, current_player, runner._env.game)
-      legal_actions = [a for a, _ in legal_actions_with_desc]
-      action_descriptions = [d for _, d in legal_actions_with_desc]
+    envs = [
+        game_env.create_env(runner._game_config) for _ in range(batch_episodes)
+    ]
+    renderers = [
+        [
+            game_env.create_renderer(
+                runner._game_config,
+                max_history_turns=getattr(runner, 'max_history_turns', 20),
+            )
+            for _ in range(num_players)
+        ]
+        for _ in range(batch_episodes)
+    ]
+    time_steps = [env.reset() for env in envs]
+    action_histories = [[] for _ in range(batch_episodes)]
+    trajectories = [
+        [PlayerTrajectory(player_id=p) for p in range(num_players)]
+        for _ in range(batch_episodes)
+    ]
+    bot_players = [
+        (1 if ep % 2 == 1 else 0) if bot_partner_enabled else None
+        for ep in global_ep_ids
+    ]
 
-      is_bot_turn = (bot_player is not None and current_player == bot_player)
-      prompt = None
-      response = None
-      log_prob = 0.0
+    active = list(range(batch_episodes))
 
-      if is_bot_turn:
-        if not hasattr(runner, '_heuristic_bot') or runner._heuristic_bot is None:
-          bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
-          if bot_type == 'belief_lookahead':
-            try:
-              from env.hanabi.belief_expert import SafeBeliefLookaheadPlayer  # pylint: disable=g-import-not-at-top
-              runner._heuristic_bot = SafeBeliefLookaheadPlayer(
-                  runner._env.game, n_worlds=1, seed=42
-              )
-            except Exception as e:
-              logging.warning(
-                  'Failed to load SafeBeliefLookaheadPlayer: %s, falling back to SafePlayPlayer', e
-              )
-              try:
-                from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-                runner._heuristic_bot = SafePlayPlayer(seed=42)
-              except ImportError:
-                runner._heuristic_bot = None
+    while active:
+      # Step A: Advance heuristic bot turns until each active game needs the LLM or terminates.
+      still_active = []
+      for b_idx in active:
+        env = envs[b_idx]
+        ts = time_steps[b_idx]
+        bot_p = bot_players[b_idx]
+
+        while not ts.last():
+          if len(action_histories[b_idx]) >= max_horizon:
+            break
+          cur_p = ts.current_player()
+          if bot_p is not None and cur_p == bot_p:
+            st = env._state
+            legals_desc = renderers[b_idx][cur_p].render_legal_actions(
+                st, cur_p, env.game
+            )
+            legals = [a for a, _ in legals_desc]
+            if runner._heuristic_bot is not None:
+              act_id = runner._heuristic_bot.select_action(st, cur_p, env.game)
+            else:
+              act_id = int(np.random.choice(legals))
+            act_text = st.action_to_string(cur_p, act_id)
+            st_text = renderers[b_idx][cur_p].render_state(st, cur_p, env.game)
+            trajectories[b_idx][cur_p].steps.append(
+                RLTrajectoryStep(
+                    prompt='',
+                    action_text=act_text,
+                    action_id=act_id,
+                    log_prob=0.0,
+                    state_text=st_text,
+                    llm_response=act_text,
+                    game_action_text=act_text,
+                )
+            )
+            action_histories[b_idx].append(act_id)
+            ts = env.step([act_id])
+            time_steps[b_idx] = ts
           else:
-            try:
-              from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
-              runner._heuristic_bot = SafePlayPlayer(seed=42)
-            except ImportError:
-              runner._heuristic_bot = None
+            break
 
-        if runner._heuristic_bot is not None:
-          action_id = runner._heuristic_bot.select_action(
-              state, current_player, runner._env.game
+        # Check termination or horizon cutoff for this game.
+        if ts.last() or len(action_histories[b_idx]) >= max_horizon:
+          if ts.rewards is not None:
+            for p in range(num_players):
+              trajectories[b_idx][p].reward = ts.rewards[p]
+          elif hasattr(env._state, 'returns'):
+            ret = env._state.returns()
+            for p in range(num_players):
+              trajectories[b_idx][p].reward = ret[p]
+
+          m_r = float(np.mean([t.reward for t in trajectories[b_idx]]))
+          ep_rewards.append(m_r)
+
+          ep_num = global_ep_ids[b_idx]
+          global_ep = (pass_idx - 1) * num_episodes + ep_num
+          if runner._log_episode_fn is not None:
+            runner._log_episode_fn(global_ep, trajectories[b_idx], 0.0, False)
+          if runner._update_metrics_fn is not None:
+            runner._update_metrics_fn(trajectories[b_idx], 0.0)
+
+          ep_elapsed = time.time() - start_time if start_time > 0 else 0.0
+          actions_summary = ' | '.join(
+              f'P{t.player_id}:[{",".join(s.game_action_text for s in t.steps)}]'
+              for t in trajectories[b_idx]
+          )
+          role_info = ''
+          if bot_p is not None:
+            role_info = f' (P{1-bot_p}:LLM vs P{bot_p}:Bot)'
+          print(
+              f'[pass {pass_idx} collect {ep_num}/{num_episodes}]{role_info} reward={m_r:.2f} '
+              f'({ep_elapsed:.1f}s) {actions_summary}',
+              flush=True,
           )
         else:
-          action_id = int(np.random.choice(legal_actions))
-        action_text = state.action_to_string(current_player, action_id)
-        response = action_text
-      else:
-        prompt = runner._agents[current_player]._build_prompt(  # pylint: disable=protected-access
-            state_text, legal_actions, action_descriptions
-        )
+          still_active.append(b_idx)
 
-        response, log_prob = runner._backend.generate_with_logprobs(
-            prompt,
+      active = still_active
+      if not active:
+        break
+
+      # Step B: Build prompts for all environments waiting on the LLM.
+      batch_prompts = []
+      batch_meta = []
+      for b_idx in active:
+        env = envs[b_idx]
+        ts = time_steps[b_idx]
+        cur_p = ts.current_player()
+        st = env._state
+        st_text = renderers[b_idx][cur_p].render_state(st, cur_p, env.game)
+        legals_desc = renderers[b_idx][cur_p].render_legal_actions(
+            st, cur_p, env.game
+        )
+        legals = [a for a, _ in legals_desc]
+        descs = [d for _, d in legals_desc]
+        prompt = runner._agents[cur_p]._build_prompt(st_text, legals, descs)
+        batch_prompts.append(prompt)
+        batch_meta.append((b_idx, cur_p, st_text, legals, legals_desc, prompt))
+
+      # Step C: GPU batched generation.
+      if hasattr(runner._backend, 'generate_batch'):
+        responses = runner._backend.generate_batch(
+            batch_prompts,
             temperature=runner._current_temperature,
             max_tokens=runner._config.max_completion_length,
         )
-        action_id = runner._renderers[current_player].parse_action(
-            response, legal_actions_with_desc
-        )
+      else:
+        responses = [
+            runner._backend.generate(
+                p,
+                temperature=runner._current_temperature,
+                max_tokens=runner._config.max_completion_length,
+            )
+            for p in batch_prompts
+        ]
+
+      # Step D: Parse and step each environment.
+      for (b_idx, cur_p, st_text, legals, legals_desc, prompt), response in zip(
+          batch_meta, responses
+      ):
+        env = envs[b_idx]
+        st = env._state
+        action_id = renderers[b_idx][cur_p].parse_action(response, legals_desc)
         if action_id is None:
-          action_id = int(np.random.choice(legal_actions))
+          action_id = int(np.random.choice(legals))
 
-        # Epsilon-greedy exploration: with probability epsilon, override the
-        # model's action with a uniformly random legal action.  This prevents
-        # game-ending action collapse (e.g. always playing cards in Hanabi)
-        # and ensures longer, more diverse collection episodes.
-        epsilon_explored = False
-        if (
-            runner._current_epsilon > 0
-            and np.random.random() < runner._current_epsilon
-        ):
-          action_id = int(np.random.choice(legal_actions))
-          epsilon_explored = True
-
-        action_text = state.action_to_string(current_player, action_id)
+        act_text = st.action_to_string(cur_p, action_id)
 
         prompt_entry = {
             'prompt': prompt,
-            'player_id': current_player,
-            'action_history': list(action_history),
-            'legal_actions': legal_actions,
-            'legal_actions_desc': legal_actions_with_desc,
-            'state_text': state_text,
-            'turn_index': len(action_history),
-            'episode': ep,
-            'serialized_state': _serialize_game_and_state(
-                runner._env.game, state
-            ),
+            'player_id': cur_p,
+            'action_history': list(action_histories[b_idx]),
+            'legal_actions': legals,
+            'legal_actions_desc': legals_desc,
+            'state_text': st_text,
+            'turn_index': len(action_histories[b_idx]),
+            'episode': global_ep_ids[b_idx],
+            'serialized_state': _serialize_game_and_state(env.game, st),
         }
         all_prompts.append(prompt_entry)
         runner._prompt_metadata[prompt] = prompt_entry
 
-      trajectories[current_player].steps.append(
-          RLTrajectoryStep(
-              prompt=prompt or '',
-              action_text=response.strip() if response else '',
-              action_id=action_id,
-              log_prob=log_prob,
-              state_text=state_text,
-              llm_response=response or '',
-              game_action_text=action_text,
-          )
-      )
+        trajectories[b_idx][cur_p].steps.append(
+            RLTrajectoryStep(
+                prompt=prompt,
+                action_text=response.strip() if response else '',
+                action_id=action_id,
+                log_prob=0.0,
+                state_text=st_text,
+                llm_response=response or '',
+                game_action_text=act_text,
+            )
+        )
 
-      action_history.append(action_id)
-      time_step = runner._env.step([action_id])
+        action_histories[b_idx].append(action_id)
+        time_steps[b_idx] = env.step([action_id])
 
-    if time_step.rewards is not None:
-      for p in range(num_players):
-        trajectories[p].reward = time_step.rewards[p]
-
-    mean_r = float(np.mean([t.reward for t in trajectories]))
-    ep_rewards.append(mean_r)
-
-    global_ep = (pass_idx - 1) * num_episodes + ep
-    if runner._log_episode_fn is not None:
-      runner._log_episode_fn(global_ep, trajectories, 0.0, False)
-    if runner._update_metrics_fn is not None:
-      runner._update_metrics_fn(trajectories, 0.0)
-
-    ep_elapsed = time.time() - start_time if start_time > 0 else 0.0
-    actions_summary = ' | '.join(
-        f'P{t.player_id}:[{",".join(s.game_action_text for s in t.steps)}]'
-        for t in trajectories
-    )
-    role_info = ''
-    if bot_player is not None:
-      role_info = f' (P{1-bot_player}:LLM vs P{bot_player}:Bot)'
-    print(
-        f'[pass {pass_idx} collect {ep}/{num_episodes}]{role_info} reward={mean_r:.2f} '
-        f'({ep_elapsed:.1f}s) {actions_summary}',
-        flush=True,
-    )
+    episodes_collected += batch_episodes
 
   mean_collected = float(np.mean(ep_rewards)) if ep_rewards else 0.0
   logging.info(
@@ -540,6 +617,8 @@ def _frozen_lora_active(runner):
   for name, param in runner._backend.model.named_parameters():  # pylint: disable=protected-access
     if name in runner._frozen_lora_state:  # pylint: disable=protected-access
       param.data.copy_(runner._frozen_lora_state[name])  # pylint: disable=protected-access
+  if hasattr(runner._backend, 'sync_replica'):
+    runner._backend.sync_replica()
 
   runner._frozen_lora_depth = 1  # pylint: disable=protected-access
   try:
@@ -548,6 +627,8 @@ def _frozen_lora_active(runner):
     for name, param in runner._backend.model.named_parameters():  # pylint: disable=protected-access
       if name in live_lora_state:
         param.data.copy_(live_lora_state[name])
+    if hasattr(runner._backend, 'sync_replica'):
+      runner._backend.sync_replica()
     runner._frozen_lora_depth = 0  # pylint: disable=protected-access
 
 
@@ -1368,7 +1449,9 @@ class GroupDiversifier:
         try:
           completion_text = cot_fn(cot_state, player_id, desc, cot_bot)
         except Exception:  # pylint: disable=broad-exception-caught
-          completion_text = desc
+          completion_text = f'Reasoning: Selecting {desc}.\nAction: {desc}'
+      elif is_reasoning:
+        completion_text = f'Reasoning: Selecting {desc}.\nAction: {desc}'
       sequences[group_start + slot, prompt_len:] = self._encode_completion(
           completion_text, width, device
       )
@@ -1503,10 +1586,44 @@ class GroupDiversifier:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _build_prompt_dataset(prompts: list[str]):
-  """Build a HuggingFace Dataset from prompt strings."""
+def _strip_bos(prompt: str, tokenizer) -> str:
+  """Removes the BOS text that ``_build_prompt_dataset`` may prepend."""
+  bos = getattr(tokenizer, 'bos_token', None)
+  if bos and isinstance(prompt, str) and prompt.startswith(bos):
+    return prompt[len(bos) :]
+  return prompt
+
+
+def _build_prompt_dataset(prompts: list[str], tokenizer=None):
+  """Build a HuggingFace Dataset from prompt strings.
+
+  TRL tokenizes plain-string prompts with ``add_special_tokens=False``, which
+  drops the BOS token that BC training and the backend's own generation (eval,
+  rollouts, partner moves) put in front of every prompt.  The BOS is therefore
+  written into the prompt text, provided the tokenizer maps it back to exactly
+  the token IDs the backend produces.  ``reward_fn`` undoes this with
+  ``_strip_bos``.
+
+  Args:
+    prompts: Raw prompt strings.
+    tokenizer: The policy tokenizer, or None to leave the prompts unchanged.
+
+  Returns:
+    A ``datasets.Dataset`` with a single ``prompt`` column.
+  """
   from datasets import Dataset  # pylint: disable=g-import-not-at-top
 
+  bos = getattr(tokenizer, 'bos_token', None)
+  if bos and prompts:
+    with_bos = tokenizer(bos + prompts[0], add_special_tokens=False)
+    if with_bos['input_ids'] == tokenizer(prompts[0])['input_ids']:
+      prompts = [p if p.startswith(bos) else bos + p for p in prompts]
+      logging.info('[GRPO] Prepended BOS %r to TRL prompts.', bos)
+    else:
+      logging.warning(
+          '[GRPO] BOS-prefixed prompt text does not reproduce the backend'
+          ' tokenization; TRL prompts left unchanged (no BOS).'
+      )
   return Dataset.from_dict({'prompt': prompts})
 
 
@@ -1598,6 +1715,8 @@ def _compute_action_reward(
     pass_idx: int,
     partner_action: int | None = None,
     post_action_state=None,
+    post_policy_state=None,
+    policy_actions: list[int] | None = None,
 ) -> float:
   """Compute the scalar reward for an action given the runner's simulation config."""
   if not parsed:
@@ -1635,54 +1754,52 @@ def _compute_action_reward(
           serialized_state=ser_state,
           horizon=horizon,
           discount=discount,
-          llm_partner_response=runner._config.llm_partner_response,
-          partner_action=partner_action,
+          policy_actions=policy_actions,
           post_action_state=post_action_state.clone()
           if post_action_state is not None and hasattr(post_action_state, 'clone')
+          else None,
+          post_policy_state=post_policy_state.clone()
+          if post_policy_state is not None and hasattr(post_policy_state, 'clone')
           else None,
       )
 
     if blend_w > 0:
-      if post_action_state is not None and hasattr(post_action_state, 'clone'):
-        blend_state = post_action_state.clone()
+      if post_policy_state is not None and hasattr(post_policy_state, 'clone'):
+        blend_state = post_policy_state.clone()
         runner._env.set_state(blend_state)
-      elif ser_state is not None:
-        _, blend_state = deserialize_game_and_state(ser_state)
-        runner._env.set_state(blend_state)
-        if not blend_state.is_terminal():
-          legal0 = blend_state.legal_actions(blend_state.current_player())
-          if action_id in legal0:
-            blend_state.apply_action(action_id)
-          elif legal0:
-            blend_state.apply_action(int(np.random.choice(legal0)))
       else:
-        runner._env.reset()
-        blend_state = runner._env._state
-        for a in action_history:
-          if blend_state.is_terminal():
-            break
-          blend_state.apply_action(a)
-        blend_state = runner._env._state
-        if not blend_state.is_terminal():
-          legal0 = blend_state.legal_actions(blend_state.current_player())
-          if action_id in legal0:
-            blend_state.apply_action(action_id)
-          elif legal0:
-            blend_state.apply_action(int(np.random.choice(legal0)))
-
-      policy_turns = runner._config.reward_policy_turns
-      if runner._config.llm_partner_response and policy_turns < 2:
-        policy_turns = 2
-      if not blend_state.is_terminal():
-        current_p = blend_state.current_player()
-        legal = blend_state.legal_actions(current_p)
-        if partner_action is not None and policy_turns >= 2:
-          act = partner_action if partner_action in legal else (int(np.random.choice(legal)) if legal else None)
-          if act is not None:
-            blend_state.apply_action(act)
-            if policy_turns > 2 and not blend_state.is_terminal():
-              _rollout_policy_turns(runner, blend_state, policy_turns - 2)
+        if post_action_state is not None and hasattr(post_action_state, 'clone'):
+          blend_state = post_action_state.clone()
+          runner._env.set_state(blend_state)
+        elif ser_state is not None:
+          _, blend_state = deserialize_game_and_state(ser_state)
+          runner._env.set_state(blend_state)
+          if not blend_state.is_terminal():
+            legal0 = blend_state.legal_actions(blend_state.current_player())
+            if action_id in legal0:
+              blend_state.apply_action(action_id)
+            elif legal0:
+              blend_state.apply_action(int(np.random.choice(legal0)))
         else:
+          runner._env.reset()
+          blend_state = runner._env._state
+          for a in action_history:
+            if blend_state.is_terminal():
+              break
+            blend_state.apply_action(a)
+          blend_state = runner._env._state
+          if not blend_state.is_terminal():
+            legal0 = blend_state.legal_actions(blend_state.current_player())
+            if action_id in legal0:
+              blend_state.apply_action(action_id)
+            elif legal0:
+              blend_state.apply_action(int(np.random.choice(legal0)))
+
+        policy_turns = max(
+            runner._config.reward_policy_turns,
+            2 if getattr(runner._config, 'llm_partner_response', False) else 1,
+        )
+        if not blend_state.is_terminal():
           _rollout_policy_turns(runner, blend_state, policy_turns - 1)
 
       survival_exp = runner._config.reward_survival_exponent
@@ -1800,16 +1917,139 @@ def _train_grpo_on_prompts(
   # group numbers that keep counting up across the whole pass.
   group_counter = [0]
 
+  results_dir = os.path.join(runner._output_dir, 'results')
+  os.makedirs(results_dir, exist_ok=True)
+  reward_cache_path = os.path.join(
+      results_dir, f'reward_cache_pass{pass_idx}.json'
+  )
+  persisted_rewards: dict[tuple[str, int], float] = {}
+  persisted_group_records: list[dict] = []
+  if os.path.exists(reward_cache_path):
+    try:
+      with open(reward_cache_path, 'r') as f:
+        rc_data = json.load(f)
+      for k_str, val in rc_data.get('rewards', {}).items():
+        if '|||' in k_str:
+          p_txt, a_str = k_str.rsplit('|||', 1)
+          persisted_rewards[(p_txt, int(a_str))] = float(val)
+      if persisted_rewards:
+        logging.info(
+            '[REWARD CACHE] Loaded %d cached decision point evals for pass %d'
+            ' from %s',
+            len(persisted_rewards),
+            pass_idx,
+            reward_cache_path,
+        )
+    except Exception as e:
+      logging.warning(
+          '[REWARD CACHE] Failed to load %s: %s', reward_cache_path, e
+      )
+
+  interim_progress_path = os.path.join(results_dir, 'interim_progress.json')
+
+  def _write_interim_progress(status_str: str = 'in_progress') -> dict:
+    now = time.time()
+    prev_ep = (pass_idx - 1) * runner._config.collect_episodes
+    progress_meta = {
+        'status': status_str,
+        'pass_idx': pass_idx,
+        'player_id': player_id,
+        'completed_players': list(
+            getattr(runner, '_pass_completed_players', [])
+        ),
+        'completed_prompts': int(
+            getattr(runner, '_pass_completed_prompts', 0)
+        ),
+        'total_episodes': prev_ep,
+        'cached_decision_evals': len(persisted_rewards),
+        'timestamp': now,
+    }
+    try:
+      with open(interim_progress_path, 'w') as f:
+        json.dump(progress_meta, f, indent=2)
+    except Exception as e:
+      logging.warning(
+          '[INTERIM PROGRESS] Failed to write %s: %s', interim_progress_path, e
+      )
+    return progress_meta
+
+  def _flush_reward_cache_and_maybe_checkpoint(
+      reward_cache_dict: dict,
+      curr_group_records: list[dict],
+      force_save_file: bool = False,
+  ) -> None:
+    del curr_group_records
+    now = time.time()
+    interval_sec = (
+        getattr(runner._config, 'checkpoint_interval_minutes', 10.0) * 60.0
+    )
+    if interval_sec <= 0:
+      interval_sec = 600.0
+    last_flush = getattr(runner, '_last_cache_flush_time', 0.0)
+    if force_save_file or (now - last_flush >= 60.0):
+      try:
+        for (p_txt, act_id), r_tensor in reward_cache_dict.items():
+          persisted_rewards[(p_txt, int(act_id))] = float(
+              r_tensor.item() if hasattr(r_tensor, 'item') else r_tensor
+          )
+        serializable_rewards = {
+            f'{p_txt}|||{act_id}': val
+            for (p_txt, act_id), val in persisted_rewards.items()
+        }
+        with open(reward_cache_path, 'w') as f:
+          json.dump(
+              {
+                  'pass_idx': pass_idx,
+                  'player_id': player_id,
+                  'rewards': serializable_rewards,
+                  'timestamp': now,
+              },
+              f,
+          )
+        runner._last_cache_flush_time = now
+      except Exception as e:
+        logging.warning(
+            '[REWARD CACHE] Failed to write %s: %s', reward_cache_path, e
+        )
+
+    last_ckpt = getattr(runner, '_last_periodic_save_time', 0.0)
+    if last_ckpt <= 0.0:
+      runner._last_periodic_save_time = now
+    elif now - last_ckpt >= interval_sec:
+      runner._last_periodic_save_time = now
+      prev_ep = (pass_idx - 1) * runner._config.collect_episodes
+      interim_meta = _write_interim_progress('in_progress')
+      logging.info(
+          '[PERIODIC CHECKPOINT] Saving interim checkpoint and syncing %d'
+          ' decision point evals (pass %d, player %s)',
+          len(persisted_rewards),
+          pass_idx,
+          player_id,
+      )
+      runner._save_checkpoint_fn(prev_ep, suffix='interim', metadata=interim_meta)
+
   def reward_fn(completions, prompts=None, **kwargs):
     del kwargs
+    if prompts is not None:
+      # Metadata and reward caches are keyed by the raw prompt, without the
+      # BOS that _build_prompt_dataset prepends for TRL.
+      prompts = [_strip_bos(p, runner._backend.tokenizer) for p in prompts]
     rewards = []
-    reward_cache = {}  # (prompt_text, action_id) -> reward tensor
+    reward_cache = {
+        k: torch.tensor(float(v)) for k, v in persisted_rewards.items()
+    }
     group_records = []  # one dict per completion, for the group/z-score dump
     _action_type_tracker = {}  # prompt_text -> {play, discard, hint, total}
     cache_hits = 0
     partner_actions_by_key = {}
-    post_states_by_key = {}
-    if runner._config.llm_partner_response:
+    post_action_states_by_key = {}
+    post_policy_states_by_key = {}
+    policy_actions_by_key = {}
+    effective_policy_turns = max(
+        runner._config.reward_policy_turns,
+        2 if getattr(runner._config, 'llm_partner_response', False) else 1,
+    )
+    if effective_policy_turns >= 2:
       needed_queries = {}
       for i, completion in enumerate(completions):
         prompt_text = (
@@ -1835,18 +2075,18 @@ def _train_grpo_on_prompts(
         )
         if action_id is not None:
           cache_key = (prompt_text, action_id)
-          if cache_key not in needed_queries:
+          if cache_key not in needed_queries and cache_key not in reward_cache:
             needed_queries[cache_key] = (
                 ser_state, action_history, action_id, p_id
             )
 
       if needed_queries:
-        batch_keys = []
-        batch_prompts = []
-        batch_legal_descs = []
-        batch_partner_ids = []
+        policy_turns = effective_policy_turns
 
+        # Step 1: Apply Turn 1 (the candidate action_id) to initialize states.
+        curr_states = {}
         for key, (ser_state, action_history, action_id, p_id) in needed_queries.items():
+          policy_actions_by_key[key] = []
           if ser_state is not None:
             _, step_state = _deserialize_game_and_state(ser_state)
           else:
@@ -1866,36 +2106,46 @@ def _train_grpo_on_prompts(
               step_state.apply_action(int(np.random.choice(legal0)))
 
           if hasattr(step_state, 'clone'):
-            post_states_by_key[key] = step_state.clone()
+            post_action_states_by_key[key] = step_state.clone()
+            curr_states[key] = step_state.clone()
+          else:
+            curr_states[key] = step_state
 
-          if step_state.is_terminal():
-            partner_actions_by_key[key] = None
-            continue
+        # Step 2: Iteratively batch policy turns 2 .. policy_turns
+        for turn_step in range(policy_turns - 1):
+          batch_keys = []
+          batch_prompts = []
+          batch_legal_descs = []
+          batch_pids = []
 
-          partner_id = step_state.current_player()
-          legal = step_state.legal_actions(partner_id)
-          if not legal:
-            partner_actions_by_key[key] = None
-            continue
+          for key, st in curr_states.items():
+            if st.is_terminal():
+              continue
+            pid = st.current_player()
+            legal = st.legal_actions(pid)
+            if not legal:
+              continue
 
-          state_text = runner._renderers[partner_id].render_state(
-              step_state, partner_id, runner._env.game
-          )
-          legal_actions_with_desc = runner._renderers[
-              partner_id
-          ].render_legal_actions(step_state, partner_id, runner._env.game)
-          legal_actions = [a for a, _ in legal_actions_with_desc]
-          action_descriptions = [d for _, d in legal_actions_with_desc]
+            state_text = runner._renderers[pid].render_state(
+                st, pid, runner._env.game
+            )
+            legal_actions_with_desc = runner._renderers[pid].render_legal_actions(
+                st, pid, runner._env.game
+            )
+            legal_actions = [a for a, _ in legal_actions_with_desc]
+            action_descriptions = [d for _, d in legal_actions_with_desc]
 
-          partner_prompt = runner._agents[partner_id]._build_prompt(
-              state_text, legal_actions, action_descriptions
-          )
-          batch_keys.append(key)
-          batch_prompts.append(partner_prompt)
-          batch_legal_descs.append(legal_actions_with_desc)
-          batch_partner_ids.append(partner_id)
+            partner_prompt = runner._agents[pid]._build_prompt(
+                state_text, legal_actions, action_descriptions
+            )
+            batch_keys.append(key)
+            batch_prompts.append(partner_prompt)
+            batch_legal_descs.append(legal_actions_with_desc)
+            batch_pids.append(pid)
 
-        if batch_prompts:
+          if not batch_prompts:
+            break
+
           with _frozen_lora_active(runner):
             if hasattr(runner._backend, 'generate_batch'):
               responses = runner._backend.generate_batch(
@@ -1916,12 +2166,22 @@ def _train_grpo_on_prompts(
           for k_idx, key in enumerate(batch_keys):
             resp = responses[k_idx]
             descs = batch_legal_descs[k_idx]
-            pid = batch_partner_ids[k_idx]
+            pid = batch_pids[k_idx]
             p_act = runner._renderers[pid].parse_action(resp, descs)
             legals = [a for a, _ in descs]
             if p_act is None or p_act not in legals:
               p_act = int(np.random.choice(legals)) if legals else None
-            partner_actions_by_key[key] = p_act
+
+            policy_actions_by_key[key].append(p_act)
+            if turn_step == 0:
+              partner_actions_by_key[key] = p_act
+
+            if p_act is not None and not curr_states[key].is_terminal():
+              curr_states[key].apply_action(p_act)
+
+        for key, st in curr_states.items():
+          if hasattr(st, 'clone'):
+            post_policy_states_by_key[key] = st.clone()
 
     for i, completion in enumerate(completions):
       prompt_text = (
@@ -2059,7 +2319,9 @@ def _train_grpo_on_prompts(
           action_history=action_history,
           pass_idx=pass_idx,
           partner_action=partner_actions_by_key.get(cache_key, None),
-          post_action_state=post_states_by_key.get(cache_key, None),
+          post_action_state=post_action_states_by_key.get(cache_key, None),
+          post_policy_state=post_policy_states_by_key.get(cache_key, None),
+          policy_actions=policy_actions_by_key.get(cache_key, None),
       )
 
       reward_tensor = torch.tensor(float(reward))
@@ -2086,6 +2348,7 @@ def _train_grpo_on_prompts(
             action_id,
             reward,
         )
+      _flush_reward_cache_and_maybe_checkpoint(reward_cache, group_records)
 
     if cache_hits > 0:
       logging.info(
@@ -2095,6 +2358,10 @@ def _train_grpo_on_prompts(
           100.0 * cache_hits / len(rewards),
       )
 
+    _flush_reward_cache_and_maybe_checkpoint(
+        reward_cache, group_records, force_save_file=True
+    )
+    persisted_group_records.extend(group_records)
     _log_group_records(group_records, group_counter)
     return rewards
 
@@ -2116,26 +2383,74 @@ def _train_grpo_on_prompts(
   )
   _cleanup_ref_adapter(runner._backend.model, prev_adapter)
 
-  max_train_batch = 4
+  max_train_batch = getattr(runner._config, 'train_batch_size', 4) or 4
   candidates = [
       d
       for d in range(1, max_train_batch + 1)
       if runner._config.num_generations % d == 0
   ]
   batch_size = max(candidates) if candidates else 1
-  gen_batch_size = runner._config.num_generations
+
+  # Determine prompt batch size: how many unique prompts are batched together
+  # for parallel LLM generation.
+  k = runner._config.num_generations
+  cfg_p_batch = getattr(runner._config, 'prompt_batch_size', None)
+  if cfg_p_batch is not None and cfg_p_batch > 0:
+    p_batch = min(cfg_p_batch, len(unique_prompts))
+  else:
+    p_batch = min(len(unique_prompts), 40)
+  p_batch = max(1, p_batch)
+
+  # Pad unique_prompts so RepeatSampler (which drops len(chunk) != p_batch)
+  # does not drop any leftover prompts.
+  training_prompts = list(unique_prompts)
+  remainder = len(training_prompts) % p_batch
+  if remainder != 0:
+    needed = p_batch - remainder
+    training_prompts.extend(
+        [unique_prompts[i % len(unique_prompts)] for i in range(needed)]
+    )
+    logging.info(
+        'Padded prompts from %d to %d to be an exact multiple of'
+        ' prompt_batch_size=%d',
+        len(unique_prompts),
+        len(training_prompts),
+        p_batch,
+    )
+
+  gen_batch_size = p_batch * k
+  grad_accum = max(1, gen_batch_size // batch_size)
+  logging.info(
+      'GRPO batch configuration: %d unique prompts -> %d training prompts, '
+      'prompt_batch_size=%d, num_generations=%d, generation_batch_size=%d, '
+      'train_batch_size=%d, grad_accum=%d',
+      len(unique_prompts),
+      len(training_prompts),
+      p_batch,
+      k,
+      gen_batch_size,
+      batch_size,
+      grad_accum,
+  )
 
   scale_mode = getattr(runner._config, 'grpo_scale_rewards', 'batch')
   scale_kwargs = _resolve_scale_rewards(trl_module, scale_mode)
-  logging.info('GRPO advantage scaling: requested=%s resolved=%s',
-               scale_mode, scale_kwargs.get('scale_rewards', '<default>'))
+  max_prompt_len = getattr(runner._config, 'max_seq_len', 2048) or 2048
+  try:
+    trl_fields = {f.name for f in dataclasses.fields(trl_module.GRPOConfig)}
+    if 'max_prompt_length' in trl_fields:
+      scale_kwargs['max_prompt_length'] = max_prompt_len
+    if 'delta' in trl_fields:
+      scale_kwargs['delta'] = 2.0
+  except (TypeError, AttributeError):
+    pass
 
   training_args = trl_module.GRPOConfig(
       **scale_kwargs,
       output_dir=out_dir,
       num_train_epochs=runner._config.train_epochs,
       per_device_train_batch_size=batch_size,
-      gradient_accumulation_steps=4,
+      gradient_accumulation_steps=grad_accum,
       learning_rate=runner._config.lr,
       max_grad_norm=runner._config.max_grad_norm,
       logging_steps=1,
@@ -2148,13 +2463,73 @@ def _train_grpo_on_prompts(
       report_to='none',
   )
 
-  trainer = trl_module.GRPOTrainer(
+  class _PatchedGRPOTrainer(trl_module.GRPOTrainer):
+    """GRPOTrainer that chunks inputs in _get_per_token_logps and clamps logp ratios."""
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+      self._active_inputs = inputs
+      try:
+        return super().compute_loss(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
+      finally:
+        self._active_inputs = None
+
+    def _get_per_token_logps(
+        self, model, input_ids, attention_mask, logits_to_keep, batch_size=None
+    ):
+      batch_size = batch_size or getattr(self.args, 'per_device_train_batch_size', 8) or 8
+      logps = super()._get_per_token_logps(
+          model, input_ids, attention_mask, logits_to_keep, batch_size=batch_size
+      )
+      active_inputs = getattr(self, '_active_inputs', None)
+      if active_inputs is not None:
+        for key, bound in (('ref_per_token_logps', 4.0), ('old_per_token_logps', 1.0)):
+          target = active_inputs.get(key)
+          if target is not None and target.shape == logps.shape:
+            active_inputs[key] = torch.clamp(
+                target, min=logps.detach() - bound, max=logps.detach() + bound
+            )
+      return logps
+
+  trainer = _PatchedGRPOTrainer(
       model=runner._backend.model,
       args=training_args,
       reward_funcs=reward_fn,
       processing_class=runner._backend.tokenizer,
-      train_dataset=_build_prompt_dataset(unique_prompts),
+      train_dataset=_build_prompt_dataset(
+          training_prompts, runner._backend.tokenizer
+      ),
   )
+
+  try:
+    import transformers  # pylint: disable=g-import-not-at-top
+
+    base_completed_prompts = int(
+        getattr(runner, '_pass_completed_prompts', 0)
+    )
+
+    class _PeriodicCheckpointCallback(transformers.TrainerCallback):
+      """Saves periodic interim checkpoints on optimizer step boundaries."""
+
+      def on_step_end(self, args, state, control, **kwargs):
+        del args, control, kwargs
+        completions_done = state.global_step * batch_size * grad_accum
+        gen_batches_done = completions_done // gen_batch_size
+        runner._pass_completed_prompts = min(
+            base_completed_prompts + len(unique_prompts),
+            base_completed_prompts + gen_batches_done * p_batch,
+        )
+        _flush_reward_cache_and_maybe_checkpoint({}, [])
+
+    trainer.add_callback(_PeriodicCheckpointCallback())
+  except Exception as e:
+    logging.warning('Failed to attach _PeriodicCheckpointCallback: %s', e)
   # ── Constrained / strategic action generation ──
   # When enabled, wrap model.generate to force action diversity.
   original_generate = runner._backend.model.generate
@@ -2262,6 +2637,12 @@ def _train_grpo_on_prompts(
 
     runner._backend.model.generate = wrapped_generate
 
+  trainable = {
+      n: p for n, p in runner._backend.model.named_parameters() if p.requires_grad
+  }
+  w_before = {n: p.detach().clone() for n, p in trainable.items()}
+  if not hasattr(runner, '_lora_init'):
+    runner._lora_init = w_before
   try:
     trainer.train()
   finally:
@@ -2275,25 +2656,55 @@ def _train_grpo_on_prompts(
     _cleanup_ref_adapter(runner._backend.model, prev_adapter)
     if hasattr(runner._backend, 'set_active_adapter') and prev_adapter:
       runner._backend.set_active_adapter(prev_adapter)
+    if hasattr(runner._backend, 'sync_replica'):
+      runner._backend.sync_replica()
 
-  # Extract training metrics.
-  pass_loss = 0.0
-  pass_reward = 0.0
-  if hasattr(trainer, 'state') and hasattr(trainer.state, 'log_history'):
-    losses = [
-        e['loss']
-        for e in trainer.state.log_history
-        if 'loss' in e and isinstance(e['loss'], (int, float))
-    ]
-    rew_vals = [
-        e.get('reward', e.get('rewards/game_reward_fn/mean', 0.0))
-        for e in trainer.state.log_history
-        if 'reward' in e or 'rewards/game_reward_fn/mean' in e
-    ]
-    if losses:
-      pass_loss = float(np.mean(losses))
-    if rew_vals:
-      pass_reward = float(np.mean(rew_vals))
+  # Extract training metrics and per-pass diagnostics (loss decomposition,
+  # clip fraction, grad norm, LoRA weight movement).
+  history = getattr(getattr(trainer, 'state', None), 'log_history', []) or []
+
+  def _mean_of(key):
+    vals = [e[key] for e in history if isinstance(e.get(key), (int, float))]
+    return float(np.mean(vals)) if vals else float('nan')
+
+  pass_loss = _mean_of('loss')
+  pass_reward = _mean_of('reward')
+  if np.isnan(pass_reward):
+    pass_reward = _mean_of('rewards/game_reward_fn/mean')
+  if np.isnan(pass_loss):
+    pass_loss = 0.0
+  if np.isnan(pass_reward):
+    pass_reward = 0.0
+
+  def _l2(deltas):
+    if not deltas:
+      return 0.0
+    return float(torch.sqrt(sum((d.float() ** 2).sum() for d in deltas)))
+
+  kl_term = runner._config.kl_coeff * _mean_of('kl')
+  with torch.no_grad():
+    diag = {
+        'train/kl': _mean_of('kl'),
+        'train/kl_term': kl_term,
+        'train/policy_loss': pass_loss - kl_term,
+        'train/clip_frac': _mean_of('clip_ratio/region_mean'),
+        'train/grad_norm': _mean_of('grad_norm'),
+        'train/completion_len': _mean_of('completions/mean_length'),
+        'train/frac_zero_std_groups': _mean_of('frac_reward_zero_std'),
+        'train/lora_step_delta': _l2(
+            [p.detach() - w_before[n] for n, p in trainable.items()]
+        ),
+        'train/lora_total_drift': _l2([
+            p.detach() - runner._lora_init[n]
+            for n, p in trainable.items()
+            if n in runner._lora_init
+        ]),
+        'train/lora_norm': _l2([p.detach() for p in trainable.values()]),
+    }
+  runner._train_diags = getattr(runner, '_train_diags', []) + [diag]
+  logging.info(
+      'GRPO pass diagnostics: %s', {k: round(v, 5) for k, v in diag.items()}
+  )
 
   del trainer
   if torch.cuda.is_available():
@@ -2312,6 +2723,310 @@ def _train_grpo_on_prompts(
 # ═══════════════════════════════════════════════════════════════════════
 # Main sampled GRPO loop
 # ═══════════════════════════════════════════════════════════════════════
+
+
+def _eval_seed_base(runner) -> int | None:
+  """Returns the fixed-deal base seed, or ``None`` if seeding is disabled."""
+  seed = getattr(runner._config, 'eval_seed', -1)
+  if seed is None or int(seed) < 0:
+    return None
+  return int(seed)
+
+
+def _run_eval(runner, num_episodes: int, **kwargs) -> dict[str, float]:
+  """Calls ``runner._evaluate_fn`` tolerating older ``evaluate`` signatures.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    num_episodes: Number of evaluation episodes.
+    **kwargs: Forwarded to ``evaluate`` (``eval_llm_max_horizon``,
+      ``seed_base``, ``metric_prefix``).
+
+  Returns:
+    Metrics dict.  If the bound evaluate() predates ``metric_prefix`` the
+    legacy result keys are re-prefixed so callers can still merge rows.
+  """
+  try:
+    return runner._evaluate_fn(num_episodes, **kwargs)
+  except TypeError as e:
+    logging.warning(
+        '[evaluate] evaluate() rejected kwargs %s (%s); retrying with the'
+        ' legacy signature (unseeded deals).',
+        sorted(kwargs),
+        e,
+    )
+    legacy = {
+        k: v for k, v in kwargs.items() if k == 'eval_llm_max_horizon'
+    }
+    metrics = runner._evaluate_fn(num_episodes, **legacy)
+    prefix = kwargs.get('metric_prefix', 'eval')
+    if prefix != 'eval':
+      metrics = {
+          (prefix + k[len('eval'):] if k.startswith('eval/') else k): v
+          for k, v in metrics.items()
+      }
+    return metrics
+
+
+def _run_full_selfplay_eval(runner, pass_idx: int) -> dict[str, float]:
+  """Full self-play evaluation on the fixed deals (``eval_full/*`` keys).
+
+  The LLM plays *every* turn (no bot hand-off), so this measures whole-game
+  strength independently of the curriculum horizon.  Returns ``{}`` when
+  ``eval_full_episodes <= 0``.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    pass_idx: Current pass index (for logging only).
+
+  Returns:
+    Metrics dict with ``eval_full/*`` keys plus ``eval_full/elapsed_sec``.
+  """
+  n = int(getattr(runner._config, 'eval_full_episodes', 0) or 0)
+  if n <= 0:
+    return {}
+  seed_base = _eval_seed_base(runner)
+  logging.info(
+      '[full self-play evaluation] Pass %d: %d episodes, LLM plays every turn'
+      ' (no bot hand-off), deals=%s.',
+      pass_idx,
+      n,
+      f'fixed (seeds {seed_base}..{seed_base + n - 1})'
+      if seed_base is not None
+      else 'random',
+  )
+  t0 = time.time()
+  metrics = _run_eval(
+      runner,
+      n,
+      eval_llm_max_horizon=None,
+      seed_base=seed_base,
+      metric_prefix='eval_full',
+  )
+  metrics['eval_full/elapsed_sec'] = time.time() - t0
+  return metrics
+
+
+_EVAL_MODES = ('full', 'bot_guided', 'both')
+
+
+def _eval_flavours(eval_mode: str | None) -> tuple[bool, bool]:
+  """Maps ``GRPOConfig.eval_mode`` to ``(run_bot_guided, run_full)``.
+
+  Args:
+    eval_mode: ``'full'`` (fixed-deal full self-play only -- the default),
+      ``'bot_guided'`` (curriculum eval only: LLM plays to the horizon, the
+      heuristic bot finishes the game) or ``'both'``.  ``None`` means
+      ``'full'``.
+
+  Returns:
+    ``(run_bot_guided, run_full)`` booleans.
+
+  Raises:
+    ValueError: If ``eval_mode`` is not one of ``_EVAL_MODES``.
+  """
+  mode = str(eval_mode or 'full').strip().lower()
+  if mode not in _EVAL_MODES:
+    raise ValueError(
+        f'Unsupported eval_mode={eval_mode!r}; expected one of {_EVAL_MODES}.'
+    )
+  return mode in ('bot_guided', 'both'), mode in ('full', 'both')
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GRPO sample-budget counters (x-axes of the decision-point dashboards)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Each counter is logged with the pass's eval row as ``grpo/<name>`` (this
+# pass) and ``grpo/<name>_total`` (cumulative since pass 1), so it reaches
+# eval_metrics.csv, the checkpoint metadata and S2.  The launcher's second
+# Flatboard dashboard plots ``eval_full.*`` against ``grpo.<name>_total``
+# instead of the pass index: the curriculum settings decide how many decision
+# points a pass trains on, so per-pass curves are not compute-matched across
+# sweep arms.
+#
+#   decision_points: unique decision points GRPO expanded into a group this
+#     pass (``len(unique_prompts)``, summed over per-player updates).
+#   rollouts: nominal reward-simulated candidate rollouts, i.e.
+#     ``decision_points * num_generations * train_epochs``.  The reward cache,
+#     strategic de-duplication and prompt-batch padding make the exact number
+#     of simulations differ slightly.
+#   collected_decision_points: decision points visited while collecting the
+#     pass's episodes (``collect_stats['num_prompts']``), trained on or not.
+_GRPO_BUDGET_KEYS = ('decision_points', 'rollouts', 'collected_decision_points')
+
+
+def _grpo_budget_metrics(
+    pass_counts: Mapping[str, int], totals: Mapping[str, int]
+) -> dict[str, int]:
+  """Builds the ``grpo/*`` and ``grpo/*_total`` metrics for one eval row.
+
+  Args:
+    pass_counts: This pass's counts keyed by ``_GRPO_BUDGET_KEYS`` (missing
+      keys count as 0).
+    totals: Cumulative counts including this pass (missing keys count as 0).
+
+  Returns:
+    ``{'grpo/<key>': pass_count, 'grpo/<key>_total': total, ...}``.
+  """
+  metrics: dict[str, int] = {}
+  for key in _GRPO_BUDGET_KEYS:
+    metrics[f'grpo/{key}'] = int(pass_counts.get(key, 0))
+    metrics[f'grpo/{key}_total'] = int(totals.get(key, 0))
+  return metrics
+
+
+def _load_grpo_budget_totals(
+    results_dir: str, upto_episode: int
+) -> dict[str, int]:
+  """Restores the cumulative ``grpo/*_total`` counters of a resumed run.
+
+  Unlike ``total_episodes_so_far`` the totals cannot be re-derived from the
+  pass index, so they are read back from the last completed pass's row of
+  ``results/eval_metrics.csv`` (synced down from CNS by ``RLTrainer``).  A
+  run that predates these counters restarts them at zero with a warning.
+
+  Args:
+    results_dir: Local results directory holding ``eval_metrics.csv``.
+    upto_episode: Episode count of the last completed pass; later rows (from
+      an explicit ``--grpo_initial_pass`` rewind) are ignored.
+
+  Returns:
+    ``{key: total}`` for every key in ``_GRPO_BUDGET_KEYS``.
+  """
+  totals = {key: 0 for key in _GRPO_BUDGET_KEYS}
+  csv_path = os.path.join(results_dir, 'eval_metrics.csv')
+  try:
+    # The trainer owns the CSV format; it is already imported by the time
+    # GRPO runs, so this is a sys.modules lookup rather than a new import.
+    from trainer.rl_trainer import read_eval_csv_row  # pylint: disable=g-import-not-at-top
+
+    row = read_eval_csv_row(
+        csv_path,
+        [f'grpo/{key}_total' for key in _GRPO_BUDGET_KEYS],
+        upto_episode,
+    )
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    logging.warning(
+        '[AUTO-RESUME] Could not read GRPO budget totals from %s: %s',
+        csv_path,
+        e,
+    )
+    row = {}
+  if not row:
+    logging.warning(
+        '[AUTO-RESUME] No grpo/*_total columns in %s up to episode %d; the'
+        ' cumulative decision-point counters restart at 0, so this work'
+        " unit's curves are shifted left on the decision-point dashboard.",
+        csv_path,
+        upto_episode,
+    )
+    return totals
+  for key in _GRPO_BUDGET_KEYS:
+    totals[key] = int(round(row[f'grpo/{key}_total']))
+  logging.info(
+      '[AUTO-RESUME] Restored GRPO budget totals up to episode %d: %s',
+      upto_episode,
+      totals,
+  )
+  return totals
+
+
+def _maybe_run_baselines(runner, results_dir: str) -> None:
+  """Runs the one-off reference evaluations on the fixed deals (pass 0).
+
+  Two anchors are logged at ``episode=0`` in ``eval_metrics.csv``:
+
+  * ``eval_full/*`` -- the *initial* adapter (e.g. the BC checkpoint) in full
+    self-play.  Without it, later ``eval_full`` rows cannot claim improvement.
+  * ``eval_bot/*``  -- the heuristic hand-off bot in both seats for every turn
+    (``eval_llm_max_horizon=0``).  Sizes the gap to the bot on the same deals.
+
+  Results are cached in ``results/eval_baselines.json`` so a resumed run
+  (``initial_pass > 1`` or an existing cache file) never repeats them.
+
+  Args:
+    runner: The ``GRPORunner`` instance.
+    results_dir: Local results directory.
+  """
+  n = int(getattr(runner._config, 'eval_full_episodes', 0) or 0)
+  if n <= 0:
+    return
+  cache_path = os.path.join(results_dir, 'eval_baselines.json')
+  if os.path.exists(cache_path):
+    logging.info(
+        '[baselines] %s already exists; skipping baseline evaluation.',
+        cache_path,
+    )
+    return
+
+  seed_base = _eval_seed_base(runner)
+  deals = (
+      f'fixed (seeds {seed_base}..{seed_base + n - 1})'
+      if seed_base is not None
+      else 'random'
+  )
+  runner._backend.model.eval()
+  merged: dict[str, float] = {}
+  t0 = time.time()
+
+  logging.info(
+      '[baselines] Pass 0: initial adapter, full self-play, %d episodes,'
+      ' deals=%s.',
+      n,
+      deals,
+  )
+  merged.update(
+      _run_eval(
+          runner,
+          n,
+          eval_llm_max_horizon=None,
+          seed_base=seed_base,
+          metric_prefix='eval_full',
+      )
+  )
+  if getattr(runner._config, 'eval_bot_baseline', True):
+    logging.info(
+        '[baselines] Pass 0: heuristic bot in both seats for every turn,'
+        ' %d episodes, deals=%s.',
+        n,
+        deals,
+    )
+    merged.update(
+        _run_eval(
+            runner,
+            n,
+            eval_llm_max_horizon=0,
+            seed_base=seed_base,
+            metric_prefix='eval_bot',
+        )
+    )
+  merged['eval_full/elapsed_sec'] = time.time() - t0
+  runner._backend.model.train()
+
+  logging.info('--- Baseline evaluation (pass 0) ---')
+  for k, v in sorted(merged.items()):
+    logging.info('  %s: %.4f', k, v)
+  try:
+    with open(cache_path, 'w') as f:
+      json.dump(
+          {
+              'episodes': n,
+              'seed_base': seed_base,
+              'bot_type': getattr(runner._config, 'bot_type', None),
+              'metrics': merged,
+              'timestamp': time.time(),
+          },
+          f,
+          indent=2,
+      )
+  except IOError as e:
+    logging.warning('[baselines] Failed to write %s: %s', cache_path, e)
+  if runner._log_eval_metrics_fn is not None:
+    # Zero budget counters anchor the pass-0 baseline at x=0 on the
+    # decision-point dashboards (rows without an x value are not plotted).
+    merged.update(_grpo_budget_metrics({}, {}))
+    runner._log_eval_metrics_fn(0, merged)
 
 
 def run_sampled(runner) -> None:
@@ -2336,7 +3051,7 @@ def run_sampled(runner) -> None:
       'Starting GRPO training: %d passes, %d episodes/pass, K=%d, '
       'reward_sim=%s, horizon=%s, blend_w=%.2f, policy_turns=%d, '
       'turn_discount=%.3f, scale_rewards=%s, '
-      'constrained_actions=%s, strategic_actions=%s, llm_partner=%s',
+      'constrained_actions=%s, strategic_actions=%s',
       runner._config.passes,
       runner._config.collect_episodes,
       runner._config.num_generations,
@@ -2348,13 +3063,63 @@ def run_sampled(runner) -> None:
       runner._config.grpo_scale_rewards,
       runner._config.constrained_action_types,
       runner._config.strategic_action_selection,
-      runner._config.llm_partner_response,
   )
 
   start_time = time.time()
-  total_episodes_so_far = 0
+  start_pass = getattr(runner._config, 'initial_pass', 1) or 1
+  total_episodes_so_far = (start_pass - 1) * runner._config.collect_episodes
+  # Cumulative sample-budget counters (see _GRPO_BUDGET_KEYS).  A resumed run
+  # reads them back from eval_metrics.csv; they are not a function of the
+  # pass index like total_episodes_so_far.
+  budget_totals = {key: 0 for key in _GRPO_BUDGET_KEYS}
+  if start_pass > 1:
+    budget_totals = _load_grpo_budget_totals(
+        os.path.join(runner._output_dir, 'results'), total_episodes_so_far
+    )
 
-  for pass_idx in range(1, runner._config.passes + 1):
+  if start_pass > 1:
+    logging.info(
+        '=== [AUTO-RESUME] Resuming GRPO training from pass %d/%d (total_episodes=%d) ===',
+        start_pass,
+        runner._config.passes,
+        total_episodes_so_far,
+    )
+    print(
+        f'=== [AUTO-RESUME] Resuming GRPO training from pass {start_pass}/{runner._config.passes} '
+        f'(episodes={total_episodes_so_far}) ===',
+        flush=True,
+    )
+
+  if start_pass > runner._config.passes:
+    logging.info(
+        'Training already complete! start_pass (%d) > passes (%d). Exiting.',
+        start_pass,
+        runner._config.passes,
+    )
+    return
+
+  # Fail fast on an unsupported eval_mode (before any pass is trained) and
+  # record which per-pass evaluation flavour(s) this run will produce.
+  _eval_mode = getattr(runner._config, 'eval_mode', 'both')
+  _run_bot_guided, _run_full = _eval_flavours(_eval_mode)
+  logging.info(
+      '[evaluation] eval_mode=%r -> per-pass bot-guided curriculum eval'
+      ' (eval/*, %d games): %s; full self-play eval (eval_full/*, %d games):'
+      ' %s.',
+      _eval_mode,
+      runner._config.num_eval_episodes,
+      'on' if _run_bot_guided else 'off',
+      int(getattr(runner._config, 'eval_full_episodes', 0) or 0),
+      'on' if _run_full else 'off',
+  )
+
+  # ── Pass 0: one-off reference baselines on the fixed eval deals ──
+  # (initial adapter in full self-play + all-bot).  Only on a fresh start; a
+  # resumed run finds results/eval_baselines.json and skips.
+  if start_pass == 1:
+    _maybe_run_baselines(runner, os.path.join(runner._output_dir, 'results'))
+
+  for pass_idx in range(start_pass, runner._config.passes + 1):
     pass_start = time.time()
     logging.info('=== GRPO pass %d/%d ===', pass_idx, runner._config.passes)
 
@@ -2390,19 +3155,6 @@ def run_sampled(runner) -> None:
           runner._config.passes,
       )
 
-    # ── Epsilon annealing ──
-    if runner._config.epsilon_anneal_end is not None:
-      progress = (pass_idx - 1) / max(runner._config.passes - 1, 1)
-      runner._current_epsilon = runner._config.epsilon + progress * (
-          runner._config.epsilon_anneal_end - runner._config.epsilon
-      )
-    logging.info(
-        'Epsilon-greedy: %.3f (pass %d/%d)',
-        runner._current_epsilon,
-        pass_idx,
-        runner._config.passes,
-    )
-
     # ── Snapshot LoRA weights for stable partner simulation ──
     runner._frozen_lora_state = {
         name: param.data.clone()
@@ -2426,8 +3178,8 @@ def run_sampled(runner) -> None:
           (pass_idx - 1) // max(1, runner._config.curriculum_passes_per_phase)
       ) + 1
       c_start, c_end = runner._config.get_curriculum_active_window(pass_idx)
-      c_max_lb = getattr(runner._config, 'curriculum_max_lookback', 0)
-      c_lb_start = max(0, c_start - c_max_lb) if c_max_lb > 0 else 0
+      c_max_lb = getattr(runner._config, 'curriculum_max_lookback', -1)
+      c_lb_start = max(0, c_start - c_max_lb) if c_max_lb >= 0 else 0
       c_max_h = getattr(runner._config, 'curriculum_max_horizon', 0)
       c_max_h_str = (
           f'{c_max_h}' if c_max_h > 0 else '0 (uncapped, train to end of game)'
@@ -2449,7 +3201,7 @@ def run_sampled(runner) -> None:
           runner._config.curriculum_passes_per_phase,
           c_lb_start,
           c_start,
-          f'{c_max_lb} turns' if c_max_lb > 0 else 'unlimited [0, start_turn)',
+          f'{c_max_lb} turns' if c_max_lb >= 0 else 'unlimited [0, start_turn)',
           runner._config.curriculum_replay_ratio,
           c_max_h_str,
           c_end,
@@ -2464,19 +3216,143 @@ def run_sampled(runner) -> None:
           runner._config.passes,
       )
 
-    # ── Step 1: Collect prompts ──
-    runner._backend.model.eval()
-    prompt_entries, collect_stats = collect_game_prompts(
-        runner,
-        num_episodes=runner._config.collect_episodes,
-        pass_idx=pass_idx,
-        start_time=start_time,
+    # ── Step 1: Collect prompts (or load from cache if resuming mid-pass) ──
+    results_dir = os.path.join(runner._output_dir, 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    batch_cache_path = os.path.join(
+        results_dir, f'batch_cache_pass{pass_idx}.json'
     )
+    legacy_batch_cache_path = os.path.join(
+        runner._output_dir, f'batch_cache_pass{pass_idx}.json'
+    )
+    interim_progress_path = os.path.join(results_dir, 'interim_progress.json')
+
+    prompt_entries = None
+    collect_stats = None
+    sampled_player_prompts: dict[str, list[str]] = {}
+
+    cache_to_read = (
+        batch_cache_path
+        if os.path.exists(batch_cache_path)
+        else (
+            legacy_batch_cache_path
+            if os.path.exists(legacy_batch_cache_path)
+            else None
+        )
+    )
+    if cache_to_read is not None:
+      try:
+        with open(cache_to_read, 'r') as f:
+          cached_payload = json.load(f)
+        prompt_entries = cached_payload.get('prompt_entries')
+        collect_stats = cached_payload.get('collect_stats')
+        sampled_player_prompts = cached_payload.get(
+            'sampled_player_prompts', {}
+        )
+        if prompt_entries and collect_stats:
+          first_ser = prompt_entries[0].get('serialized_state')
+          if (
+              isinstance(first_ser, str)
+              and '"adapter": "hanabi_env"' in first_ser
+              and '"history"' not in first_ser
+          ):
+            logging.warning(
+                '[BATCH CACHE] Legacy cache %s lacks Hanabi move history;'
+                ' discarding and re-collecting pass %d.',
+                cache_to_read,
+                pass_idx,
+            )
+            prompt_entries = None
+            sampled_player_prompts = {}
+          else:
+            for p_entry in prompt_entries:
+              runner._prompt_metadata[p_entry['prompt']] = p_entry
+            logging.info(
+                '[BATCH CACHE] Restored %d cached rollout prompts for pass %d'
+                ' from %s',
+                len(prompt_entries),
+                pass_idx,
+                cache_to_read,
+            )
+            print(
+                f'[BATCH CACHE] Restored {len(prompt_entries)} cached rollout'
+                f' prompts for pass {pass_idx}!',
+                flush=True,
+            )
+        else:
+          prompt_entries = None
+      except Exception as e:
+        logging.warning(
+            '[BATCH CACHE] Failed to load cache file %s: %s. Re-collecting.',
+            cache_to_read,
+            e,
+        )
+        prompt_entries = None
+
+    resumed_completed_players: list[int] = []
+    resumed_player_id = None
+    resumed_completed_prompts = 0
+    if prompt_entries is not None and os.path.exists(interim_progress_path):
+      try:
+        with open(interim_progress_path, 'r') as f:
+          ip_data = json.load(f)
+        if (
+            ip_data.get('status') == 'in_progress'
+            and ip_data.get('pass_idx') == pass_idx
+        ):
+          resumed_completed_players = [
+              int(x) for x in ip_data.get('completed_players', [])
+          ]
+          resumed_player_id = ip_data.get('player_id')
+          resumed_completed_prompts = int(
+              ip_data.get('completed_prompts', 0)
+          )
+          logging.info(
+              '[INTERIM RESUME] Pass %d resuming mid-pass:'
+              ' completed_players=%s, current_player=%s,'
+              ' completed_prompts=%d',
+              pass_idx,
+              resumed_completed_players,
+              resumed_player_id,
+              resumed_completed_prompts,
+          )
+      except Exception as e:
+        logging.warning(
+            '[INTERIM RESUME] Failed to read %s: %s', interim_progress_path, e
+        )
+
+    runner._pass_completed_players = list(resumed_completed_players)
+    runner._pass_completed_prompts = 0
+    if getattr(runner, '_last_periodic_save_time', 0.0) <= 0.0:
+      runner._last_periodic_save_time = time.time()
+
+    freshly_collected = False
+    if prompt_entries is None:
+      freshly_collected = True
+      runner._backend.model.eval()
+      prompt_entries, collect_stats = collect_game_prompts(
+          runner,
+          num_episodes=runner._config.collect_episodes,
+          pass_idx=pass_idx,
+          start_time=start_time,
+      )
+      try:
+        with open(batch_cache_path, 'w') as f:
+          json.dump(
+              {
+                  'prompt_entries': prompt_entries,
+                  'collect_stats': collect_stats,
+                  'sampled_player_prompts': sampled_player_prompts,
+              },
+              f,
+          )
+      except Exception as e:
+        logging.warning('[BATCH CACHE] Failed to save cache: %s', e)
+
     total_episodes_so_far += runner._config.collect_episodes
 
-    # Record collection metrics to results/collection_metrics.csv
-    results_dir = os.path.join(runner._output_dir, 'results')
-    if os.path.exists(results_dir):
+    # Record collection metrics to results/collection_metrics.csv (only once per pass)
+    if freshly_collected and os.path.exists(results_dir):
       collect_csv_path = os.path.join(results_dir, 'collection_metrics.csv')
       write_header = not os.path.exists(collect_csv_path)
       try:
@@ -2508,8 +3384,11 @@ def run_sampled(runner) -> None:
     total_pass_loss = 0.0
     total_pass_reward = 0.0
     num_train_steps = 0
+    # Unique decision points expanded into GRPO groups this pass (summed over
+    # per-player updates).  Counted from the full sampled list, before the
+    # mid-pass resume skips, so a preempted pass is not under-counted.
+    pass_decision_points = 0
 
-    # Curriculum window calculation:
     # Curriculum window calculation and graduation check:
     window_size = getattr(runner._config, 'curriculum_window_size', 0)
     if window_size > 0 and not getattr(runner, '_curriculum_graduated', False):
@@ -2521,7 +3400,9 @@ def run_sampled(runner) -> None:
           (e.get('turn_index', 0) + 1 for e in prompt_entries), default=0
       )
       active_count = sum(
-          1 for e in prompt_entries if start_turn <= e.get('turn_index', 0) < end_turn
+          1
+          for e in prompt_entries
+          if start_turn <= e.get('turn_index', 0) < end_turn
       )
       reached_max_h = max_horizon_cfg > 0 and end_turn >= max_horizon_cfg
       reached_natural_end = max_horizon_cfg <= 0 and (
@@ -2545,15 +3426,15 @@ def run_sampled(runner) -> None:
     if is_graduated or window_size <= 0:
       start_turn, end_turn = 0, 1000
       replay_ratio = 0.0
-      max_lookback = 0
+      lookback_start = 0
     else:
       start_turn, end_turn = runner._config.get_curriculum_active_window(
           pass_idx
       )
       replay_ratio = getattr(runner._config, 'curriculum_replay_ratio', 0.30)
-      max_lookback = getattr(runner._config, 'curriculum_max_lookback', 0)
+      max_lookback = getattr(runner._config, 'curriculum_max_lookback', -1)
       lookback_start = (
-          max(0, start_turn - max_lookback) if max_lookback > 0 else 0
+          max(0, start_turn - max_lookback) if max_lookback >= 0 else 0
       )
       logging.info(
           '[curriculum] Pass %d: active window turns [%d, %d), lookback [%d,'
@@ -2563,7 +3444,7 @@ def run_sampled(runner) -> None:
           end_turn,
           lookback_start,
           start_turn,
-          f'{max_lookback} turns' if max_lookback > 0 else 'unlimited',
+          f'{max_lookback} turns' if max_lookback >= 0 else 'unlimited',
           replay_ratio,
       )
 
@@ -2588,7 +3469,6 @@ def run_sampled(runner) -> None:
       max_game_length = max(
           (e.get('turn_index', 0) + 1 for e in entries), default=0
       )
-      lookback_s = max(0, start_turn - max_lookback) if max_lookback > 0 else 0
 
       active_entries = [
           e for e in entries if start_turn <= e.get('turn_index', 0) < end_turn
@@ -2596,7 +3476,7 @@ def run_sampled(runner) -> None:
       replay_entries = [
           e
           for e in entries
-          if lookback_s <= e.get('turn_index', 0) < start_turn
+          if lookback_start <= e.get('turn_index', 0) < start_turn
       ]
 
       active_prompts = list({e['prompt'] for e in active_entries})
@@ -2612,7 +3492,11 @@ def run_sampled(runner) -> None:
       else:
         active_target = max(1, window_size * num_episodes)
 
-      clamped_ratio = min(max(0.0, replay_ratio), 0.99)
+      # No replay window (lookback 0, or start_turn == 0) => no replay budget;
+      # otherwise the shortfall backfill below would refill it from any turn.
+      clamped_ratio = (
+          min(max(0.0, replay_ratio), 0.99) if lookback_start < start_turn else 0.0
+      )
       max_updates = (
           int(round(active_target / (1.0 - clamped_ratio)))
           if clamped_ratio < 1.0
@@ -2687,12 +3571,26 @@ def run_sampled(runner) -> None:
           start_turn,
           end_turn,
           len(selected_replay),
-          lookback_s,
+          lookback_start,
           start_turn,
           len(extra_prompts),
           max_updates,
       )
       return selected
+
+    def _persist_batch_cache_with_prompts() -> None:
+      try:
+        with open(batch_cache_path, 'w') as f:
+          json.dump(
+              {
+                  'prompt_entries': prompt_entries,
+                  'collect_stats': collect_stats,
+                  'sampled_player_prompts': sampled_player_prompts,
+              },
+              f,
+          )
+      except Exception as e:
+        logging.warning('[BATCH CACHE] Failed to update cache: %s', e)
 
     if runner._config.per_player_updates:
       player_groups: dict[int, list[dict]] = {}
@@ -2703,32 +3601,90 @@ def run_sampled(runner) -> None:
         player_groups[pid].append(entry)
 
       for pid in sorted(player_groups.keys()):
-        group_entries = player_groups[pid]
-        unique_prompts = _sample_curriculum_prompts(group_entries)
+        p_key = str(pid)
+        if p_key in sampled_player_prompts and sampled_player_prompts[p_key]:
+          unique_prompts = sampled_player_prompts[p_key]
+        else:
+          group_entries = player_groups[pid]
+          unique_prompts = _sample_curriculum_prompts(group_entries)
+          sampled_player_prompts[p_key] = unique_prompts
+          _persist_batch_cache_with_prompts()
+
         if not unique_prompts:
           continue
+        pass_decision_points += len(unique_prompts)
+        if pid in runner._pass_completed_players:
+          logging.info(
+              '[INTERIM RESUME] Pass %d: Skipping Player %d (already completed'
+              ' before preemption).',
+              pass_idx,
+              pid,
+          )
+          continue
+
+        if (
+            resumed_player_id == pid
+            and 0 < resumed_completed_prompts < len(unique_prompts)
+        ):
+          logging.info(
+              '[INTERIM RESUME] Pass %d (Player %d): Skipping %d/%d'
+              ' already-trained prompts.',
+              pass_idx,
+              pid,
+              resumed_completed_prompts,
+              len(unique_prompts),
+          )
+          runner._pass_completed_prompts = resumed_completed_prompts
+          prompts_to_train = unique_prompts[resumed_completed_prompts:]
+        else:
+          runner._pass_completed_prompts = 0
+          prompts_to_train = unique_prompts
+
         logging.info(
             'Pass %d: training on %d unique prompts for Player %d.',
             pass_idx,
-            len(unique_prompts),
+            len(prompts_to_train),
             pid,
         )
         p_loss, p_reward = _train_grpo_on_prompts(
-            runner, unique_prompts, pass_idx, pid, trl
+            runner, prompts_to_train, pass_idx, pid, trl
         )
         total_pass_loss += p_loss
         total_pass_reward += p_reward
         num_train_steps += 1
+        runner._pass_completed_players.append(pid)
+        runner._pass_completed_prompts = 0
     else:
-      unique_prompts = _sample_curriculum_prompts(prompt_entries)
+      p_key = 'all'
+      if p_key in sampled_player_prompts and sampled_player_prompts[p_key]:
+        unique_prompts = sampled_player_prompts[p_key]
+      else:
+        unique_prompts = _sample_curriculum_prompts(prompt_entries)
+        sampled_player_prompts[p_key] = unique_prompts
+        _persist_batch_cache_with_prompts()
+      pass_decision_points += len(unique_prompts)
+
+      if 0 < resumed_completed_prompts < len(unique_prompts):
+        logging.info(
+            '[INTERIM RESUME] Pass %d: Skipping %d/%d already-trained prompts.',
+            pass_idx,
+            resumed_completed_prompts,
+            len(unique_prompts),
+        )
+        runner._pass_completed_prompts = resumed_completed_prompts
+        prompts_to_train = unique_prompts[resumed_completed_prompts:]
+      else:
+        runner._pass_completed_prompts = 0
+        prompts_to_train = unique_prompts
+
       logging.info(
           'Pass %d: %d unique prompts from %d total.',
           pass_idx,
-          len(unique_prompts),
+          len(prompts_to_train),
           len(prompt_entries),
       )
       p_loss, p_reward = _train_grpo_on_prompts(
-          runner, unique_prompts, pass_idx, None, trl
+          runner, prompts_to_train, pass_idx, None, trl
       )
       total_pass_loss += p_loss
       total_pass_reward += p_reward
@@ -2745,43 +3701,97 @@ def run_sampled(runner) -> None:
         avg_reward,
     )
 
+    # Clean up mid-pass cache files now that training for this pass is complete
+    try:
+      for fname in os.listdir(results_dir):
+        if fname.startswith('batch_cache_pass') or fname.startswith(
+            'reward_cache_pass'
+        ):
+          os.remove(os.path.join(results_dir, fname))
+    except Exception:
+      pass
+
     # ── Step 4: Log training metrics ──
     if runner._log_training_step_fn is not None:
       runner._log_training_step_fn(pass_idx, avg_reward, avg_loss, start_time)
 
     # ── Step 5: Evaluate ──
     runner._backend.model.eval()
-    horizon = (
-        None
-        if getattr(runner, '_curriculum_graduated', False)
-        or runner._config.curriculum_window_size <= 0
-        else runner._config.get_curriculum_horizon(pass_idx)
-    )
-    eval_kwargs = {}
-    if horizon is not None:
-      eval_kwargs['eval_llm_max_horizon'] = horizon
-      logging.info(
-          '[curriculum evaluation] Pass %d: evaluating %d episodes. LLM plays'
-          ' turns [0, %d); heuristic bot plays remainder [%d, terminal).',
-          pass_idx,
-          runner._config.num_eval_episodes,
-          horizon,
-          horizon,
+    eval_mode = getattr(runner._config, 'eval_mode', 'both')
+    run_bot_guided, run_full = _eval_flavours(eval_mode)
+    eval_metrics: dict[str, float] = {}
+    if run_bot_guided:
+      # Curriculum ("bot-guided") eval: the LLM plays turns [0, horizon) and
+      # the heuristic bot finishes the game.  Only measures play up to the
+      # curriculum horizon, so it is off unless eval_mode is bot_guided/both.
+      horizon = (
+          None
+          if getattr(runner, '_curriculum_graduated', False)
+          or runner._config.curriculum_window_size <= 0
+          else runner._config.get_curriculum_horizon(pass_idx)
+      )
+      eval_kwargs = {}
+      seed_base = _eval_seed_base(runner)
+      if seed_base is not None:
+        eval_kwargs['seed_base'] = seed_base
+      if horizon is not None:
+        eval_kwargs['eval_llm_max_horizon'] = horizon
+        logging.info(
+            '[curriculum evaluation] Pass %d: evaluating %d episodes. LLM'
+            ' plays turns [0, %d); heuristic bot plays remainder'
+            ' [%d, terminal). Deals: %s.',
+            pass_idx,
+            runner._config.num_eval_episodes,
+            horizon,
+            horizon,
+            f'fixed (seed_base={seed_base})'
+            if seed_base is not None
+            else 'random',
+        )
+      else:
+        logging.info(
+            '[curriculum evaluation] Pass %d: evaluating %d episodes with LLM'
+            ' for all turns (no curriculum horizon limit). Deals: %s.',
+            pass_idx,
+            runner._config.num_eval_episodes,
+            f'fixed (seed_base={seed_base})'
+            if seed_base is not None
+            else 'random',
+        )
+      eval_metrics.update(
+          _run_eval(runner, runner._config.num_eval_episodes, **eval_kwargs)
       )
     else:
       logging.info(
-          '[curriculum evaluation] Pass %d: evaluating %d episodes with LLM'
-          ' for all turns (no curriculum horizon limit).',
+          '[curriculum evaluation] Pass %d: skipped (eval_mode=%r).',
           pass_idx,
-          runner._config.num_eval_episodes,
+          eval_mode,
       )
-    try:
-      eval_metrics = runner._evaluate_fn(
-          runner._config.num_eval_episodes, **eval_kwargs
-      )
-    except TypeError:
-      eval_metrics = runner._evaluate_fn(runner._config.num_eval_episodes)
+    if run_full:
+      # Full self-play on the same fixed deals (LLM every turn): the
+      # horizon-independent "is the whole game getting better?" signal.
+      eval_metrics.update(_run_full_selfplay_eval(runner, pass_idx))
     eval_metrics['eval/collection_mean_reward'] = collect_stats['mean_reward']
+    # Sample-budget counters: per pass and cumulative (x-axes of the
+    # decision-point Flatboard dashboard, see _GRPO_BUDGET_KEYS).
+    pass_budget = {
+        'decision_points': pass_decision_points,
+        'rollouts': (
+            pass_decision_points
+            * runner._config.num_generations
+            * max(1, int(getattr(runner._config, 'train_epochs', 1) or 1))
+        ),
+        'collected_decision_points': int(collect_stats.get('num_prompts', 0)),
+    }
+    for key, count in pass_budget.items():
+      budget_totals[key] += count
+    eval_metrics.update(_grpo_budget_metrics(pass_budget, budget_totals))
+    # Fold this pass's training diagnostics (mean over per-player calls) into
+    # the eval row so loss decomposition / LoRA drift land in eval_metrics.csv.
+    diags = getattr(runner, '_train_diags', [])
+    for k in {k for d in diags for k in d}:
+      eval_metrics[k] = float(np.mean([d[k] for d in diags if k in d]))
+    runner._train_diags = []
     logging.info('--- Evaluation after GRPO pass %d ---', pass_idx)
     for k, v in sorted(eval_metrics.items()):
       logging.info('  %s: %.4f', k, v)
@@ -2789,8 +3799,37 @@ def run_sampled(runner) -> None:
     if runner._log_eval_metrics_fn is not None:
       runner._log_eval_metrics_fn(total_episodes_so_far, eval_metrics)
 
-    # ── Step 6: Checkpoint ──
-    runner._save_checkpoint_fn(total_episodes_so_far)
+    # ── Step 6: Checkpoint (runs asynchronously in parallel without blocking) ──
+    try:
+      with open(interim_progress_path, 'w') as f:
+        json.dump(
+            {
+                'status': 'pass_complete',
+                'pass_idx': pass_idx,
+                'total_episodes': total_episodes_so_far,
+                'timestamp': time.time(),
+            },
+            f,
+            indent=2,
+        )
+    except Exception:
+      pass
+
+    checkpoint_meta = {
+        'status': 'pass_complete',
+        'pass_idx': pass_idx,
+        'total_episodes': total_episodes_so_far,
+        'eval_metrics': eval_metrics,
+        'train_metrics': {
+            'avg_loss': avg_loss,
+            'avg_reward': avg_reward,
+            'pass_elapsed_sec': pass_elapsed,
+        },
+        'collection_metrics': collect_stats,
+        'timestamp': time.time(),
+    }
+    runner._last_periodic_save_time = time.time()
+    runner._save_checkpoint_fn(total_episodes_so_far, metadata=checkpoint_meta)
 
   # ── Final summary and checkpoint ──
   total_time = time.time() - start_time
@@ -2802,4 +3841,12 @@ def run_sampled(runner) -> None:
   )
   if runner._write_summary_fn is not None:
     runner._write_summary_fn(total_time)
-  runner._save_checkpoint_fn(total_episodes_so_far, suffix='final')
+  final_meta = {
+      'pass_idx': runner._config.passes,
+      'total_episodes': total_episodes_so_far,
+      'total_time_sec': total_time,
+      'timestamp': time.time(),
+  }
+  runner._save_checkpoint_fn(
+      total_episodes_so_far, suffix='final', metadata=final_meta, wait=True
+  )

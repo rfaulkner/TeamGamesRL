@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Dense per-action reward shaping for Hanabi.
 
 Instead of rolling the game out to completion and using the terminal score
@@ -576,50 +562,21 @@ def evaluate_dense_chain(
     serialized_state: Optional[str] = None,
     horizon: int = 4,
     discount: float = 0.9,
-    llm_partner_response: bool = False,
-    partner_action: Optional[int] = None,
+    policy_actions: Optional[list[int]] = None,
     post_action_state=None,
+    post_policy_state=None,
 ) -> float:
-  """Evaluate a chosen action plus a short heuristic continuation.
+  """Evaluate a chosen action plus policy and heuristic continuation.
 
-  Computes the dense reward for ``chosen_action``, then continues
-  the game for ``horizon`` more turns using the heuristic player,
-  accumulating discounted dense rewards for each subsequent action.
-
-  This addresses the myopic-play concern: the agent gets credit not
-  just for the immediate action quality but also for how well the
-  game state it creates supports good subsequent play.
-
-  The total reward is::
+  Computes the dense reward for ``chosen_action``, then continues the game
+  for subsequent policy turns (from ``policy_actions``) and heuristic
+  turns up to ``horizon``, accumulating discounted dense rewards:
 
     r_0 + gamma * r_1 + gamma^2 * r_2 + ... + gamma^h * r_h
 
-  where r_0 is the dense reward for ``chosen_action`` and r_1..r_h
-  are the dense rewards for the heuristic player's subsequent moves.
-
-  When ``partner_action`` is provided, it is directly used for the
-  first continuation turn. Otherwise, when ``llm_partner_response`` is
-  True, the first continuation turn (the partner's response) is sampled
-  from the frozen LLM policy.
-
-  Args:
-    runner: The ``GRPORunner`` instance (for environment and config).
-    action_history: Action history leading to the current state.
-    chosen_action: The action to evaluate.
-    target_player: The player whose perspective we're evaluating from.
-    serialized_state: Serialized state string for restoration.
-    horizon: Number of additional turns to simulate after the chosen
-        action. Each turn's reward is discounted by ``discount``.
-    discount: Discount factor gamma for future action rewards.
-    llm_partner_response: If True, use frozen LLM policy for the first
-        continuation turn (the partner's immediate response).
-    partner_action: Pre-computed action ID for the partner's immediate
-        continuation turn. If given, avoids sampling an LLM action.
-    post_action_state: Optional pre-advanced game state after chosen_action
-        has been applied. Reusing this state avoids card dealing divergence.
-
-  Returns:
-    The total discounted dense reward.
+  where r_0 is the dense reward for ``chosen_action``, r_1..r_k are dense
+  rewards for LLM policy continuation turns, and remaining turns are
+  evaluated using the heuristic player.
   """
   # Restore the game state for initial action evaluation.
   if serialized_state is not None:
@@ -637,7 +594,7 @@ def evaluate_dense_chain(
   if state.is_terminal():
     return 0.0
 
-  # Compute dense reward for the chosen action.
+  # Compute dense reward for the chosen action (Turn 1).
   total_reward = evaluate_action_quality(state, chosen_action, target_player)
 
   # Advance state: reuse cloned post_action_state if provided, else apply chosen_action.
@@ -651,7 +608,35 @@ def evaluate_dense_chain(
     elif legal0:
       state.apply_action(int(np.random.choice(legal0)))
 
-  # Continue with heuristic player for `horizon` turns.
+  gamma = discount
+  turns_simulated = 0
+
+  # Evaluate precomputed subsequent LLM policy actions (Turns 2 .. m).
+  if policy_actions:
+    for p_act in policy_actions:
+      if turns_simulated >= horizon or state.is_terminal():
+        break
+      curr_p = state.current_player()
+      legal = state.legal_actions(curr_p)
+      act = p_act if (p_act is not None and p_act in legal) else (int(np.random.choice(legal)) if legal else None)
+      if act is None:
+        break
+      step_reward = evaluate_action_quality(state, act, curr_p)
+      total_reward += gamma * step_reward
+      gamma *= discount
+      state.apply_action(act)
+      turns_simulated += 1
+
+  # If post_policy_state was provided and we evaluated all policy actions, sync state
+  if post_policy_state is not None and hasattr(post_policy_state, 'clone') and turns_simulated == len(policy_actions or []):
+    state = post_policy_state.clone()
+    runner._env.set_state(state)
+
+  remaining_horizon = horizon - turns_simulated
+  if remaining_horizon <= 0 or state.is_terminal():
+    return total_reward
+
+  # Continue with heuristic player for the remaining horizon turns.
   bot_type = getattr(runner._config, 'bot_type', 'belief_lookahead')
   heuristic = None
   game = getattr(runner._env, 'game', None)
@@ -666,11 +651,9 @@ def evaluate_dense_chain(
       from env.hanabi.heuristic_player import SafePlayPlayer  # pylint: disable=g-import-not-at-top
       heuristic = SafePlayPlayer(seed=42)
     except ImportError:
-      # No heuristic available -- return just the immediate reward.
       return total_reward
-  gamma = discount
-  first_continuation = True
-  for _ in range(horizon):
+
+  for _ in range(remaining_horizon):
     if state.is_terminal():
       break
     current_player = state.current_player()
@@ -678,32 +661,13 @@ def evaluate_dense_chain(
     if not legal:
       break
 
-    # For the first continuation turn, optionally use the precomputed
-    # or sampled LLM partner action.
-    if first_continuation and (partner_action is not None or llm_partner_response):
-      first_continuation = False
-      if partner_action is not None:
-        h_action = partner_action
-      else:
-        from learn.grpo_sampled import _sample_llm_partner_action  # pylint: disable=g-import-not-at-top
-        h_action = _sample_llm_partner_action(runner, state)
-      if h_action is None or h_action not in legal:
-        h_action = int(np.random.choice(legal)) if legal else None
-      if h_action is None:
-        break
-    else:
-      first_continuation = False
-      # Heuristic selects the next action.
-      h_action = heuristic.select_action(state, current_player, game)
-      if h_action is None or h_action not in legal:
-        h_action = int(np.random.choice(legal)) if legal else None
-      if h_action is None:
-        break
+    h_action = heuristic.select_action(state, current_player, game)
+    if h_action is None or h_action not in legal:
+      h_action = int(np.random.choice(legal)) if legal else None
+    if h_action is None:
+      break
 
-    # Compute dense reward for this continuation action.
-    step_reward = evaluate_action_quality(
-        state, h_action, current_player
-    )
+    step_reward = evaluate_action_quality(state, h_action, current_player)
     total_reward += gamma * step_reward
     gamma *= discount
 

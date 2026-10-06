@@ -45,7 +45,13 @@ from typing import Optional
 from absl import logging
 import numpy as np
 
-from open_spiel.python import rl_agent
+try:
+  from open_spiel.python import rl_agent
+except ImportError:
+  try:
+    from third_party.open_spiel.python import rl_agent
+  except ImportError:
+    from google3.third_party.open_spiel.python import rl_agent
 
 from env import state_renderers
 

@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Environment creation and renderer factory for TeamGamesRL.
 
 This module consolidates the duplicated environment-creation logic and
@@ -23,7 +9,7 @@ from env import state_renderers
 from env.game_config import GameConfig
 
 
-def create_env(game_config: GameConfig):
+def create_env(game_config: GameConfig, seed: int | None = None):
   """Create a game environment from a game configuration.
 
   For most games, this creates an OpenSpiel ``rl_environment.Environment``.
@@ -35,6 +21,10 @@ def create_env(game_config: GameConfig):
 
   Args:
     game_config: A ``GameConfig`` describing the game to instantiate.
+    seed: Optional seed for the environment's chance events (card deals).
+      Two environments created with the same seed deal the same cards, which
+      enables fixed-deal (paired) evaluation across training passes.  ``None``
+      keeps the default, unseeded behaviour.
 
   Returns:
     An environment instance with ``reset()``, ``step()``, ``_state``,
@@ -44,15 +34,24 @@ def create_env(game_config: GameConfig):
     from env.hanabi.hanabi_env import HanabiEnvironment  # pylint: disable=g-import-not-at-top
     from env.hanabi.hanabi_env import HanabiGame  # pylint: disable=g-import-not-at-top
 
-    game = HanabiGame(**game_config.game_params)
+    game = HanabiGame(**game_config.game_params, seed=seed)
     return HanabiEnvironment(game)
 
-  from open_spiel.python import rl_environment  # pylint: disable=g-import-not-at-top
+  try:
+    from open_spiel.python import rl_environment  # pylint: disable=g-import-not-at-top
+  except ImportError:
+    try:
+      from third_party.open_spiel.python import rl_environment  # pylint: disable=g-import-not-at-top
+    except ImportError:
+      from google3.third_party.open_spiel.python import rl_environment  # pylint: disable=g-import-not-at-top
 
-  if game_config.game_params:
-    return rl_environment.Environment(
-        game_config.game_name, **game_config.game_params
+  env_kwargs = dict(game_config.game_params or {})
+  if seed is not None:
+    env_kwargs['chance_event_sampler'] = rl_environment.ChanceEventSampler(
+        seed=seed
     )
+  if env_kwargs:
+    return rl_environment.Environment(game_config.game_name, **env_kwargs)
   return rl_environment.Environment(game_config.game_name)
 
 

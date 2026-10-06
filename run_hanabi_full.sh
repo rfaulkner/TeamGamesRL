@@ -55,13 +55,12 @@ LORA_RANK=16
 LR="2e-5"
 GRPO_PASSES=50
 COLLECT_EPISODES=20
+COLLECT_BATCH_SIZE=16
 MAX_SEQ_LEN=2048
 TEMPERATURE="1.2"
 TEMPERATURE_ANNEAL_END="0.7"
 TEMPERATURE_FLOOR="0.5"
 MAX_COMPLETION_LENGTH=20
-EPSILON="0.3"
-EPSILON_ANNEAL_END="0.0"
 REWARD_MODE="dense_chain"
 REWARD_BLEND_WEIGHT="0.50"
 REWARD_ROLLOUT_SAMPLES="1"
@@ -131,8 +130,6 @@ for arg in "$@"; do
     --temperature_anneal_end=*) TEMPERATURE_ANNEAL_END="${arg#*=}" ;;
     --temperature_floor=*) TEMPERATURE_FLOOR="${arg#*=}" ;;
     --max_completion_length=*) MAX_COMPLETION_LENGTH="${arg#*=}" ;;
-    --epsilon=*)      EPSILON="${arg#*=}" ;;
-    --epsilon_anneal_end=*) EPSILON_ANNEAL_END="${arg#*=}" ;;
     --reward_mode=*|--reward_simulation_mode=*) REWARD_MODE="${arg#*=}" ;;
     --reward_blend_weight=*) REWARD_BLEND_WEIGHT="${arg#*=}" ;;
     --reward_rollout_samples=*) REWARD_ROLLOUT_SAMPLES="${arg#*=}" ;;
@@ -153,6 +150,7 @@ for arg in "$@"; do
     --reasoning) REASONING="true" ;;
     --reasoning=*) REASONING="${arg#*=}" ;;
     --eval_batch_size=*) EVAL_BATCH_SIZE="${arg#*=}" ;;
+    --collect_batch_size=*|--grpo_collect_batch_size=*) COLLECT_BATCH_SIZE="${arg#*=}" ;;
     --curriculum_window_size=*) CURRICULUM_WINDOW_SIZE="${arg#*=}" ;;
     --curriculum_passes_per_phase=*) CURRICULUM_PASSES_PER_PHASE="${arg#*=}" ;;
     --curriculum_max_horizon=*) CURRICULUM_MAX_HORIZON="${arg#*=}" ;;
@@ -232,7 +230,6 @@ echo "  Log / Log Episodes Every:    5 passes"
 echo ""
 echo " [Sampling & Exploration]"
 echo "  Temperature:                 ${TEMPERATURE} (anneal end: ${TEMPERATURE_ANNEAL_END:-none}, floor: ${TEMPERATURE_FLOOR:-none})"
-echo "  Epsilon:                     ${EPSILON} (anneal end: ${EPSILON_ANNEAL_END:-none})"
 echo ""
 echo " [Reward & Simulation]"
 echo "  Reward Mode:                 ${REWARD_MODE}"
@@ -316,8 +313,6 @@ python3 trainer/gemma_rl_trainer.py \
   --checkpoint_every=25 \
   --temperature="${TEMPERATURE}" \
   ${ANNEAL_FLAGS} \
-  --epsilon="${EPSILON}" \
-  --epsilon_anneal_end="${EPSILON_ANNEAL_END}" \
   --reward_simulation_mode="${REWARD_MODE}" \
   --reward_blend_weight="${REWARD_BLEND_WEIGHT}" \
   --reward_rollout_samples="${REWARD_ROLLOUT_SAMPLES}" \
@@ -335,6 +330,7 @@ python3 trainer/gemma_rl_trainer.py \
   --bot_type="${BOT_TYPE}" \
   --reasoning="${REASONING}" \
   --eval_batch_size="${EVAL_BATCH_SIZE}" \
+  --grpo_collect_batch_size="${COLLECT_BATCH_SIZE}" \
   --curriculum_window_size="${CURRICULUM_WINDOW_SIZE}" \
   --curriculum_passes_per_phase="${CURRICULUM_PASSES_PER_PHASE}" \
   --curriculum_max_horizon="${CURRICULUM_MAX_HORIZON}" \

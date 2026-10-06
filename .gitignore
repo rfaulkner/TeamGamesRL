@@ -47,3 +47,6 @@ reports/
 
 # Misc
 .DS_Store
+BUILD
+xm_*
+s2*

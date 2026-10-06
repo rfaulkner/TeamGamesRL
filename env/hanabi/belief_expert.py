@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Belief-state lookahead expert player for Hanabi.
 
 Evaluates candidate actions using belief-consistent determinization and
@@ -79,6 +65,22 @@ class SafeBeliefLookaheadPlayer:
             new_cards_at_index_zero=new_cards_at_index_zero,
         ),
     ]
+    # Read-only trace of the most recent ``select_action`` call.  Lets a
+    # caller (e.g. the BC data generator) explain *why* an action was chosen
+    # without re-running or perturbing the decision.  Keys:
+    #   kind: 'single_legal' | 'known_playable' | 'single_candidate'
+    #         | 'heuristic_fallback' | 'lookahead'
+    #   action: the returned action id
+    #   playable_position: hand index of the known-playable card (kind ==
+    #         'known_playable'), else None
+    #   q_values: {action_id: mean rollout score} (kind == 'lookahead')
+    #   n_worlds: number of determinized worlds actually used
+    self.last_decision: dict[str, Any] = {}
+
+  def _record(self, kind: str, action: int, **extra: Any) -> int:
+    """Stores the decision trace and returns ``action`` unchanged."""
+    self.last_decision = {'kind': kind, 'action': action, **extra}
+    return action
 
   def select_action(
       self,
@@ -90,7 +92,7 @@ class SafeBeliefLookaheadPlayer:
     del game
     legal_actions = state.legal_actions(player_id)
     if len(legal_actions) == 1:
-      return legal_actions[0]
+      return self._record('single_legal', legal_actions[0])
 
     obs_string = state.observation_string(player_id)
     fireworks = self._bot._parse_fireworks(obs_string)
@@ -104,7 +106,11 @@ class SafeBeliefLookaheadPlayer:
         card_knowledge, fireworks, play_actions
     )
     if playable_action is not None:
-      return playable_action
+      return self._record(
+          'known_playable',
+          playable_action,
+          playable_position=play_actions[playable_action],
+      )
 
     # 2. Restrict candidate actions to legal hints and legal discards.
     # We deliberately do NOT gamble on blind plays of unhinted cards.
@@ -118,7 +124,7 @@ class SafeBeliefLookaheadPlayer:
       candidate_actions = legal_actions
 
     if len(candidate_actions) == 1:
-      return candidate_actions[0]
+      return self._record('single_candidate', candidate_actions[0])
 
     # Sample N determinized worlds
     worlds = []
@@ -130,10 +136,13 @@ class SafeBeliefLookaheadPlayer:
         break
 
     if not worlds:
-      return self._bot.select_action(state, player_id)
+      return self._record(
+          'heuristic_fallback', self._bot.select_action(state, player_id)
+      )
 
     best_action = candidate_actions[0]
     best_q = -1e9
+    q_values: dict[int, float] = {}
 
     for action in candidate_actions:
       total_score = 0.0
@@ -145,8 +154,11 @@ class SafeBeliefLookaheadPlayer:
         else:
           total_score += _rollout_to_terminal(sim, self._rollout_players)
       q = total_score / len(worlds)
+      q_values[action] = q
       if q > best_q:
         best_q = q
         best_action = action
 
-    return best_action
+    return self._record(
+        'lookahead', best_action, q_values=q_values, n_worlds=len(worlds)
+    )

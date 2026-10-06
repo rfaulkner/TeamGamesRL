@@ -1,17 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Gemma 2B RL trainer for multi-agent OpenSpiel team games.
 
 This is the CLI entry point that wires together:
@@ -27,8 +13,38 @@ Usage:
 """
 
 import dataclasses
+import os
 import sys
 from typing import Any
+
+# Prevent PyTorch CUDA memory fragmentation on large allocations
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+# Ensure project root is in sys.path when running as a package or binary
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+  sys.path.insert(0, _REPO_ROOT)
+
+# In Google3, open_spiel is located under third_party.open_spiel.
+# Use sys.modules aliasing instead of adding third_party to sys.path,
+# which would corrupt package discovery for non-Python directories in third_party (e.g. brotli).
+if 'open_spiel' not in sys.modules:
+  try:
+    import open_spiel  # pylint: disable=unused-import
+  except ImportError:
+    try:
+      import third_party.open_spiel as _os
+      sys.modules['open_spiel'] = _os
+      import third_party.open_spiel.python as _osp
+      sys.modules['open_spiel.python'] = _osp
+    except ImportError:
+      try:
+        import google3.third_party.open_spiel as _os
+        sys.modules['open_spiel'] = _os
+        import google3.third_party.open_spiel.python as _osp
+        sys.modules['open_spiel.python'] = _osp
+      except ImportError:
+        pass
 
 from absl import app
 from absl import flags
@@ -71,6 +87,39 @@ flags.DEFINE_integer(
     'Batch size for parallel evaluation episodes. Running multiple evaluation '
     'games in lockstep batches GPU generations for ~4x faster evaluation.',
 )
+flags.DEFINE_integer(
+    'eval_full_episodes',
+    32,
+    'Episodes of full self-play evaluation (LLM plays every turn, no bot '
+    'hand-off) run after every GRPO pass, logged as eval_full/* (see '
+    '--eval_mode). Also sets the size of the one-off pass-0 baselines '
+    '(initial adapter full self-play + all-bot). 0 disables.',
+)
+flags.DEFINE_enum(
+    'eval_mode',
+    'full',
+    ['full', 'bot_guided', 'both'],
+    'Which per-pass evaluation(s) to run after each GRPO pass. "full" '
+    '(default): only the fixed-deal full self-play eval (eval_full/*, '
+    '--eval_full_episodes games). "bot_guided": only the curriculum eval '
+    '(eval/*, --num_eval_episodes games; LLM plays to the curriculum horizon, '
+    'the heuristic bot finishes the game). "both": run both (previous '
+    'behaviour). The pass-0 baselines and eval/collection_mean_reward are '
+    'unaffected.',
+)
+flags.DEFINE_integer(
+    'eval_seed',
+    10000,
+    'Base seed for fixed-deal evaluation: eval episode i is dealt with seed '
+    'eval_seed + i so every pass is scored on the same deals (paired '
+    'comparison). Negative disables seeding (fresh random deals per pass).',
+)
+flags.DEFINE_boolean(
+    'eval_bot_baseline',
+    True,
+    'Before pass 1, also evaluate the heuristic bot in both seats for every '
+    'turn on the fixed eval deals (eval_bot/*, logged at episode 0).',
+)
 flags.DEFINE_float(
     'temperature', 0.8, 'Sampling temperature for LLM action selection.'
 )
@@ -85,17 +134,6 @@ flags.DEFINE_float(
     'temperature_floor',
     0.5,
     'Minimum floor for annealed temperature to prevent generation collapse.',
-)
-flags.DEFINE_float(
-    'epsilon',
-    0.3,
-    'Epsilon-greedy exploration rate during game collection. With this '
-    'probability, the model action is replaced with a random legal action.',
-)
-flags.DEFINE_float(
-    'epsilon_anneal_end',
-    0.0,
-    'Anneal epsilon to this value over training. Set to None to disable.',
 )
 flags.DEFINE_float('lr', 3e-5, 'Learning rate for the LoRA adapter.')
 flags.DEFINE_integer('lora_rank', 16, 'LoRA adapter rank.')
@@ -125,7 +163,7 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer('seed', 42, 'Random seed for reproducibility.')
 flags.DEFINE_integer(
-    'max_seq_len', 512, 'Maximum sequence length for the model.'
+    'max_seq_len', 2048, 'Maximum sequence length for the model.'
 )
 flags.DEFINE_float('max_grad_norm', 1.0, 'Maximum gradient norm for clipping.')
 flags.DEFINE_bool('use_wandb', False, 'Enable Weights & Biases logging.')
@@ -168,10 +206,30 @@ flags.DEFINE_integer(
     'before each GRPO training pass.',
 )
 flags.DEFINE_integer(
+    'grpo_collect_batch_size',
+    16,
+    'Batch size for parallel game collection episodes during GRPO.',
+)
+flags.DEFINE_integer(
+    'grpo_prompt_batch_size',
+    40,
+    'Batch size for parallel LLM prompt generation during GRPO training.',
+)
+flags.DEFINE_integer(
+    'grpo_train_batch_size',
+    4,
+    'Maximum per-device batch size for TRL GRPOTrainer backward passes.',
+)
+flags.DEFINE_integer(
     'grpo_train_epochs', 1, 'Number of training epochs per GRPO pass.'
 )
 flags.DEFINE_integer(
     'grpo_passes', 25, 'Number of collect-then-train passes for GRPO.'
+)
+flags.DEFINE_integer(
+    'grpo_initial_pass',
+    0,
+    'Pass to start from (1-based). 0 = auto-detect from existing checkpoints.',
 )
 flags.DEFINE_integer(
     'grpo_max_completion_length',
@@ -420,6 +478,11 @@ flags.DEFINE_string(
     'Type of bot partner to use: "belief_lookahead" (SafeBeliefLookaheadPlayer) '
     'or "safe_play" (SafePlayPlayer).',
 )
+flags.DEFINE_float(
+    'checkpoint_interval_minutes',
+    10.0,
+    'Interval in minutes for saving interim checkpoints and decision-point eval caches.',
+)
 flags.DEFINE_bool(
     'reasoning',
     False,
@@ -443,8 +506,9 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer(
     'curriculum_max_lookback',
-    0,
-    'Maximum turn lookback distance from active window for replay sampling (0 = unlimited).',
+    -1,
+    'Max turn lookback from active window for replay sampling '
+    '(-1 = unlimited, 0 = no replay, N = last N turns).',
 )
 flags.DEFINE_float(
     'curriculum_replay_ratio',
@@ -520,6 +584,10 @@ def _print_experiment_configuration(
           'eval_every',
           'num_eval_episodes',
           'eval_batch_size',
+          'eval_full_episodes',
+          'eval_mode',
+          'eval_seed',
+          'eval_bot_baseline',
           'checkpoint_every',
           'log_every',
           'log_episodes_every',
@@ -532,8 +600,6 @@ def _print_experiment_configuration(
           'temperature',
           'temperature_anneal_end',
           'temperature_floor',
-          'epsilon',
-          'epsilon_anneal_end',
       ]),
       ('GRPO Configuration', [
           'grpo_passes',
@@ -611,6 +677,133 @@ def _print_experiment_configuration(
   print('=' * 80, flush=True)
 
 
+def _find_latest_checkpoint(output_dir: str) -> tuple[str | None, int]:
+  """Scans output_dir (CNS or local) for checkpoint_ep* and checkpoint_interim directories.
+
+  Returns:
+    (latest_checkpoint_path, latest_episode) or (None, 0).
+  """
+  if not output_dir:
+    return None, 0
+
+  candidates: list[tuple[int, str]] = []
+  interim_path: str | None = None
+  gfile_mod = None
+
+  # Check CNS output_dir
+  if output_dir.startswith('/cns/'):
+    try:
+      from pyglib import gfile as _gfile
+      gfile_mod = _gfile
+    except ImportError:
+      try:
+        from tensorflow.io import gfile as _gfile
+        gfile_mod = _gfile
+      except ImportError:
+        gfile_mod = None
+
+    if gfile_mod is not None:
+      exists_fn = getattr(gfile_mod, 'Exists', getattr(gfile_mod, 'exists', None))
+      listdir_fn = getattr(gfile_mod, 'ListDirectory', getattr(gfile_mod, 'listdir', None))
+      if exists_fn and exists_fn(output_dir) and listdir_fn:
+        try:
+          entries = listdir_fn(output_dir)
+          for entry in entries:
+            clean_entry = entry.strip('/')
+            if clean_entry == 'checkpoint_interim':
+              interim_path = os.path.join(output_dir, clean_entry)
+            elif 'checkpoint_ep' in clean_entry:
+              part = clean_entry.split('checkpoint_ep')[-1]
+              try:
+                ep = int(part)
+                candidates.append((ep, os.path.join(output_dir, clean_entry)))
+              except ValueError:
+                pass
+        except Exception as e:
+          logging.warning('Error listing CNS output directory %s: %s', output_dir, e)
+
+  # Check local output_dir
+  if os.path.isdir(output_dir):
+    try:
+      for entry in os.listdir(output_dir):
+        if entry == 'checkpoint_interim':
+          interim_path = os.path.join(output_dir, entry)
+        elif 'checkpoint_ep' in entry:
+          part = entry.split('checkpoint_ep')[-1]
+          try:
+            ep = int(part)
+            candidates.append((ep, os.path.join(output_dir, entry)))
+          except ValueError:
+            pass
+    except Exception as e:
+      logging.warning('Error listing local output directory %s: %s', output_dir, e)
+
+  def _is_valid_checkpoint(ckpt_path: str) -> bool:
+    """Verifies that adapter_model.safetensors exists and has a valid header."""
+    try:
+      from backend.gemma_backend import _stage_checkpoint_if_cns  # pylint: disable=g-import-not-at-top
+      from safetensors import safe_open  # pylint: disable=g-import-not-at-top
+
+      staged = _stage_checkpoint_if_cns(ckpt_path)
+      sf_path = os.path.join(staged, 'adapter_model.safetensors')
+      if not os.path.exists(sf_path):
+        logging.warning('Checkpoint %s is missing adapter_model.safetensors', ckpt_path)
+        return False
+      with safe_open(sf_path, framework='pt', device='cpu') as f:
+        if not f.keys():
+          return False
+      return True
+    except Exception as e:
+      logging.warning(
+          'Skipping corrupted/incomplete checkpoint %s: %s', ckpt_path, e
+      )
+      return False
+
+  # Newest first; stop at the first valid checkpoint. Validating a CNS
+  # checkpoint stages it to /tmp (~1 min each), so checking every one would
+  # cost O(passes) minutes per restart.
+  candidates.sort(key=lambda x: x[0], reverse=True)
+  latest_ep, latest_ckpt = 0, None
+  for ep, path in candidates:
+    if _is_valid_checkpoint(path):
+      latest_ep, latest_ckpt = ep, path
+      break
+
+  # Check if checkpoint_interim is active for the current pass (newer than latest_ep)
+  if interim_path is not None:
+    meta_file = os.path.join(interim_path, 'checkpoint_metadata.json')
+    try:
+      import json as _json
+      meta_data = None
+      if meta_file.startswith('/cns/') and gfile_mod is not None:
+        open_fn = getattr(gfile_mod, 'GFile', getattr(gfile_mod, 'Open', None))
+        exists_fn = getattr(gfile_mod, 'Exists', getattr(gfile_mod, 'exists', None))
+        if open_fn and exists_fn and exists_fn(meta_file):
+          with open_fn(meta_file, 'r') as f:
+            meta_data = _json.load(f)
+      elif os.path.exists(meta_file):
+        with open(meta_file, 'r') as f:
+          meta_data = _json.load(f)
+
+      if (
+          isinstance(meta_data, dict)
+          and meta_data.get('status') == 'in_progress'
+          and int(meta_data.get('total_episodes', -1)) >= latest_ep
+          and _is_valid_checkpoint(interim_path)
+      ):
+        logging.info(
+            'Found active mid-pass interim checkpoint %s (pass %s, base_ep=%d)',
+            interim_path,
+            meta_data.get('pass_idx'),
+            latest_ep,
+        )
+        return interim_path, latest_ep
+    except Exception as e:
+      logging.warning('Failed to inspect interim checkpoint metadata %s: %s', meta_file, e)
+
+  return latest_ckpt, latest_ep
+
+
 def main(argv: list[str]) -> None:
   """Main entry point for Gemma RL training."""
   del argv
@@ -637,6 +830,34 @@ def main(argv: list[str]) -> None:
       FLAGS.temperature,
   )
 
+  # ── Auto-detect existing checkpoint to prevent losing progress on Borg restarts ──
+  auto_resume_checkpoint, latest_ep = _find_latest_checkpoint(FLAGS.output_dir)
+  initial_pass = 1
+  lora_checkpoint_to_load = None
+
+  if FLAGS.grpo_initial_pass > 0:
+    initial_pass = FLAGS.grpo_initial_pass
+    logging.info('Explicit initial pass configured via flag: %d', initial_pass)
+
+  if auto_resume_checkpoint is not None:
+    collect_ep = FLAGS.grpo_collect_episodes if FLAGS.grpo_collect_episodes > 0 else 50
+    completed_passes = latest_ep // collect_ep
+    if FLAGS.grpo_initial_pass <= 0:
+      initial_pass = completed_passes + 1
+    lora_checkpoint_to_load = auto_resume_checkpoint
+    logging.info(
+        '=== [AUTO-RESUME] Found existing checkpoint in output_dir: %s (episode %d). '
+        'Resuming from Pass %d ===',
+        auto_resume_checkpoint,
+        latest_ep,
+        initial_pass,
+    )
+    print(
+        f'=== [AUTO-RESUME] Found existing checkpoint {auto_resume_checkpoint} (episode {latest_ep})! '
+        f'Resuming from Pass {initial_pass} ===',
+        flush=True,
+    )
+
   # ── Load model ──
   from backend.gemma_backend import GemmaLLMBackend  # pylint: disable=g-import-not-at-top
 
@@ -647,11 +868,38 @@ def main(argv: list[str]) -> None:
       lora_dropout=FLAGS.lora_dropout,
       use_4bit=FLAGS.use_4bit,
       max_seq_len=FLAGS.max_seq_len,
-      lora_checkpoint=FLAGS.initial_lora_checkpoint,
+      lora_checkpoint=lora_checkpoint_to_load,
+      base_lora_checkpoint=FLAGS.initial_lora_checkpoint,
   )
 
   # ── Build full experiment config for reproducibility ──
   experiment_config = dict(all_flags)
+
+  # ── Flatboard / S2 eval sink (no-op outside XManager) ──
+  from trainer.s2_eval_logger import S2EvalLogger  # pylint: disable=g-import-not-at-top
+
+  # Explicit CLI flags cover every swept hyperparameter (the launcher passes
+  # them per work unit), so Flatboard can group curves by S2_METADATA_<flag>.
+  s2_metadata = dict(explicit_flags)
+  for key in (
+      'game',
+      'model_name',
+      'lr',
+      'reasoning',
+      'curriculum_window_size',
+      'curriculum_max_lookback',
+      'reward_policy_turns',
+      'initial_lora_checkpoint',
+      'eval_mode',
+  ):
+    s2_metadata.setdefault(key, all_flags.get(key))
+  eval_sink = S2EvalLogger.maybe_create(
+      dataframe='eval',
+      episodes_per_step=(
+          FLAGS.grpo_collect_episodes if FLAGS.rl_algorithm == 'grpo' else 1
+      ),
+      metadata=s2_metadata,
+  )
 
   # ── Build trainer ──
   from trainer.rl_trainer import RLTrainer  # pylint: disable=g-import-not-at-top
@@ -678,6 +926,13 @@ def main(argv: list[str]) -> None:
       bot_type=FLAGS.bot_type,
       reasoning=FLAGS.reasoning,
       eval_batch_size=FLAGS.eval_batch_size,
+      eval_sink=eval_sink,
+      # Evaluate with at least the training completion budget: expert-CoT
+      # completions reach ~350 tokens, and truncated ones are parsed as random
+      # fallback actions.
+      eval_max_tokens=max(
+          FLAGS.grpo_max_completion_length, 256 if FLAGS.reasoning else 64
+      ),
   )
 
   # ── Train ──
@@ -688,14 +943,24 @@ def main(argv: list[str]) -> None:
     grpo_config = GRPOConfig(
         num_generations=FLAGS.grpo_num_generations,
         collect_episodes=FLAGS.grpo_collect_episodes,
+        collect_batch_size=FLAGS.grpo_collect_batch_size,
+        prompt_batch_size=FLAGS.grpo_prompt_batch_size,
+        train_batch_size=FLAGS.grpo_train_batch_size,
         train_epochs=FLAGS.grpo_train_epochs,
+        gradient_accumulation_steps=FLAGS.gradient_accumulation_steps,
         passes=FLAGS.grpo_passes,
+        initial_pass=initial_pass,
+        max_seq_len=FLAGS.max_seq_len,
         max_completion_length=FLAGS.grpo_max_completion_length,
         lr=FLAGS.lr,
         kl_coeff=FLAGS.kl_coeff,
         max_grad_norm=FLAGS.max_grad_norm,
         temperature=FLAGS.temperature,
         num_eval_episodes=FLAGS.num_eval_episodes,
+        eval_full_episodes=FLAGS.eval_full_episodes,
+        eval_mode=FLAGS.eval_mode,
+        eval_seed=FLAGS.eval_seed,
+        eval_bot_baseline=FLAGS.eval_bot_baseline,
         exhaustive_groups=FLAGS.grpo_exhaustive_groups,
         optimistic_reward_alpha=FLAGS.grpo_optimistic_alpha,
         optimistic_reward_alpha_min=FLAGS.grpo_optimistic_alpha_min,
@@ -713,8 +978,6 @@ def main(argv: list[str]) -> None:
         dense_chain_discount=FLAGS.dense_chain_discount,
         temperature_anneal_end=FLAGS.temperature_anneal_end,
         temperature_floor=FLAGS.temperature_floor,
-        epsilon=FLAGS.epsilon,
-        epsilon_anneal_end=FLAGS.epsilon_anneal_end,
         reward_blend_weight=FLAGS.reward_blend_weight,
         reward_rollout_samples=FLAGS.reward_rollout_samples,
         reward_rollout_common_seed=FLAGS.reward_rollout_common_seed,
@@ -729,6 +992,7 @@ def main(argv: list[str]) -> None:
         llm_partner_response=FLAGS.llm_partner_response,
         bot_partner=FLAGS.bot_partner,
         bot_type=FLAGS.bot_type,
+        checkpoint_interval_minutes=FLAGS.checkpoint_interval_minutes,
         reasoning=FLAGS.reasoning,
         curriculum_window_size=FLAGS.curriculum_window_size,
         curriculum_passes_per_phase=FLAGS.curriculum_passes_per_phase,
@@ -815,4 +1079,4 @@ def main(argv: list[str]) -> None:
 
 
 if __name__ == '__main__':
-  app.run(main)
+  app.run(main, flags_parser=lambda argv: flags.FLAGS(argv, known_only=True))
